@@ -133,9 +133,10 @@ fn build_cues_first(cues_body: &[u8], clusters: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// Build an MKV with the supplied Cues body placed AFTER the last
-/// Cluster (the common single-pass / index-at-end layout). This drives
-/// the late best-effort `scan_cues_from` path.
-fn build_cues_last(cues_body: &[u8], clusters: &[Vec<u8>]) -> Vec<u8> {
+/// Cluster (the common single-pass / index-at-end layout). With
+/// `indexed`, a SeekHead in front points at the Cues — how a writer makes
+/// trailing Cues reachable without walking the Clusters (RFC 9559 §6.3).
+fn build_cues_last(cues_body: &[u8], clusters: &[Vec<u8>], indexed: bool) -> Vec<u8> {
     let info = elem_master(ids::INFO, &info_body());
     let tracks = elem_master(ids::TRACKS, &tracks_body());
     let cues = elem_master(ids::CUES, cues_body);
@@ -146,6 +147,12 @@ fn build_cues_last(cues_body: &[u8], clusters: &[Vec<u8>]) -> Vec<u8> {
     for c in clusters {
         seg_body.extend_from_slice(&elem_master(ids::CLUSTER, c));
     }
+    if indexed {
+        let cues_position = seek_head(ids::CUES, 0).len() + seg_body.len();
+        let mut front = seek_head(ids::CUES, cues_position as u64);
+        front.extend_from_slice(&seg_body);
+        seg_body = front;
+    }
     seg_body.extend_from_slice(&cues);
     let segment = elem_master(ids::SEGMENT, &seg_body);
 
@@ -153,6 +160,16 @@ fn build_cues_last(cues_body: &[u8], clusters: &[Vec<u8>]) -> Vec<u8> {
     out.extend_from_slice(&ebml_header());
     out.extend_from_slice(&segment);
     out
+}
+
+/// A SeekHead with one Seek pointing `id` at Segment Position `position`,
+/// encoded on 8 bytes so the SeekHead's length doesn't depend on it.
+fn seek_head(id: u32, position: u64) -> Vec<u8> {
+    let mut seek = elem_master(ids::SEEK_ID, &write_element_id(id));
+    seek.extend_from_slice(&write_element_id(ids::SEEK_POSITION));
+    seek.extend_from_slice(&write_vint(8, 0));
+    seek.extend_from_slice(&position.to_be_bytes());
+    elem_master(ids::SEEK_HEAD, &elem_master(ids::SEEK, &seek))
 }
 
 fn open(bytes: Vec<u8>) -> oxideav_mkv::demux::MkvDemuxer {
@@ -347,9 +364,9 @@ fn multiple_cue_points_preserve_document_order() {
 }
 
 #[test]
-fn cues_after_last_cluster_late_scan_path() {
-    // The common index-at-end layout drives the best-effort scan_cues_from
-    // path; the typed collector is fed there too.
+fn cues_after_last_cluster_reached_through_seek_head() {
+    // The common index-at-end layout: the open follows the SeekHead to the
+    // trailing Cues, and the typed collector is fed there too.
     let mut tp = Vec::new();
     tp.extend_from_slice(&elem_uint(ids::CUE_TRACK, 1));
     tp.extend_from_slice(&elem_uint(ids::CUE_CLUSTER_POSITION, 0x55));
@@ -358,7 +375,7 @@ fn cues_after_last_cluster_late_scan_path() {
     let ctp = elem_master(ids::CUE_TRACK_POSITIONS, &tp);
     let cb = cue_point(123, &ctp);
 
-    let dmx = open(build_cues_last(&cb, &[cluster_body(0, 0x11)]));
+    let dmx = open(build_cues_last(&cb, &[cluster_body(0, 0x11)], true));
     let pts = dmx.cue_points();
     assert_eq!(pts.len(), 1);
     assert_eq!(pts[0].time, 123);
@@ -366,6 +383,19 @@ fn cues_after_last_cluster_late_scan_path() {
     assert_eq!(p.cluster_position, Some(0x55));
     assert_eq!(p.duration, Some(960));
     assert_eq!(p.block_number, Some(1));
+}
+
+#[test]
+fn cues_after_last_cluster_without_seek_head_are_not_scanned_for() {
+    // Finding trailing Cues no SeekHead points at means walking every
+    // Cluster before the first packet — the open doesn't, and the Clusters
+    // still demux.
+    let cb = cue_point(123, &ctp_minimal(1, 0x55));
+
+    let mut dmx = open(build_cues_last(&cb, &[cluster_body(0, 0x11)], false));
+    assert!(dmx.cue_points().is_empty());
+    let pkt = dmx.next_packet().expect("packet");
+    assert_eq!(pkt.data, vec![0x11]);
 }
 
 #[test]

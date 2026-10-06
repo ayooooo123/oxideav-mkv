@@ -670,8 +670,19 @@ fn cues(entries: &[(u64, u64, u64)]) -> Vec<u8> {
     elem_master(ids::CUES, &body)
 }
 
-/// `join_file` plus a trailing Cues element indexing only the two *source*
-/// tracks (the common layout — the virtual track has no Cues rows).
+/// A SeekHead with one Seek pointing `id` at Segment Position `position`,
+/// encoded on 8 bytes so the SeekHead's length doesn't depend on it.
+fn seek_head(id: u32, position: u64) -> Vec<u8> {
+    let mut seek = elem_master(ids::SEEK_ID, &write_element_id(id));
+    seek.extend_from_slice(&write_element_id(ids::SEEK_POSITION));
+    seek.extend_from_slice(&write_vint(8, 0));
+    seek.extend_from_slice(&position.to_be_bytes());
+    elem_master(ids::SEEK_HEAD, &elem_master(ids::SEEK, &seek))
+}
+
+/// `join_file` plus a trailing Cues element, reached through a SeekHead,
+/// indexing only the two *source* tracks (the common layout — the virtual
+/// track has no Cues rows).
 fn join_file_with_cues() -> Vec<u8> {
     let ta = video_track(1, UID_A);
     let tb = video_track(2, UID_B);
@@ -706,7 +717,8 @@ fn join_file_with_cues() -> Vec<u8> {
     );
     // Segment-relative cluster offsets (Cues sit after the Clusters, so
     // the offsets are known when the index is built).
-    let off_c0 = (info.len() + tracks.len()) as u64;
+    let seek_head_len = seek_head(ids::CUES, 0).len() as u64;
+    let off_c0 = seek_head_len + (info.len() + tracks.len()) as u64;
     let off_c1 = off_c0 + c0.len() as u64;
     let cues = cues(&[
         (1, 0, off_c0),
@@ -714,7 +726,7 @@ fn join_file_with_cues() -> Vec<u8> {
         (2, 5, off_c0),
         (2, 20, off_c1),
     ]);
-    let mut seg = Vec::new();
+    let mut seg = seek_head(ids::CUES, off_c1 + c1.len() as u64);
     seg.extend_from_slice(&info);
     seg.extend_from_slice(&tracks);
     seg.extend_from_slice(&c0);

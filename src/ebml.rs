@@ -258,9 +258,17 @@ pub fn skip<R: Seek + ?Sized>(r: &mut R, n: u64) -> Result<()> {
 /// The table is built once on first call rather than stored as a literal,
 /// so no numeric table is transcribed into source.
 pub fn crc32_ieee(data: &[u8]) -> u32 {
-    use std::sync::OnceLock;
-    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
-    let table = TABLE.get_or_init(|| {
+    crc32_ieee_update(0, data)
+}
+
+/// Continue an IEEE CRC-32 over more bytes: `crc` is the CRC of the bytes
+/// seen so far (`0` for none), so `crc32_ieee_update(crc32_ieee(a), b)`
+/// equals the [`crc32_ieee`] of `a` followed by `b`. Lets a reader check
+/// an element's `CRC-32` while it streams the element instead of holding
+/// the whole body in memory.
+pub fn crc32_ieee_update(crc: u32, data: &[u8]) -> u32 {
+    use std::sync::LazyLock;
+    static TABLE: LazyLock<[u32; 256]> = LazyLock::new(|| {
         let mut t = [0u32; 256];
         let mut n = 0usize;
         while n < 256 {
@@ -279,7 +287,8 @@ pub fn crc32_ieee(data: &[u8]) -> u32 {
         }
         t
     });
-    let mut crc = 0xFFFF_FFFFu32;
+    let table = &*TABLE;
+    let mut crc = crc ^ 0xFFFF_FFFF;
     for &b in data {
         crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }

@@ -536,17 +536,22 @@ to register every codec the build enables.
   `MkvDemuxer::damage_events()` — empty exactly when the file needed no
   recovery, so strict-minded callers can reject after the fact. The
   strict `open` / `open_typed` behaviour is unchanged byte-for-byte.
-- **Resilient Cues-less seek fallback**: on an `open_resilient` demuxer,
-  `seek_to` on a file with no usable `Cues` (absent — RFC 9559 §22.1 only
-  RECOMMENDS the element — or damaged and skipped at open) linearly scans
-  Cluster `Timestamp`s (§5.1.3.1) and lands on the last Cluster at or
-  before the target, stopping early on the §11.1 ascending-Cluster-time
-  order. Unknown-size Clusters are stepped over with the same vetted
-  Top-Level scan the resync path uses; targets before the first / past
-  the last Cluster snap to the first / last Cluster. The strict path
-  still returns `Error::Unsupported` — the RFC 9559 §23.2 "neither
-  SeekHead nor Cues at the start SHOULD be considered non-seekable"
-  signal stays observable.
+- **Cues-less seek**: `seek_to` on a file with no usable `Cues` (absent —
+  RFC 9559 §22.1 only RECOMMENDS the element; live recordings and files
+  written to a pipe have none — or damaged and skipped by a resilient
+  open) scans the Clusters up to the target, the way FFmpeg indexes such
+  a file: it walks Cluster `Timestamp`s (§5.1.3.1) to the first Cluster
+  past the target, then reads Block headers in those Clusters, newest
+  first, for the last keyframe of the sought track at or before the
+  target. When the track's first Block in that Cluster is a keyframe the
+  seek lands on the Cluster's start; otherwise (a Cluster starting
+  mid-GOP) it lands on the keyframe's Block, so the first packet of the
+  track is always one it decodes from. Unknown-size Clusters are stepped
+  over child by child; targets before the first keyframe / past the last
+  Cluster snap to the first / last Cluster. Like FFmpeg, both the strict
+  and the resilient path seek this way rather than taking RFC 9559
+  §23.2's "neither SeekHead nor Cues at the start SHOULD be considered
+  non-seekable".
 - **Cues that LIE — trust-but-verify seek + whole-index audit**: the
   index is pure metadata (every `CueClusterPosition` / `CueTime` /
   `CueRelativePosition` / `CueBlockNumber` claim restates information
@@ -641,9 +646,11 @@ to register every codec the build enables.
   inspection rather than being truncated. `is_empty()` reports the common
   standalone Segment; `is_hard_linked()` reports a chain member. Pure
   container surface: no neighbouring-file resolution.
-- Seek: `seek_to(stream, pts)` uses the Cues index. Handles Cues at
-  either end of the Segment, and walks an unknown-size final Cluster to
-  find Cues that sit past it.
+- Seek: `seek_to(stream, pts)` uses the Cues index — before the first
+  Cluster, or after the Cluster run when the SeekHead points at it (the
+  open never walks the Clusters to find Cues no SeekHead references).
+  Without Cues it scans the Clusters up to the target (see Cues-less
+  seek).
 - **`CueRelativePosition` honoured on seek** (RFC 9559 §5.1.5.1.2.3): when
   a Cues entry carries the `CueRelativePosition` element, `seek_to` opens
   the target Cluster, captures its `Timestamp` (RFC 9559 §5.1.3.1 — SHOULD
@@ -679,7 +686,7 @@ to register every codec the build enables.
   `CueTrackPositions` (the spec gives the latter `minOccurs: 1` with no
   `maxOccurs`, so a single timestamp can index blocks on several tracks).
   Populated whether `Cues` sits before the first Cluster or after the
-  last (the late best-effort rescan feeds the same typed collector);
+  last (reached through the SeekHead, feeding the same typed collector);
   optional children surface as `Option<u64>` (absent vs present), `0`-but-
   present and `0`-by-default `CueCodecState` are observationally identical
   per the spec default. Unknown children inside `CueTrackPositions` are
@@ -695,16 +702,19 @@ to register every codec the build enables.
   the rest of the element and records the result.
   `MkvDemuxer::crc_status() -> &[CrcStatus]` exposes each
   `{element_id, stored, computed}` triple with an `is_valid()` helper.
-  Up-front masters are checked at open time in segment order; Cluster
-  checks land lazily on the first `next_packet` / `seek_to` that opens
-  each Cluster (the element id on a Cluster status is `ids::CLUSTER`),
-  with a body-offset dedup so a back-then-forward seek revisiting the
-  same Cluster never produces two statuses for it. The late best-effort
-  Cues rescan (the path the demuxer uses when `Cues` sits after the
-  final `Cluster` — the common single-pass-mux layout, and the one our
-  own muxer emits) also validates a leading `CRC-32` on the rediscovered
-  `Cues` element and pushes its status, so a Cues CRC mismatch surfaces
-  regardless of whether the `Cues` was placed before or after Clusters.
+  Up-front masters are checked at open time in segment order. A Cluster's
+  CRC is computed over the bytes the walk reads as it returns the
+  Cluster's packets, so they stream out before the Cluster has been read
+  whole (bytes the walk would skip — a `Void`, the Blocks before a Cue's
+  `CueRelativePosition` — are read through for it); the status lands once
+  the walk has read the whole Cluster (the element id on a Cluster status
+  is `ids::CLUSTER`), and a Cluster the walk leaves early gets none. A
+  body-offset dedup keeps a back-then-forward seek revisiting the same
+  Cluster from producing two statuses for it. Trailing `Cues` reached
+  through the SeekHead (the common single-pass-mux layout, and the one
+  our own muxer emits) are validated the same way, so a Cues CRC mismatch
+  surfaces regardless of whether the `Cues` was placed before or after
+  Clusters.
   A Cluster declared with the unknown-size VINT can't be CRC-checked
   (the spec requires a bounded body) and produces no status. Validation
   is informational — a mismatch does **not** abort the open (RFC 8794
@@ -1936,13 +1946,11 @@ so the demuxer never hides an unrecognised track.
 
 ## What's NOT implemented
 
-- CRC-32 validation covers Top-Level master elements parsed up front and
-  every `Cluster` the demuxer opens through `next_packet` / `seek_to`; the
-  late best-effort Cues rescan (when Cues sit after the final Cluster) is
-  now checksummed too — a leading `CRC-32` child on the late-Cues `Cues`
-  element validates and surfaces through `crc_status()` exactly the same
-  way the up-front masters do. A `Cluster` declared with the unknown-size
-  VINT still produces no status (RFC 8794 §11.3.1 needs a bounded body).
+- CRC-32 validation covers Top-Level master elements parsed up front,
+  trailing ones reached through the SeekHead, and every `Cluster` the
+  demuxer walks to its end through `next_packet` / `seek_to`. A `Cluster`
+  declared with the unknown-size VINT still produces no status (RFC 8794
+  §11.3.1 needs a bounded body).
   The muxer writes a leading `CRC-32` child on every Top-Level master it
   buffers end-to-end before flushing — `Info`, `Tracks`, `Cues`, plus
   `Chapters` and `Attachments` when those are queued. `SeekHead` and

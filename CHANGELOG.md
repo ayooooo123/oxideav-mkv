@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Demuxing is incremental: a file arriving over a network plays after its
+  first kilobytes instead of after a Cluster — or, without Cues, the whole
+  file — has been read.
+  - A Cluster's `CRC-32` is computed over the bytes the walk reads as it
+    returns the Cluster's packets, instead of reading the whole Cluster
+    before its first packet; its `crc_status()` entry lands once the walk
+    has read the whole Cluster. A Cluster without a `CRC-32` child is no
+    longer read for one.
+  - The open no longer walks the Cluster run looking for `Cues` stored
+    after the last Cluster: trailing `Cues` are found through the SeekHead
+    (as every writer that puts them there references them), as are
+    trailing `Tags` / `Chapters` / `Attachments`.
+  - `seek_to` on a file without `Cues` scans the Clusters on the strict
+    path too (it returned `Error::Unsupported`), and lands on the last
+    keyframe of the sought track at or before the target: on the Cluster's
+    start when the track's first Block there is a keyframe, else on the
+    keyframe's Block.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.10...v0.0.11) - 2026-10-04
 
 ### Other

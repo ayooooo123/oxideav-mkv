@@ -1,9 +1,11 @@
 //! Matroska demuxer.
 //!
 //! Strategy: read the EBML header, locate the Segment, parse Info + Tracks
-//! up front. Then on each `next_packet` call, walk Cluster children one at a
-//! time, extracting frames from `SimpleBlock` and `BlockGroup → Block`
-//! elements (lacing-aware).
+//! up front, and follow the SeekHead to the Top-Level masters stored after
+//! the Clusters — never scanning the Cluster run, which over a network is
+//! the whole file. Then on each `next_packet` call, walk Cluster children
+//! one at a time, extracting frames from `SimpleBlock` and `BlockGroup →
+//! Block` elements (lacing-aware) as the reader reaches them.
 
 mod video_config;
 
@@ -17,8 +19,8 @@ use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::codec_id::{from_matroska, strip_bitmapinfoheader};
 use crate::ebml::{
-    crc32_ieee, read_bytes, read_element_header, read_float, read_int, read_string, read_uint,
-    read_vint, skip, VINT_UNKNOWN_SIZE,
+    crc32_ieee, crc32_ieee_update, read_bytes, read_element_header, read_float, read_int,
+    read_string, read_uint, read_vint, skip, VINT_UNKNOWN_SIZE,
 };
 use crate::ids;
 
@@ -490,31 +492,10 @@ fn open_typed_impl(
         input.seek(SeekFrom::Start(resume_pos))?;
     }
 
-    // Cues are often written after the final Cluster — if we haven't seen
-    // them yet and the segment size is known, scan from the first cluster
-    // to segment end looking for a top-level Cues element. We keep this
-    // best-effort: any I/O error or parse problem leaves `cues` empty
-    // and falls back to Unsupported at seek time.
-    if cues.is_empty() {
-        if let Some(first_cluster) = first_cluster_offset {
-            let resume_pos = input.stream_position()?;
-            if scan_cues_from(
-                &mut *input,
-                first_cluster,
-                segment_data_end,
-                &mut cues,
-                &mut cue_points,
-                &mut crc_status,
-            )
-            .is_err()
-            {
-                cues.clear();
-                cue_points.clear();
-            }
-            // Restore reader position to the first cluster for next_packet().
-            input.seek(SeekFrom::Start(resume_pos))?;
-        }
-    }
+    // Cues that neither precede the first Cluster nor are reachable through
+    // the SeekHead are not searched for: finding them means walking every
+    // Cluster to the end of the Segment before the first packet. A seek
+    // without Cues scans the Clusters up to its target instead.
 
     // Sort cues by (track, time) for stable lookup.
     cues.sort_by(|a, b| a.track.cmp(&b.track).then(a.time.cmp(&b.time)));
@@ -1081,7 +1062,7 @@ fn open_typed_impl(
     // is legal: open succeeds, `next_packet` reports a clean `Error::Eof`
     // (the reader is parked at the Segment end), and `seek_to` fails
     // with `Error::Unsupported` since there is nothing to land on.
-    input.seek(SeekFrom::Start(
+    let input_pos = input.seek(SeekFrom::Start(
         first_cluster_offset.unwrap_or(segment_data_end),
     ))?;
 
@@ -1100,7 +1081,7 @@ fn open_typed_impl(
     }
 
     Ok(MkvDemuxer {
-        input,
+        input: Box::new(ClusterReader::new(input, input_pos)),
         ebml_header,
         streams,
         track_index_by_number,
@@ -1698,7 +1679,7 @@ struct SegmentInfo {
 /// In Matroska, every Top-Level master element SHOULD carry a `CRC-32`
 /// child as its first element (RFC 9559 §6.2). The demuxer checks the
 /// elements it parses up front (Info, Tracks, Tags, Cues, Chapters,
-/// Attachments, SeekHead) **and** each Cluster as it first opens it,
+/// Attachments, SeekHead) **and** each Cluster as the walk reads it,
 /// recording whether the stored CRC matched the IEEE CRC-32 of the rest
 /// of the element's data. Elements with no `CRC-32` child are not
 /// represented here — absence of a status means "no CRC to check,"
@@ -7591,15 +7572,6 @@ fn parse_cue_reference(r: &mut dyn ReadSeek, end: u64) -> Result<CueReference> {
     Ok(reference)
 }
 
-/// Best-effort scan of the byte range `[start, end)` looking for a top-level
-/// Cues element whose header we can find intact. Used when the Cues element
-/// appears after the last Cluster in the file (the common single-pass layout
-/// when muxing in a single pass with index-at-end, and also what our own
-/// muxer emits).
-///
-/// Unknown-size Clusters are walked element-by-element until a sibling
-/// top-level element terminates them, so Cues that sit after an
-/// unknown-size final Cluster are still found.
 /// Follow one SeekHead entry (RFC 9559 §6.3) to a Top-Level master the
 /// pre-Cluster walk never reached (the single-pass-mux layout stores
 /// `Tags` / `Chapters` / `Attachments` / `Cues` after the Cluster run).
@@ -7692,112 +7664,6 @@ fn follow_seek_target(
         crc_status.push(status);
     }
     Ok(())
-}
-
-fn scan_cues_from(
-    r: &mut dyn ReadSeek,
-    start: u64,
-    end: u64,
-    out: &mut Vec<CueEntry>,
-    typed: &mut Vec<CuePoint>,
-    crc_status: &mut Vec<CrcStatus>,
-) -> Result<()> {
-    r.seek(SeekFrom::Start(start))?;
-    while r.stream_position()? < end {
-        let pos = r.stream_position()?;
-        let e = read_element_header(r)?;
-        if e.id == ids::CUES {
-            let body_start = r.stream_position()?;
-            let body_end = if e.size == VINT_UNKNOWN_SIZE {
-                end
-            } else {
-                body_start.saturating_add(e.size)
-            };
-            if body_end > end {
-                r.seek(SeekFrom::Start(pos))?;
-                return Ok(());
-            }
-            // Validate a leading CRC-32 child on the late-Cues path too
-            // (RFC 9559 §6.2 — Cues SHOULD carry CRC-32 like every other
-            // Top-Level master, and the muxer we ship does). The helper
-            // rewinds the reader to `body_start` before returning, so
-            // `parse_cues` proceeds unaffected — and if the leading child
-            // happens to be a `CRC-32` rather than a `CuePoint`,
-            // `parse_cues` skips it the same way the early-Cues path
-            // does, since it tolerates unknown ids inside Cues.
-            if e.size != VINT_UNKNOWN_SIZE {
-                if let Some(s) = validate_top_level_crc(r, ids::CUES, body_start, body_end)? {
-                    crc_status.push(s);
-                }
-            }
-            parse_cues(r, body_end, out, typed)?;
-            return Ok(());
-        }
-        if e.size == VINT_UNKNOWN_SIZE {
-            if e.id == ids::CLUSTER {
-                // Walk cluster children until we meet a sibling top-level
-                // element (another Cluster, Cues, Tags, ...). Push any
-                // skip we can't interpret up to the parent loop's guard.
-                if !walk_unknown_cluster(r, end)? {
-                    return Ok(());
-                }
-                continue;
-            }
-            // Unknown-size, non-cluster element we can't interpret — stop.
-            r.seek(SeekFrom::Start(pos))?;
-            return Ok(());
-        }
-        let body_start = r.stream_position()?;
-        let body_end = body_start.saturating_add(e.size);
-        if body_end > end {
-            r.seek(SeekFrom::Start(pos))?;
-            return Ok(());
-        }
-        r.seek(SeekFrom::Start(body_end))?;
-    }
-    Ok(())
-}
-
-/// Walk the children of an unknown-size Cluster starting at the current
-/// reader position. Returns `true` after positioning the reader on the
-/// next top-level element (so the outer scan can continue from there) and
-/// `false` if we hit EOF / end of segment before finding one. Any non-child
-/// element id that's a valid Segment child terminates the walk.
-fn walk_unknown_cluster(r: &mut dyn ReadSeek, end: u64) -> Result<bool> {
-    while r.stream_position()? < end {
-        let pos = r.stream_position()?;
-        let e = match read_element_header(r) {
-            Ok(v) => v,
-            Err(_) => return Ok(false),
-        };
-        // Cluster children we know and can size correctly.
-        let is_cluster_child = matches!(
-            e.id,
-            ids::TIMECODE
-                | ids::SIMPLE_BLOCK
-                | ids::BLOCK_GROUP
-                | ids::BLOCK
-                | ids::BLOCK_DURATION
-                | ids::REFERENCE_BLOCK
-                | ids::VOID
-                | ids::CRC32
-        );
-        if !is_cluster_child {
-            // Treat as a sibling of Cluster — rewind and let caller handle.
-            r.seek(SeekFrom::Start(pos))?;
-            return Ok(true);
-        }
-        if e.size == VINT_UNKNOWN_SIZE {
-            // Unexpected inside a cluster; bail.
-            return Ok(false);
-        }
-        let body_end = r.stream_position()?.saturating_add(e.size);
-        if body_end > end {
-            return Ok(false);
-        }
-        r.seek(SeekFrom::Start(body_end))?;
-    }
-    Ok(false)
 }
 
 fn parse_tracks(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TrackEntry>) -> Result<()> {
@@ -8711,6 +8577,115 @@ enum ClusterState {
     },
 }
 
+/// The demuxer's input. It tracks the read position so a Cluster's
+/// `CRC-32` (RFC 8794 §11.3.1) is computed over the bytes the Cluster walk
+/// reads anyway: packets leave the demuxer as their Blocks arrive instead
+/// of after the whole Cluster has been read for its checksum.
+struct ClusterReader {
+    inner: Box<dyn ReadSeek>,
+    pos: u64,
+    /// The `CRC-32` of the Cluster being walked, while it is computed.
+    crc: Option<RunningCrc>,
+}
+
+/// A Cluster `CRC-32` computed as the walk reads the Cluster body.
+struct RunningCrc {
+    /// Body offset of the Cluster — its key in
+    /// [`MkvDemuxer::validated_cluster_starts`].
+    body_start: u64,
+    stored: u32,
+    /// CRC of the bytes from the end of the `CRC-32` element to `next`.
+    crc: u32,
+    /// The next byte the CRC consumes. It only moves forward, over bytes
+    /// read in file order: a re-read never counts twice, and a read that
+    /// starts past it leaves the CRC unfinished.
+    next: u64,
+    /// End of the Cluster body; the CRC is complete when `next` gets here.
+    end: u64,
+}
+
+impl ClusterReader {
+    fn new(inner: Box<dyn ReadSeek>, pos: u64) -> Self {
+        Self {
+            inner,
+            pos,
+            crc: None,
+        }
+    }
+}
+
+impl Read for ClusterReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if let Some(c) = &mut self.crc {
+            let stop = self.pos.saturating_add(n as u64).min(c.end);
+            if self.pos <= c.next && c.next < stop {
+                let from = (c.next - self.pos) as usize;
+                let to = (stop - self.pos) as usize;
+                c.crc = crc32_ieee_update(c.crc, &buf[from..to]);
+                c.next = stop;
+            }
+        }
+        self.pos = self.pos.saturating_add(n as u64);
+        Ok(n)
+    }
+}
+
+impl Seek for ClusterReader {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        // A forward skip over Cluster bytes the CRC still needs (a Void,
+        // an unknown child, the Blocks before a Cue target) is read rather
+        // than seeked, so the CRC sees every byte. A read that ends early
+        // (truncated input) leaves the rest to a plain seek.
+        if let (SeekFrom::Start(target), Some(c)) = (to, &self.crc) {
+            if self.pos == c.next && target > c.next && target <= c.end {
+                let mut buf = [0u8; 16 * 1024];
+                while self.pos < target {
+                    let want = ((target - self.pos) as usize).min(buf.len());
+                    match self.read(&mut buf[..want]) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                if self.pos == target {
+                    return Ok(target);
+                }
+            }
+        }
+        self.pos = self.inner.seek(to)?;
+        Ok(self.pos)
+    }
+
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        Ok(self.pos)
+    }
+}
+
+/// How many Cluster offsets a Cues-less seek remembers on its way to the
+/// target before thinning them — see [`MkvDemuxer::seek_by_cluster_scan`].
+const MAX_SEEK_SCAN_CLUSTERS: usize = 4096;
+
+/// The keyframe a Cues-less seek lands on — see
+/// [`MkvDemuxer::seek_by_cluster_scan`].
+#[derive(Clone, Copy)]
+struct ScanKeyframe {
+    /// Offset of the Cluster element header.
+    cluster: u64,
+    /// Offset of the `SimpleBlock` / `BlockGroup` element.
+    block: u64,
+    body_start: u64,
+    body_end: u64,
+    unknown_size: bool,
+    cluster_timecode: i64,
+    /// The Block's timestamp, in Segment Ticks.
+    time: i64,
+    /// The track's first Block in the Cluster is a keyframe, so the track
+    /// decodes from the Cluster's start.
+    at_cluster_start: bool,
+}
+
 /// One de-laced packet waiting in the demuxer's output queue, paired with
 /// the per-Block side channels that must surface alongside it when it is
 /// returned by `next_packet`:
@@ -8740,7 +8715,9 @@ struct QueuedPacket {
 /// (returning this struct directly so consumers can call typed accessors
 /// like [`MkvDemuxer::tags`] that the trait does not expose).
 pub struct MkvDemuxer {
-    input: Box<dyn ReadSeek>,
+    /// Boxed so `&mut *self.input` stays a `&mut dyn ReadSeek` for the
+    /// element parsers.
+    input: Box<ClusterReader>,
     /// The parsed EBML header (RFC 8794 §11.2) — `DocType`, the version trio,
     /// and any `DocTypeExtension` declarations. See [`MkvDemuxer::ebml_header`].
     ebml_header: EbmlHeader,
@@ -8799,8 +8776,8 @@ pub struct MkvDemuxer {
     /// §11.3.1) — see [`MkvDemuxer::crc_status`]. Holds both the up-front
     /// statuses captured for `Info` / `Tracks` / `Tags` / `Cues` /
     /// `Chapters` / `Attachments` / `SeekHead` at open time **and** the
-    /// statuses captured per `Cluster` as the demuxer first encounters each
-    /// one through [`MkvDemuxer::next_packet`] / [`Demuxer::seek_to`]. The
+    /// statuses captured per `Cluster` once the walk through
+    /// [`MkvDemuxer::next_packet`] / [`Demuxer::seek_to`] has read it. The
     /// element id distinguishes the two (e.g. [`ids::CLUSTER`] for the
     /// per-Cluster checks).
     crc_status: Vec<CrcStatus>,
@@ -8992,7 +8969,7 @@ pub struct MkvDemuxer {
     /// same bytes and loop.
     resync_floor: u64,
     /// Absolute offset of the first `Cluster` element header — the anchor
-    /// for the resilient Cues-less seek fallback
+    /// for the Cues-less seek
     /// ([`MkvDemuxer::seek_by_cluster_scan`]). `None` for a legal
     /// zero-Cluster (metadata-only) Segment — the schema gives `Cluster`
     /// no `minOccurs` — in which case `next_packet` reports a clean
@@ -9077,17 +9054,13 @@ impl Demuxer for MkvDemuxer {
                 "MKV: stream index {stream_index} out of range"
             )));
         }
+        // A seek leaves the Cluster being walked: its CRC stays unchecked.
+        self.input.crc = None;
         if self.cues.is_empty() {
-            if self.resilient {
-                // Cues-less / damaged-Cues fallback (RFC 9559 §22.1 only
-                // RECOMMENDS a Cues element): linearly scan Cluster
-                // Timestamps and land on the last Cluster at or before
-                // the target.
-                return self.seek_by_cluster_scan(stream_index, pts);
-            }
-            return Err(Error::unsupported(
-                "MKV: no Cues index in file — cannot seek",
-            ));
+            // Cues-less file (RFC 9559 §22.1 only RECOMMENDS a Cues
+            // element — live recordings and files written to a pipe have
+            // none): scan the Clusters up to the target.
+            return self.seek_by_cluster_scan(stream_index, pts);
         }
         let track_number = self.track_number_by_index[stream_index as usize];
 
@@ -9296,14 +9269,16 @@ impl MkvDemuxer {
     /// Elements without a `CRC-32` child are not represented — the
     /// spec lets a writer omit them.
     ///
-    /// Up-front Top-Level masters land at open time. Cluster statuses
-    /// are appended as the demuxer first walks each Cluster — either
-    /// through [`Demuxer::next_packet`] driving the legacy `advance`
-    /// loop, or through a cue-driven [`Demuxer::seek_to`] that opens a
-    /// Cluster header. A Cluster is recorded at most once even if a
-    /// back-then-forward seek revisits it. The element id on a Cluster
-    /// status is [`ids::CLUSTER`]; Cluster bodies declared with the
-    /// unknown-size VINT can't be CRC-checked (the spec requires a
+    /// Up-front Top-Level masters land at open time. A Cluster's CRC is
+    /// computed over the bytes the walk reads as it returns the
+    /// Cluster's packets — through [`Demuxer::next_packet`] driving the
+    /// `advance` loop, or after a [`Demuxer::seek_to`] lands inside the
+    /// Cluster — and its status is appended once the walk has read the
+    /// whole Cluster; a Cluster the walk leaves early (a seek away, a
+    /// damaged child) gets none. A Cluster is recorded at most once even
+    /// if a back-then-forward seek revisits it. The element id on a
+    /// Cluster status is [`ids::CLUSTER`]; Cluster bodies declared with
+    /// the unknown-size VINT can't be CRC-checked (the spec requires a
     /// bounded body) and produce no status.
     ///
     /// Validation is informational: a mismatching CRC does **not** stop
@@ -9314,7 +9289,7 @@ impl MkvDemuxer {
     ///
     /// Returned in the order the elements were validated — Top-Level
     /// masters in Segment order at open time, then each Cluster in the
-    /// order it was first opened by `next_packet` / `seek_to`.
+    /// order the walk finished reading it.
     pub fn crc_status(&self) -> &[CrcStatus] {
         &self.crc_status
     }
@@ -10885,34 +10860,38 @@ impl MkvDemuxer {
         Ok(())
     }
 
-    /// Validate a `Cluster` element's leading `CRC-32` child (RFC 8794
-    /// §11.3.1, RFC 9559 §6.2) and record the result on
-    /// [`Self::crc_status`] if not already done for this Cluster.
+    /// Start checking a `Cluster` element's leading `CRC-32` child (RFC
+    /// 8794 §11.3.1, RFC 9559 §6.2), with the reader at `body_start`.
     ///
     /// `body_start` is the absolute file offset of the Cluster's body
     /// (the byte right after the Cluster's id+size header). `body_end` is
     /// the absolute file offset of the byte right after the last child of
-    /// the Cluster. The reader is left at `body_start` on return so the
-    /// regular Cluster walk proceeds unchanged.
+    /// the Cluster. Only the first child's header is read here: when it is
+    /// a `CRC-32`, the reader is left right after it and [`ClusterReader`]
+    /// computes the CRC over the rest of the body as the walk reads it, so
+    /// packets are returned as their Blocks arrive; the status lands on
+    /// [`Self::crc_status`] once the walk has read the whole body (see
+    /// [`Self::finish_cluster_crc`]). Otherwise the reader is left at
+    /// `body_start`.
     ///
     /// Best-effort and *informational*:
     /// * A Cluster declared with unknown size (`body_end ==
     ///   self.segment_data_end`) can't be CRC-checked — RFC 8794 §11.3.1
     ///   requires a bounded body — so the check is skipped.
-    /// * A non-bounded body, a truncated read, or any other I/O hiccup
-    ///   silently degrades to "no status recorded"; the Cluster still
-    ///   demuxes normally per RFC 8794 §12 ("a reader MAY ignore the
-    ///   data").
+    /// * A truncated read, a walk that leaves the Cluster early (a seek, a
+    ///   damaged child) or any other I/O hiccup silently degrades to "no
+    ///   status recorded"; the Cluster still demuxes normally per RFC 8794
+    ///   §12 ("a reader MAY ignore the data").
     /// * The dedup set keyed on `body_start` guarantees the same Cluster
-    ///   isn't recorded twice when a back-then-forward seek revisits it,
-    ///   or when both `advance` and `apply_cue_relative_position` open
-    ///   the same Cluster on the same `next_packet` call chain.
+    ///   isn't recorded twice when a back-then-forward seek revisits it.
     fn validate_cluster_crc(
         &mut self,
         body_start: u64,
         body_end: u64,
         is_unknown_size: bool,
     ) -> Result<()> {
+        // Whatever the previous Cluster left unchecked is moot now.
+        self.input.crc = None;
         if body_end <= body_start {
             return Ok(());
         }
@@ -10925,20 +10904,46 @@ impl MkvDemuxer {
         if self.validated_cluster_starts.contains(&body_start) {
             return Ok(());
         }
-        let status =
-            match validate_top_level_crc(&mut *self.input, ids::CLUSTER, body_start, body_end) {
-                Ok(s) => s,
-                Err(_) => {
-                    // Make sure the reader is at body_start even on error.
-                    self.input.seek(SeekFrom::Start(body_start))?;
-                    return Ok(());
-                }
-            };
-        self.validated_cluster_starts.insert(body_start);
-        if let Some(s) = status {
-            self.crc_status.push(s);
+        // A CRC-32 element is fixed at 4 bytes; any other size is
+        // malformed — "no CRC to check" rather than an error.
+        let stored = match read_element_header(&mut *self.input) {
+            Ok(e) if e.id == ids::CRC32 && e.size == 4 => read_bytes(&mut *self.input, 4).ok(),
+            _ => None,
+        };
+        let crc_end = self.input.stream_position()?;
+        match stored {
+            Some(v) if crc_end <= body_end => {
+                self.input.crc = Some(RunningCrc {
+                    body_start,
+                    stored: u32::from_le_bytes([v[0], v[1], v[2], v[3]]),
+                    crc: 0,
+                    next: crc_end,
+                    end: body_end,
+                });
+                // A Cluster holding nothing but its CRC-32 is complete.
+                self.finish_cluster_crc();
+            }
+            _ => {
+                self.input.seek(SeekFrom::Start(body_start))?;
+            }
         }
         Ok(())
+    }
+
+    /// Record the Cluster `CRC-32` that [`ClusterReader`] computed, once
+    /// the walk has read the whole Cluster body.
+    fn finish_cluster_crc(&mut self) {
+        if !self.input.crc.as_ref().is_some_and(|c| c.next == c.end) {
+            return;
+        }
+        if let Some(c) = self.input.crc.take() {
+            self.validated_cluster_starts.insert(c.body_start);
+            self.crc_status.push(CrcStatus {
+                element_id: ids::CLUSTER,
+                stored: c.stored,
+                computed: c.crc,
+            });
+        }
     }
 
     /// Resynchronise the Cluster stream after a parse error at (or after)
@@ -10953,6 +10958,7 @@ impl MkvDemuxer {
     /// keeps failing to parse cannot be re-matched forever.
     fn resync_cluster_stream(&mut self, failed_at: u64) -> Result<()> {
         self.cluster_state = ClusterState::Idle;
+        self.input.crc = None;
         let from = failed_at.saturating_add(1).max(self.resync_floor);
         let found =
             scan_top_level_element(&mut *self.input, from, self.segment_data_end).unwrap_or(None);
@@ -11030,14 +11036,24 @@ impl MkvDemuxer {
         }
     }
 
-    /// Resilient Cues-less seek: walk the Cluster chain from the first
-    /// Cluster, reading each Cluster's `Timestamp` (RFC 9559 §5.1.3.1 —
-    /// SHOULD be the first child, or the second after a `CRC-32`), and
-    /// land on the last Cluster whose timestamp is at or before the
-    /// target. RFC 9559 §22.1 only RECOMMENDS a `Cues` element, so a
-    /// file with no (or damaged, hence skipped) `Cues` is still legal —
-    /// this is the O(clusters) recovery path a resilient Reader offers
-    /// where the strict path returns `Error::Unsupported`.
+    /// Cues-less seek. RFC 9559 §22.1 only RECOMMENDS a `Cues` element,
+    /// so a file without one (a live recording, a file written to a pipe)
+    /// is sought from its Clusters, the way FFmpeg indexes such a file.
+    ///
+    /// The Cluster chain is walked from the first Cluster reading only
+    /// each Cluster's `Timestamp` (RFC 9559 §5.1.3.1 — SHOULD be the first
+    /// child, or the second after a `CRC-32`), up to the first Cluster
+    /// starting after the target. Those Clusters are then searched newest
+    /// first, reading Block headers only, for the last keyframe of
+    /// `stream_index`'s track at or before the target. When the track's
+    /// first Block in that Cluster is a keyframe, the seek lands on the
+    /// Cluster's start, like a Cue without `CueRelativePosition`, and
+    /// returns the Cluster's timestamp; otherwise the reader is left on
+    /// the keyframe's Block, so it is the first packet `next_packet`
+    /// returns, and its timestamp is returned. Without such a keyframe the
+    /// seek lands on the last Cluster starting at or before the target
+    /// (the first Cluster for an earlier target), like the Cluster-start
+    /// case.
     ///
     /// Damage-tolerant like the rest of the resilient stream walk: an
     /// unparseable stretch is stepped over with the same Top-Level scan
@@ -11046,17 +11062,24 @@ impl MkvDemuxer {
     fn seek_by_cluster_scan(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
         let target_ticks = self.stream_pts_to_ticks(stream_index, pts);
         // A zero-Cluster Segment has nothing to scan — same signal the
-        // strict path gives when it has no Cues to seek by.
+        // Cues path gives when it has nothing to land on.
         let Some(mut pos) = self.first_cluster_offset else {
             return Err(Error::unsupported(
                 "MKV: no Clusters in Segment — cannot seek",
             ));
         };
-        // (cluster header offset, cluster timestamp) of the best-so-far
-        // candidate; the first parseable Cluster seeds it so a target
-        // before the first Cluster lands there (mirroring the Cues path's
-        // first-cue fallback).
-        let mut best: Option<(u64, u64)> = None;
+        // Header offsets of the Clusters starting at or before the target,
+        // in Segment order. A file of tiny Clusters must not grow this
+        // without bound: at the cap every other entry is dropped, and the
+        // keyframe search below walks the wider gaps.
+        let mut starts: Vec<u64> = Vec::new();
+        // Where the keyframe search ends: the first Cluster starting after
+        // the target, else the Segment end.
+        let mut scan_end = self.segment_data_end;
+        // (header offset, timestamp) of the Cluster to land on when the
+        // track has no keyframe at or before the target: the last Cluster
+        // starting at or before it, else the first parseable Cluster.
+        let mut fallback: Option<(u64, u64)> = None;
         while pos < self.segment_data_end {
             self.input.seek(SeekFrom::Start(pos))?;
             let e = match read_element_header(&mut *self.input) {
@@ -11107,20 +11130,34 @@ impl MkvDemuxer {
                     }
                 }
                 if let Some(tc) = tc {
-                    if tc <= target_ticks || best.is_none() {
-                        best = Some((pos, tc));
-                    }
-                    if tc >= target_ticks {
+                    if tc > target_ticks {
                         // Clusters are stored in ascending time order
-                        // (§11.1) — nothing later can be a better match.
+                        // (§11.1) — nothing later can hold the keyframe.
+                        fallback.get_or_insert((pos, tc));
+                        scan_end = pos;
                         break;
                     }
+                    fallback = Some((pos, tc));
+                    if starts.len() == MAX_SEEK_SCAN_CLUSTERS {
+                        let mut keep = false;
+                        starts.retain(|_| {
+                            keep = !keep;
+                            keep
+                        });
+                    }
+                    starts.push(pos);
                 }
             }
             // Advance to the next Top-Level element: directly for a
-            // bounded element, by scanning for an unknown-size one (its
-            // end is only defined by the next sibling — §6.2).
-            pos = match bounded_end {
+            // bounded element, over the children of an unknown-size
+            // Cluster (its end is only defined by the next sibling —
+            // §6.2), by scanning for anything else.
+            let next = match bounded_end {
+                Some(end) => Some(end),
+                None if e.id == ids::CLUSTER => self.unknown_size_cluster_end(body_start)?,
+                None => None,
+            };
+            pos = match next {
                 Some(end) if end > pos => end,
                 _ => match scan_top_level_element(
                     &mut *self.input,
@@ -11132,7 +11169,15 @@ impl MkvDemuxer {
                 },
             };
         }
-        let (cluster_off, landed_ticks) = best
+        let track = self.track_number_by_index[stream_index as usize];
+        let mut end = scan_end;
+        for &start in starts.iter().rev() {
+            if let Some(kf) = self.last_keyframe_between(start, end, track, target_ticks)? {
+                return self.land_on_keyframe(stream_index, kf);
+            }
+            end = start;
+        }
+        let (cluster_off, landed_ticks) = fallback
             .ok_or_else(|| Error::unsupported("MKV: no parseable Cluster Timestamp to seek by"))?;
         self.input.seek(SeekFrom::Start(cluster_off))?;
         self.cluster_state = ClusterState::Idle;
@@ -11141,6 +11186,207 @@ impl MkvDemuxer {
         self.last_block_group_meta = None;
         self.last_virtual_origin = None;
         Ok(self.ticks_to_stream_pts(stream_index, landed_ticks))
+    }
+
+    /// Where an unknown-size Cluster whose body starts at `body_start`
+    /// ends: at its first child that is a Top-Level element (RFC 8794
+    /// §6.2), found by stepping over the children by their sizes. `None`
+    /// when a child can't be parsed or stepped over.
+    fn unknown_size_cluster_end(&mut self, body_start: u64) -> Result<Option<u64>> {
+        let mut pos = body_start;
+        while pos < self.segment_data_end {
+            self.input.seek(SeekFrom::Start(pos))?;
+            let c = match read_element_header(&mut *self.input) {
+                Ok(c) => c,
+                Err(_) => return Ok(None),
+            };
+            if TOP_LEVEL_IDS.contains(&c.id) {
+                return Ok(Some(pos));
+            }
+            if c.size == VINT_UNKNOWN_SIZE {
+                return Ok(None);
+            }
+            pos = self.input.stream_position()?.saturating_add(c.size);
+        }
+        Ok(Some(self.segment_data_end))
+    }
+
+    /// The last keyframe of track `track` at or before `target_ticks`
+    /// among the Clusters from the one whose header is at `start` up to
+    /// `end`, found by reading Block headers only: a `SimpleBlock` with
+    /// its keyframe flag set, or a `BlockGroup` without `ReferenceBlock`
+    /// (RFC 9559 §10.2 / §5.1.3.5.5).
+    fn last_keyframe_between(
+        &mut self,
+        start: u64,
+        end: u64,
+        track: u64,
+        target_ticks: u64,
+    ) -> Result<Option<ScanKeyframe>> {
+        let mut best: Option<ScanKeyframe> = None;
+        let mut pos = start;
+        while pos < end {
+            self.input.seek(SeekFrom::Start(pos))?;
+            let e = match read_element_header(&mut *self.input) {
+                Ok(e) => e,
+                Err(_) => break,
+            };
+            let body_start = self.input.stream_position()?;
+            let unknown_size = e.size == VINT_UNKNOWN_SIZE;
+            let walk_end = if unknown_size {
+                self.segment_data_end
+            } else {
+                body_start.saturating_add(e.size).min(self.segment_data_end)
+            };
+            if e.id != ids::CLUSTER {
+                if unknown_size {
+                    break;
+                }
+                pos = walk_end;
+                continue;
+            }
+            // The body end the Cluster walk uses — see `advance`.
+            let body_end = if unknown_size || self.resilient {
+                walk_end
+            } else {
+                body_start.saturating_add(e.size)
+            };
+            // Blocks before the Timestamp decode against 0, as in `advance`.
+            let mut cluster_timecode: i64 = 0;
+            // Whether the track's first Block in this Cluster is a keyframe.
+            let mut first_keyframe: Option<bool> = None;
+            let mut child = body_start;
+            let mut cluster_stop = Some(walk_end);
+            while child < walk_end {
+                self.input.seek(SeekFrom::Start(child))?;
+                let c = match read_element_header(&mut *self.input) {
+                    Ok(c) if c.size != VINT_UNKNOWN_SIZE => c,
+                    _ => {
+                        cluster_stop = None;
+                        break;
+                    }
+                };
+                if unknown_size && TOP_LEVEL_IDS.contains(&c.id) {
+                    cluster_stop = Some(child);
+                    break;
+                }
+                let c_body = self.input.stream_position()?;
+                let c_end = c_body.saturating_add(c.size);
+                // `(keyframe, timestamp offset)` of a Block of the track.
+                let block = match c.id {
+                    ids::TIMECODE => {
+                        if let Ok(v) = read_uint(&mut *self.input, c.size as usize) {
+                            cluster_timecode = v as i64;
+                        }
+                        None
+                    }
+                    ids::SIMPLE_BLOCK => match self.read_block_header(c.size)? {
+                        Some((t, offset, flags)) if t == track => Some((flags & 0x80 != 0, offset)),
+                        _ => None,
+                    },
+                    ids::BLOCK_GROUP => {
+                        let mut block = None;
+                        let mut referenced = false;
+                        let mut g = c_body;
+                        while g < c_end.min(walk_end) {
+                            self.input.seek(SeekFrom::Start(g))?;
+                            let gc = match read_element_header(&mut *self.input) {
+                                Ok(gc) if gc.size != VINT_UNKNOWN_SIZE => gc,
+                                _ => break,
+                            };
+                            let gc_body = self.input.stream_position()?;
+                            match gc.id {
+                                ids::BLOCK => block = self.read_block_header(gc.size)?,
+                                ids::REFERENCE_BLOCK => referenced = true,
+                                _ => {}
+                            }
+                            g = gc_body.saturating_add(gc.size);
+                        }
+                        match block {
+                            Some((t, offset, _)) if t == track => Some((!referenced, offset)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some((keyframe, offset)) = block {
+                    let at_cluster_start = *first_keyframe.get_or_insert(keyframe);
+                    let time = cluster_timecode.saturating_add(offset);
+                    if keyframe
+                        && i128::from(time) <= i128::from(target_ticks)
+                        && best.map_or(true, |b| time > b.time)
+                    {
+                        best = Some(ScanKeyframe {
+                            cluster: pos,
+                            block: child,
+                            body_start,
+                            body_end,
+                            unknown_size,
+                            cluster_timecode,
+                            time,
+                            at_cluster_start,
+                        });
+                    }
+                }
+                child = c_end;
+            }
+            match cluster_stop {
+                Some(next) if next > pos => pos = next,
+                _ => break,
+            }
+        }
+        Ok(best)
+    }
+
+    /// Read the header of a Block body of `size` bytes at the reader
+    /// (RFC 9559 §10.1): track number, signed 16-bit timestamp offset and
+    /// flags. `None` when the body is too short to hold one.
+    fn read_block_header(&mut self, size: u64) -> Result<Option<(u64, i64, u8)>> {
+        // An 8-octet track number VINT plus timestamp and flags.
+        let mut head = [0u8; 11];
+        let len = size.min(head.len() as u64) as usize;
+        if self.input.read_exact(&mut head[..len]).is_err() {
+            return Ok(None);
+        }
+        let mut cur = std::io::Cursor::new(&head[..len]);
+        let Ok((track, _)) = read_vint(&mut cur, false) else {
+            return Ok(None);
+        };
+        let mut rest = [0u8; 3];
+        if cur.read_exact(&mut rest).is_err() {
+            return Ok(None);
+        }
+        Ok(Some((
+            track,
+            i16::from_be_bytes([rest[0], rest[1]]) as i64,
+            rest[2],
+        )))
+    }
+
+    /// Leave the reader where a Cues-less seek lands for the keyframe it
+    /// found — see [`Self::seek_by_cluster_scan`]: the Cluster header, or
+    /// the keyframe's Block inside the Cluster the way
+    /// `apply_cue_relative_position` lands on a Cue's Block.
+    fn land_on_keyframe(&mut self, stream_index: u32, kf: ScanKeyframe) -> Result<i64> {
+        self.out_queue.clear();
+        self.last_block_additions = None;
+        self.last_block_group_meta = None;
+        self.last_virtual_origin = None;
+        if kf.at_cluster_start {
+            self.input.seek(SeekFrom::Start(kf.cluster))?;
+            self.cluster_state = ClusterState::Idle;
+            return Ok(self.ticks_to_stream_pts(stream_index, kf.cluster_timecode.max(0) as u64));
+        }
+        self.input.seek(SeekFrom::Start(kf.body_start))?;
+        self.validate_cluster_crc(kf.body_start, kf.body_end, kf.unknown_size)?;
+        self.input.seek(SeekFrom::Start(kf.block))?;
+        self.register_cluster_record(kf.body_start);
+        self.cluster_state = ClusterState::InCluster {
+            body_start: kf.body_start,
+            body_end: kf.body_end,
+            cluster_timecode: kf.cluster_timecode,
+        };
+        Ok(self.ticks_to_stream_pts(stream_index, kf.time.max(0) as u64))
     }
 
     /// Parse a `Tags` element encountered during the Cluster walk and
@@ -11228,10 +11474,9 @@ impl MkvDemuxer {
                         } else {
                             body_start.saturating_add(e.size)
                         };
-                        // Validate the Cluster's leading CRC-32 child if
-                        // present (RFC 8794 §11.3.1, RFC 9559 §6.2). The
-                        // helper rewinds the reader to `body_start` so the
-                        // child-element walk below sees the same bytes.
+                        // Start checking the Cluster's leading CRC-32 child
+                        // if present (RFC 8794 §11.3.1, RFC 9559 §6.2); the
+                        // CRC is computed as the walk below reads the body.
                         self.validate_cluster_crc(body_start, body_end, is_unknown_size)?;
                         self.register_cluster_record(body_start);
                         self.cluster_state = ClusterState::InCluster {
@@ -11356,6 +11601,8 @@ impl MkvDemuxer {
                     }
                     _ => skip(&mut *self.input, e.size)?,
                 }
+                // The child just read may have been the Cluster's last.
+                self.finish_cluster_crc();
                 Ok(())
             }
         }

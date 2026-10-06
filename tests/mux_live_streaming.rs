@@ -99,16 +99,21 @@ fn live_layout_omits_seek_head_and_cues() {
     assert!(contains_id(&vod, SEEK_HEAD_ID));
     assert!(contains_id(&vod, CUES_ID));
 
-    // A live stream still demuxes every packet through the strict path...
+    // A live stream still demuxes every packet through the strict path,
+    // and seeks there through the Cluster-Timestamp scan: like FFmpeg, the
+    // demuxer doesn't take §23.2's non-seekable SHOULD for a finished
+    // recording it can read back.
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(live.clone()));
     let mut dmx = oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert!(dmx.seek_entries().is_empty(), "no SeekHead parsed");
     assert_eq!(drain(&mut dmx).len(), 13);
-    // ...but is non-seekable there (§23.2's SHOULD signal in action).
-    assert!(dmx.seek_to(0, 0).is_err());
+    assert_eq!(dmx.seek_to(0, 7000).expect("strict live seek"), 6000);
+    assert_eq!(
+        drain(&mut dmx),
+        vec![6000, 7000, 8000, 9000, 10000, 11000, 12000]
+    );
 
-    // The resilient path recovers seekability via the Cluster-Timestamp
-    // scan fallback.
+    // So does the resilient path.
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(live));
     let mut dmx =
         oxideav_mkv::demux::open_resilient_typed(rs, &oxideav_core::NullCodecResolver).unwrap();

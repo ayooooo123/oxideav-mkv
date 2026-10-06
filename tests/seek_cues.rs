@@ -8,7 +8,7 @@
 //! * `landed_pts <= target_pts`  (never overshoots the request)
 //! * the first packet read after the seek carries `pts >= landed_pts`
 //!   (we landed on the cluster the cue pointed at, not an earlier one)
-//! * a missing-Cues file returns `Error::Unsupported`.
+//! * a missing-Cues file seeks by scanning its Clusters.
 //!
 //! The file uses a 1 ms timecode scale so Matroska ticks and stream-side
 //! pts are numerically identical — makes the assertions easy to read.
@@ -308,16 +308,20 @@ fn seek_to_before_start_uses_first_cue() {
 }
 
 #[test]
-fn seek_to_without_cues_is_unsupported() {
+fn seek_to_without_cues_scans_clusters() {
+    // RFC 9559 §22.1 only RECOMMENDS Cues: without them the seek scans
+    // the Clusters and lands on the one holding the last keyframe at or
+    // before the target.
     let (bytes, _) = build_mkv_with_cues(false);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
     let mut dmx =
         oxideav_mkv::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux open");
 
-    match dmx.seek_to(0, 1000) {
-        Err(Error::Unsupported(_)) => {}
-        other => panic!("expected Error::Unsupported without Cues, got {other:?}"),
-    }
+    let landed = dmx.seek_to(0, 1500).expect("Cues-less seek");
+    assert_eq!(landed, 1000);
+    let pkt = dmx.next_packet().expect("packet after Cues-less seek");
+    assert_eq!(pkt.pts, Some(1000));
+    assert_eq!(pkt.data, vec![0xBB]);
 }
 
 #[test]

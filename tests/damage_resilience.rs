@@ -411,9 +411,8 @@ fn unrecoverable_tail_ends_stream_cleanly() {
 }
 
 // =====================================================================
-// 8. Cues-less seek fallback — RFC 9559 §22.1 only RECOMMENDS Cues; the
-//    resilient path seeks by scanning Cluster Timestamps where the
-//    strict path returns Unsupported.
+// 8. Cues-less seek fallback — RFC 9559 §22.1 only RECOMMENDS Cues; both
+//    paths seek by scanning Cluster Timestamps.
 // =====================================================================
 
 #[test]
@@ -421,10 +420,8 @@ fn resilient_seek_without_cues_scans_cluster_timestamps() {
     let bytes = three_cluster_file(); // no Cues element at all
 
     let mut strict = open_strict(bytes.clone()).expect("open");
-    assert!(
-        strict.seek_to(0, 1500).is_err(),
-        "strict path stays Unsupported without Cues"
-    );
+    assert_eq!(strict.seek_to(0, 1500).expect("strict seek"), 1000);
+    assert_eq!(drain(&mut strict), vec![(1000, 0x22), (2000, 0x33)]);
 
     let mut dmx = open_resilient(bytes).expect("open");
     // Mid-file target snaps back to the cluster at 1000 ms.
