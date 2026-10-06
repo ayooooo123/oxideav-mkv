@@ -278,6 +278,21 @@ fn resync_recovers_after_forged_block_size_mid_cluster() {
     assert_eq!(dmx.damage_events()[0].kind(), DamageKind::ClusterStream);
 }
 
+#[test]
+fn unknown_child_cannot_skip_over_later_clusters() {
+    let damaged = elem_master(ids::CLUSTER, &[
+        elem_uint(ids::TIMECODE, 1000),
+        elem_forged_size(0xea, 1 << 20, &[0xaa; 16]),
+    ].concat());
+    let bytes = file_with_segment_body(&[
+        info_master(), tracks_master(), cluster(0, 0x11),
+        damaged, cluster(2000, 0x33),
+    ].concat());
+    let mut d = open_strict(bytes).unwrap();
+    assert_eq!(drain(&mut d), vec![(0, 0x11), (2000, 0x33)]);
+    assert_eq!(d.damage_events().len(), 1);
+}
+
 // =====================================================================
 // 4. Truncation — every cut point yields a packet prefix + clean Eof,
 //    never a panic.

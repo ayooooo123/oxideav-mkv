@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are bounded. Empty frames without BlockAdditions no longer emit packets.
 - Both open paths resynchronize after Cluster-stream parse errors and end
   a truncated tail with EOF, retaining complete packets before the damage.
+  Unknown children are bounded to their Cluster before skipping, so a
+  forged size cannot bypass later Clusters.
   Empty-frame filtering runs after decompression, so a header-stripped
   zero-byte frame still emits its restored header.
 - Laces advance by their per-frame durations rather than repeating the

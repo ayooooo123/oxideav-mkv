@@ -8988,9 +8988,8 @@ pub struct MkvDemuxer {
     /// pushing a duplicate row).
     cluster_record_by_offset: std::collections::HashMap<u64, usize>,
     /// `true` when constructed via [`open_resilient`] /
-    /// [`open_resilient_typed`] — a parse error in the Cluster stream
-    /// triggers a resynchronisation scan instead of failing
-    /// [`Demuxer::next_packet`]. See [`MkvDemuxer::is_resilient`].
+    /// [`open_resilient_typed`] — metadata-open errors are recoverable.
+    /// Cluster-stream errors recover on either path.
     resilient: bool,
     /// Every recovery performed so far — open-time master skips first,
     /// then stream-time resyncs in the order they happened. See
@@ -11562,6 +11561,15 @@ impl MkvDemuxer {
                     return Ok(());
                 }
                 let e = read_element_header(&mut *self.input)?;
+                // Even an unknown child must fit this Cluster. Seeking over
+                // its forged size can otherwise leap past later Clusters
+                // without producing an error for the recovery path.
+                if !TOP_LEVEL_IDS.contains(&e.id)
+                    && (e.size == VINT_UNKNOWN_SIZE
+                        || self.input.stream_position()?.saturating_add(e.size) > body_end)
+                {
+                    return Err(Error::invalid("MKV: child exceeds Cluster"));
+                }
                 match e.id {
                     ids::TIMECODE => {
                         let v = read_uint(&mut *self.input, e.size as usize)? as i64;
