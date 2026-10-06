@@ -44,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `D_WEBVTT/*` streams resolve to the `webvtt` subtitle decoder. Packets
   contain FFmpeg's cue text; identifier and settings are retained separately
   by `MkvDemuxer::webvtt_metadata()`. `S_TEXT/WEBVTT` stays raw.
+- Open follows nested SeekHeads for trailing Info and Tracks, including
+  tracks after an unknown-size Cluster. Cycles and excessive index chains
+  are bounded. Empty frames without BlockAdditions no longer emit packets.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.10...v0.0.11) - 2026-10-04
 

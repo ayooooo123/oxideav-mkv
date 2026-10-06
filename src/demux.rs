@@ -212,6 +212,7 @@ fn open_typed_impl(
     let mut tracks: Vec<TrackEntry> = Vec::new();
     let mut first_cluster_offset: Option<u64> = None;
     let mut metadata: Vec<(String, String)> = Vec::new();
+    let mut have_info = false;
     let mut cues: Vec<CueEntry> = Vec::new();
     // Typed `Cues > CuePoint` tree (RFC 9559 §5.1.5.1), surfaced via
     // `MkvDemuxer::cue_points` — populated alongside the denormalised
@@ -336,6 +337,7 @@ fn open_typed_impl(
                 ids::INFO => {
                     let end = body_end_known.unwrap_or(segment_data_end);
                     parse_info(&mut *input, end, &mut info, &mut metadata)?;
+                    have_info = true;
                 }
                 ids::TRACKS => {
                     let end = body_end_known.unwrap_or(segment_data_end);
@@ -454,13 +456,21 @@ fn open_typed_impl(
     // merged, so a hostile SeekHead can't corrupt the surfaced state.
     if first_cluster_offset.is_some() {
         let resume_pos = input.stream_position()?;
-        let mut chase: Vec<(u32, u64)> = Vec::new();
-        for se in &seek_entries {
+        let mut visited = std::collections::HashSet::new();
+        let mut cursor = 0;
+        // Follow nested SeekHeads without recursion; reject cycles and bound
+        // the work even when a hostile file chains many distinct indexes.
+        while cursor < seek_entries.len() && visited.len() < 4096 {
+            let se = &seek_entries[cursor];
+            cursor += 1;
             let Some(id) = se.seek_id() else { continue };
             if !se.has_position() {
                 continue;
             }
             let wanted = match id {
+                ids::INFO => !have_info,
+                ids::TRACKS => tracks.is_empty(),
+                ids::SEEK_HEAD => true,
                 ids::CUES => cues.is_empty(),
                 ids::TAGS => pending_tags.is_empty(),
                 ids::CHAPTERS => editions.is_empty(),
@@ -468,21 +478,21 @@ fn open_typed_impl(
                 _ => false,
             };
             let abs = segment_data_start.saturating_add(se.seek_position());
-            if wanted
-                && abs >= resume_pos
-                && abs < segment_data_end
-                && !chase.iter().any(|(i, _)| *i == id)
+            if !wanted || abs < resume_pos || abs >= segment_data_end
+                || !visited.insert((id, abs))
             {
-                chase.push((id, abs));
+                continue;
             }
-        }
-        for (id, abs) in chase {
             let _ = follow_seek_target(
                 &mut *input,
                 id,
                 abs,
                 segment_data_end,
                 &mut crc_status,
+                &mut info,
+                &mut have_info,
+                &mut tracks,
+                &mut seek_entries,
                 &mut cues,
                 &mut cue_points,
                 &mut pending_tags,
@@ -7577,6 +7587,10 @@ fn follow_seek_target(
     abs: u64,
     segment_data_end: u64,
     crc_status: &mut Vec<CrcStatus>,
+    info: &mut SegmentInfo,
+    have_info: &mut bool,
+    tracks: &mut Vec<TrackEntry>,
+    seek_entries: &mut Vec<SeekEntry>,
     cues: &mut Vec<CueEntry>,
     cue_points: &mut Vec<CuePoint>,
     pending_tags: &mut Vec<RawTag>,
@@ -7604,6 +7618,24 @@ fn follow_seek_target(
     // status only when the parse below succeeds.
     let crc = validate_top_level_crc(r, e.id, body_start, end)?;
     match e.id {
+        ids::INFO => {
+            let mut tmp_info = SegmentInfo::default();
+            let mut tmp_meta = Vec::new();
+            parse_info(r, end, &mut tmp_info, &mut tmp_meta)?;
+            *info = tmp_info;
+            *have_info = true;
+            metadata.extend(tmp_meta);
+        }
+        ids::TRACKS => {
+            let mut tmp = Vec::new();
+            parse_tracks(r, end, &mut tmp)?;
+            tracks.extend(tmp);
+        }
+        ids::SEEK_HEAD => {
+            let mut tmp = Vec::new();
+            parse_seek_head(r, end, &mut tmp)?;
+            seek_entries.extend(tmp);
+        }
         ids::CUES => {
             let mut tmp_cues = Vec::new();
             let mut tmp_points = Vec::new();
@@ -11762,6 +11794,11 @@ impl MkvDemuxer {
         let n_frames = frames.len() as i64;
         let per_frame = explicit_duration.map(|d| d / n_frames.max(1));
         for (i, f) in frames.into_iter().enumerate() {
+            // An empty frame has no packet in FFmpeg unless BlockAdditions
+            // give it side-channel content (e.g. WebM alpha).
+            if f.is_empty() && additions.is_none() {
+                continue;
+            }
             let pts = pts_base + per_frame.unwrap_or(0) * i as i64;
             // Block scope (RFC 9559 §5.1.4.1.31.3 bit 0x1) is "all frame
             // contents, excluding lacing data": each de-laced frame is
