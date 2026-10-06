@@ -178,18 +178,21 @@ fn roundtrip_additions_duration_and_max_id() {
 fn non_keyframe_round_trips_via_reference_block() {
     // §5.1.3.5.5: a plain Block has no KEY flag bit, so the muxer must
     // write a ReferenceBlock for a non-keyframe — the demuxer infers
-    // keyframe-ness from the element's absence/presence.
+    // keyframe-ness from the element's absence/presence. The payloads
+    // lead with VP9 frame headers that agree (0x82: key frame, 0x86:
+    // inter frame), as the demuxer reads VP9 frame types the way
+    // FFmpeg's parser does.
     let streams = [video_stream(0)];
     let bytes = mux_with(&streams, |mx| {
         mx.set_max_block_addition_id(0, 1).expect("declare");
         mx.write_header().expect("write_header");
         mx.write_packet_with_additions(
-            &packet(0, 0, true, 0x11, 8),
+            &packet(0, 0, true, 0x82, 8),
             &[MkvBlockAddition::codec_defined(vec![0x33; 2])],
         )
         .expect("keyframe group");
         mx.write_packet_with_additions(
-            &packet(0, 40, false, 0x22, 8),
+            &packet(0, 40, false, 0x86, 8),
             &[MkvBlockAddition::codec_defined(vec![0x44; 2])],
         )
         .expect("non-keyframe group");

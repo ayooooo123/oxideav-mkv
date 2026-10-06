@@ -32,6 +32,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compressed `CodecPrivate` (scope `0x2`) reaches the stream's extradata
   decompressed. A frame that fails to decompress is an error. A chain
   holding an encryption still leaves the data as stored.
+- Keyframe flags follow FFmpeg instead of flagging every `SimpleBlock`
+  packet a keyframe: the Block's own signal (the `SimpleBlock` keyframe
+  bit, a `BlockGroup` without `ReferenceBlock`), read through the codec
+  parser FFmpeg runs over the track — an H.264 IDR / recovery point /
+  single-reference I slice, a VP8 / VP9 / AV1 key frame, a Theora intra
+  frame, a TrueHD / MLP major sync decide — and every packet of an
+  intra-only codec (all audio but AAC / MLP / TrueHD; ProRes, MJPEG,
+  JPEG 2000, raw video) or of a subtitle track is a keyframe. HEVC, AAC
+  and codecs without such a reading keep the Block's signal.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.10...v0.0.11) - 2026-10-04
 

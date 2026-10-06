@@ -8,6 +8,7 @@
 //! Block` elements (lacing-aware) as the reader reaches them.
 
 mod content;
+mod parser;
 mod video_config;
 
 use std::io::{Read, Seek, SeekFrom};
@@ -535,6 +536,10 @@ fn open_typed_impl(
     let mut streams: Vec<StreamInfo> = Vec::new();
     let mut track_index_by_number: std::collections::HashMap<u64, u32> =
         std::collections::HashMap::new();
+    // Per-stream codec as FFmpeg identifies it, and the codec parser FFmpeg
+    // runs over its packets — see `parser`.
+    let mut track_codecs: Vec<parser::Codec> = Vec::new();
+    let mut frame_parsers: Vec<Option<parser::FrameParser>> = Vec::new();
     for t in &tracks {
         let idx = streams.len() as u32;
         track_index_by_number.insert(t.number, idx);
@@ -683,6 +688,13 @@ fn open_typed_impl(
         if let Some(lang) = t.language_bcp47.clone().or_else(|| t.language.clone()) {
             params.language = Some(lang);
         }
+        let codec = parser::Codec::of(
+            &t.codec_id_string,
+            params.codec_id.as_str(),
+            t.track_type == ids::TRACK_TYPE_AUDIO,
+        );
+        track_codecs.push(codec);
+        frame_parsers.push(parser::FrameParser::new(codec, &params.extradata));
         streams.push(StreamInfo {
             index: idx,
             time_base,
@@ -1125,6 +1137,8 @@ fn open_typed_impl(
         last_virtual_origin: None,
         content_encodings,
         frame_decompressions,
+        track_codecs,
+        frame_parsers,
         video_interlacings,
         video_geometries,
         video_colours,
@@ -8787,6 +8801,13 @@ pub struct MkvDemuxer {
     /// nothing to undo, or when the chain contains a step the container
     /// can't reverse (encryption) — packets then pass through encoded.
     frame_decompressions: Vec<Option<Vec<content::Decompression>>>,
+    /// Per-stream codec as FFmpeg identifies it (`ff_mkv_codec_tags`),
+    /// indexed by stream index — see [`parser::Codec`].
+    track_codecs: Vec<parser::Codec>,
+    /// Per-stream codec parser FFmpeg runs over the packets, whose reading
+    /// of each frame flags it a keyframe; `None` where FFmpeg runs none
+    /// (the Block's keyframe signal stands). See [`parser::FrameParser`].
+    frame_parsers: Vec<Option<parser::FrameParser>>,
     /// Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 +
     /// §5.1.4.1.28.2), indexed by stream index. `None` for non-video tracks
     /// and for video tracks whose `TrackEntry` carried no `Video` master —
@@ -11638,9 +11659,8 @@ impl MkvDemuxer {
             }
         }
         if let Some(b) = block_bytes {
-            // For BlockGroup, the lacing flags are in the same place as
-            // SimpleBlock (the "keyframe" bit doesn't exist in plain Block —
-            // keyframe-ness is inferred from absence of ReferenceBlock).
+            // A Block carries no keyframe bit: a BlockGroup without a
+            // ReferenceBlock (RFC 9559 §5.1.3.5.5) holds a keyframe.
             let meta = if meta.is_empty() {
                 None
             } else {
@@ -11649,7 +11669,7 @@ impl MkvDemuxer {
             self.queue_block_packets_with(
                 &b,
                 cluster_timecode,
-                is_keyframe,
+                Some(is_keyframe),
                 duration,
                 additions,
                 meta,
@@ -11664,21 +11684,22 @@ impl MkvDemuxer {
         cluster_timecode: i64,
         _hint: bool,
     ) -> Result<()> {
-        // SimpleBlock: keyframe bit is bit 7 of flags byte.
-        // BlockGroup/Block has the same layout but no keyframe bit.
-        // We pass through whatever's set in the flags byte for SimpleBlock.
-        // A SimpleBlock can never carry BlockAdditions (the element lives
+        // A SimpleBlock's keyframe bit is bit 7 of its flags byte. A
+        // SimpleBlock can never carry BlockAdditions (the element lives
         // only on BlockGroup, RFC 9559 §5.1.3.5.2) nor the BlockGroup meta
         // children (ReferenceBlock / ReferencePriority / CodecState /
         // DiscardPadding).
-        self.queue_block_packets_with(bytes, cluster_timecode, true, None, None, None)
+        self.queue_block_packets_with(bytes, cluster_timecode, None, None, None, None)
     }
 
+    /// De-laces a Block and queues its frames. `group_keyframe` is the
+    /// keyframe signal of a BlockGroup's Block (no `ReferenceBlock`),
+    /// `None` for a SimpleBlock, whose flags byte carries it.
     fn queue_block_packets_with(
         &mut self,
         bytes: &[u8],
         cluster_timecode: i64,
-        default_keyframe: bool,
+        group_keyframe: Option<bool>,
         explicit_duration: Option<i64>,
         additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
         meta: Option<std::sync::Arc<BlockGroupMeta>>,
@@ -11692,7 +11713,7 @@ impl MkvDemuxer {
         cur.read_exact(&mut flags_buf)?;
         let flags = flags_buf[0];
         let lacing = (flags >> 1) & 0x03;
-        let keyframe_flag = flags & 0x80 != 0;
+        let container_key = group_keyframe.unwrap_or(flags & 0x80 != 0);
 
         let stream_idx = match self.track_index_by_number.get(&track_number) {
             Some(i) => *i,
@@ -11724,11 +11745,21 @@ impl MkvDemuxer {
                 Some(chain) => content::decompress(chain, f)?,
                 None => f,
             };
+            // FFmpeg flags a packet a keyframe from what its codec parser
+            // reads in the frame where it runs one, and every packet of an
+            // intra-only codec or a non-audio-video track; the Block's
+            // keyframe signal otherwise.
+            let si = stream_idx as usize;
+            let keyframe = match self.frame_parsers.get_mut(si).and_then(Option::as_mut) {
+                _ if self.track_codecs.get(si).is_some_and(|c| c.intra_only()) => true,
+                Some(parser) => parser.keyframe(&frame_bytes, container_key),
+                None => container_key,
+            };
             let mut pkt = Packet::new(stream_idx, self.time_base, frame_bytes);
             pkt.pts = Some(pts);
             pkt.dts = Some(pts);
             pkt.duration = per_frame;
-            pkt.flags.keyframe = keyframe_flag || default_keyframe;
+            pkt.flags.keyframe = keyframe;
             // BlockAdditions (RFC 9559 §5.1.3.5.2) and the BlockGroup meta
             // children attach to the Block as a whole; every frame de-laced
             // from a laced Block shares the same additions / meta (the spec

@@ -49,8 +49,11 @@ fn tmp_path(tag: &str) -> std::path::PathBuf {
     ))
 }
 
+/// An HEVC track: FFmpeg runs no parser over HEVC in Matroska, so the
+/// demuxer flags its keyframes from the BlockGroup's `ReferenceBlock`
+/// alone — the rule these tests exercise — whatever the payload bytes.
 fn video_stream(index: u32) -> StreamInfo {
-    let mut p = CodecParameters::video(CodecId::new("vp9"));
+    let mut p = CodecParameters::video(CodecId::new("h265"));
     p.width = Some(320);
     p.height = Some(240);
     StreamInfo {
