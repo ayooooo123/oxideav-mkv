@@ -51,6 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a truncated tail with EOF, retaining complete packets before the damage.
   Empty-frame filtering runs after decompression, so a header-stripped
   zero-byte frame still emits its restored header.
+- Laces advance by their per-frame durations rather than repeating the
+  first timestamp. BlockDuration and DefaultDuration use FFmpeg 9's integer
+  remainder distribution; duration-less Vorbis, Opus, FLAC and WavPack
+  frames advance by durations parsed from their codec headers.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.10...v0.0.11) - 2026-10-04
 

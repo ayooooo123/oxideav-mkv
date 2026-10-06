@@ -9,6 +9,7 @@
 
 mod content;
 mod parser;
+mod timing;
 mod video_config;
 mod webvtt;
 
@@ -726,6 +727,7 @@ fn open_typed_impl(
             params,
         });
     }
+    let packet_clocks = streams.iter().map(|s| timing::PacketClock::new(&s.params)).collect();
 
     // Resolve `Tags.Targets.Tag*UID` references now that the full segment
     // has been walked. Tags appearing before Tracks in segment order are
@@ -1137,7 +1139,6 @@ fn open_typed_impl(
         segment_data_end,
         cluster_state: ClusterState::Idle,
         out_queue: std::collections::VecDeque::new(),
-        time_base,
         metadata,
         duration_micros,
         cues,
@@ -1158,6 +1159,7 @@ fn open_typed_impl(
         frame_decompressions,
         track_codecs,
         frame_parsers,
+        packet_clocks,
         webvtt_tracks: tracks.iter().map(|t| t.codec_id_string.starts_with("D_WEBVTT/")).collect(),
         last_webvtt_metadata: None,
         video_interlacings,
@@ -8756,7 +8758,6 @@ pub struct MkvDemuxer {
     /// [`Demuxer::next_packet`], each carried as a [`QueuedPacket`]
     /// record pairing the `Packet` with its per-Block side channels.
     out_queue: std::collections::VecDeque<QueuedPacket>,
-    time_base: TimeBase,
     metadata: Vec<(String, String)>,
     duration_micros: i64,
     /// Cue index entries, sorted by (track, time). Empty if the file has
@@ -8852,6 +8853,7 @@ pub struct MkvDemuxer {
     /// of each frame flags it a keyframe; `None` where FFmpeg runs none
     /// (the Block's keyframe signal stands). See [`parser::FrameParser`].
     frame_parsers: Vec<Option<parser::FrameParser>>,
+    packet_clocks: Vec<timing::PacketClock>,
     webvtt_tracks: Vec<bool>,
     last_webvtt_metadata: Option<std::sync::Arc<WebVttMetadata>>,
     /// Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 +
@@ -9191,6 +9193,7 @@ impl Demuxer for MkvDemuxer {
         self.last_block_group_meta = None;
         self.last_virtual_origin = None;
         self.last_webvtt_metadata = None;
+        self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
 
         // RFC 9559 §5.1.5.1.2.3: when the Cues entry carries a
         // `CueRelativePosition`, the referenced SimpleBlock / BlockGroup
@@ -11218,6 +11221,7 @@ impl MkvDemuxer {
         self.last_block_group_meta = None;
         self.last_virtual_origin = None;
         self.last_webvtt_metadata = None;
+        self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
         Ok(self.ticks_to_stream_pts(stream_index, landed_ticks))
     }
 
@@ -11406,6 +11410,7 @@ impl MkvDemuxer {
         self.last_block_group_meta = None;
         self.last_virtual_origin = None;
         self.last_webvtt_metadata = None;
+        self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
         if kf.at_cluster_start {
             self.input.seek(SeekFrom::Start(kf.cluster))?;
             self.cluster_state = ClusterState::Idle;
@@ -11786,11 +11791,24 @@ impl MkvDemuxer {
             _ => unreachable!(),
         };
 
-        let pts_base = cluster_timecode + timecode_offset;
-        let n_frames = frames.len() as i64;
-        let per_frame = explicit_duration.map(|d| d / n_frames.max(1));
+        let si = stream_idx as usize;
+        let time_base = self.streams[si].time_base;
+        let mut block_pts = Some(cluster_timecode.saturating_add(timecode_offset));
+        let n_frames = frames.len().max(1) as i128;
+        // FFmpeg 9 computes the whole Block duration in segment ticks first,
+        // then distributes the integer remainder between laces.
+        let block_duration = explicit_duration.filter(|&d| d > 0)
+            .map(i128::from)
+            .or_else(|| self.track_timing[si].default_duration.map(|ns| {
+                ns as i128 * n_frames / self.timecode_scale_ns as i128
+            })).unwrap_or(0);
         for (i, f) in frames.into_iter().enumerate() {
-            let pts = pts_base + per_frame.unwrap_or(0) * i as i64;
+            let i = i as i128;
+            let lace_duration = (block_duration * (i + 1) / n_frames
+                - block_duration * i / n_frames).min(i64::MAX as i128) as i64;
+            let source_pts = block_pts;
+            block_pts = block_pts.and_then(|pts| (lace_duration > 0)
+                .then(|| pts.saturating_add(lace_duration)));
             // Block scope (RFC 9559 §5.1.4.1.31.3 bit 0x1) is "all frame
             // contents, excluding lacing data": each de-laced frame is
             // decompressed on its own.
@@ -11808,7 +11826,9 @@ impl MkvDemuxer {
             // reads in the frame where it runs one, and every packet of an
             // intra-only codec or a non-audio-video track; the Block's
             // keyframe signal otherwise.
-            let si = stream_idx as usize;
+            let parsed_duration = self.packet_clocks[si].frame_duration(&frame_bytes, time_base);
+            let duration = (lace_duration > 0).then_some(lace_duration).or(parsed_duration);
+            let pts = self.packet_clocks[si].timestamp(source_pts, duration);
             let webvtt = if self.webvtt_tracks[si] {
                 Some(std::sync::Arc::new(webvtt::split(&mut frame_bytes)?))
             } else {
@@ -11819,10 +11839,10 @@ impl MkvDemuxer {
                 Some(parser) => parser.keyframe(&frame_bytes, container_key),
                 None => container_key,
             };
-            let mut pkt = Packet::new(stream_idx, self.time_base, frame_bytes);
-            pkt.pts = Some(pts);
-            pkt.dts = Some(pts);
-            pkt.duration = per_frame;
+            let mut pkt = Packet::new(stream_idx, time_base, frame_bytes);
+            pkt.pts = pts;
+            pkt.dts = pts;
+            pkt.duration = duration;
             pkt.flags.keyframe = keyframe;
             // BlockAdditions (RFC 9559 §5.1.3.5.2) and the BlockGroup meta
             // children attach to the Block as a whole; every frame de-laced
