@@ -8604,6 +8604,8 @@ fn parse_projection(r: &mut dyn ReadSeek, end: u64, p: &mut RawProjection) -> Re
 enum ClusterState {
     /// Not inside a cluster; the next read must start with a Cluster header.
     Idle,
+    /// EOF, including a truncated Segment whose declared end is unreachable.
+    Ended,
     /// Inside a Cluster, reading children. `body_end` is where the cluster
     /// ends. `body_start` is the absolute file offset of the byte right
     /// after the Cluster's id+size header — used as the dedup key on
@@ -11025,8 +11027,8 @@ impl MkvDemuxer {
     /// `failed_at`: scan forward for the next plausible Top-Level element,
     /// record a [`DamageEvent`], and leave the reader positioned on it so
     /// the regular [`Self::advance`] loop dispatches it. When no recovery
-    /// point exists, the tail is dropped and the reader parks at the
-    /// Segment end so the next `advance` reports a clean `Error::Eof`.
+    /// point exists, the tail is dropped and the state becomes terminal;
+    /// no seek beyond the physical input is required.
     ///
     /// Progress guarantee: the scan never starts below `resync_floor`
     /// (one past the last accepted recovery point), so a candidate that
@@ -11056,11 +11058,8 @@ impl MkvDemuxer {
                     resumed_at: None,
                     bytes_skipped: self.segment_data_end.saturating_sub(failed_at),
                 });
-                // Park at the Segment end; the seek target always exists
-                // because segment_data_end is clamped to the input length
-                // in resilient mode.
-                self.input.seek(SeekFrom::Start(self.segment_data_end))?;
-                Ok(())
+                self.cluster_state = ClusterState::Ended;
+                Err(Error::Eof)
             }
         }
     }
@@ -11534,6 +11533,7 @@ impl MkvDemuxer {
 
     fn advance(&mut self) -> Result<()> {
         match self.cluster_state {
+            ClusterState::Ended => Err(Error::Eof),
             ClusterState::Idle => {
                 let pos = self.input.stream_position()?;
                 if pos >= self.segment_data_end {

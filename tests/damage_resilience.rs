@@ -21,7 +21,7 @@
 //! * damage with no later recovery point drops the tail and ends the
 //!   stream cleanly.
 
-use std::io::Cursor;
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
 use oxideav_core::{Demuxer, Error, ReadSeek};
 use oxideav_mkv::demux::{DamageKind, MkvDemuxer};
@@ -512,4 +512,40 @@ fn resilient_seek_steps_over_unknown_size_cluster() {
     let landed = dmx.seek_to(0, 1400).expect("seek into unknown-size");
     assert_eq!(landed, 1000);
     assert_eq!(drain(&mut dmx), vec![(1000, 0x22), (2000, 0x33)]);
+}
+
+/// Like an HTTP Range source, unlike Cursor, seeking past EOF is rejected.
+struct BoundedInput(Cursor<Vec<u8>>);
+
+impl Read for BoundedInput {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { self.0.read(buf) }
+}
+
+impl Seek for BoundedInput {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let end = self.0.get_ref().len() as i128;
+        let target = match from {
+            SeekFrom::Start(n) => i128::from(n),
+            SeekFrom::Current(n) => i128::from(self.0.position()) + i128::from(n),
+            SeekFrom::End(n) => end + i128::from(n),
+        };
+        if !(0..=end).contains(&target) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek past end"));
+        }
+        self.0.set_position(target as u64);
+        Ok(target as u64)
+    }
+}
+
+#[test]
+fn truncated_strict_input_does_not_seek_to_declared_segment_end() {
+    let mut bytes = three_cluster_file();
+    bytes.truncate(bytes.len() - 5);
+    let input = Box::new(BoundedInput(Cursor::new(bytes)));
+    let mut d = oxideav_mkv::demux::open_typed(input, &oxideav_core::NullCodecResolver).unwrap();
+    assert_eq!(drain(&mut d), [(0, 0x11), (1000, 0x22)]);
+    assert!(matches!(d.next_packet(), Err(Error::Eof)));
+    assert!(matches!(d.next_packet(), Err(Error::Eof)));
+    assert_eq!(d.seek_to(0, 0).unwrap(), 0);
+    assert_eq!(drain(&mut d), [(0, 0x11), (1000, 0x22)]);
 }

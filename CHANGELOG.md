@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forged size cannot bypass later Clusters.
   Empty-frame filtering runs after decompression, so a header-stripped
   zero-byte frame still emits its restored header.
+  Unrecoverable tails enter a terminal state instead of seeking to a
+  possibly truncated Segment's declared end, including on HTTP Range inputs.
 - Laces advance by their per-frame durations rather than repeating the
   first timestamp. BlockDuration and DefaultDuration use FFmpeg 9's integer
   remainder distribution; duration-less Vorbis, Opus, FLAC and WavPack
