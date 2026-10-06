@@ -81,7 +81,8 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
         "S_TEXT/UTF8" => "subrip",
         "S_TEXT/SSA" => "ssa",
         "S_TEXT/ASS" => "ass",
-        "S_TEXT/WEBVTT" => "webvtt",
+        "S_TEXT/WEBVTT" | "D_WEBVTT/SUBTITLES" | "D_WEBVTT/CAPTIONS"
+        | "D_WEBVTT/DESCRIPTIONS" | "D_WEBVTT/METADATA" => "webvtt",
         "S_TEXT/USF" => "usf",
         "S_VOBSUB" => "dvd_subtitle",
         "S_HDMV/PGS" => "hdmv_pgs_subtitle",

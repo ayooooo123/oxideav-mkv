@@ -41,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   intra-only codec (all audio but AAC / MLP / TrueHD; ProRes, MJPEG,
   JPEG 2000, raw video) or of a subtitle track is a keyframe. HEVC, AAC
   and codecs without such a reading keep the Block's signal.
+- `D_WEBVTT/*` streams resolve to the `webvtt` subtitle decoder. Packets
+  contain FFmpeg's cue text; identifier and settings are retained separately
+  by `MkvDemuxer::webvtt_metadata()`. `S_TEXT/WEBVTT` stays raw.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.10...v0.0.11) - 2026-10-04
 

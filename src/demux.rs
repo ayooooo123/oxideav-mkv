@@ -10,6 +10,9 @@
 mod content;
 mod parser;
 mod video_config;
+mod webvtt;
+
+pub use webvtt::WebVttMetadata;
 
 use std::io::{Read, Seek, SeekFrom};
 
@@ -605,6 +608,12 @@ fn open_typed_impl(
                 p
             }
         };
+        if codec_id.as_str() == "webvtt" {
+            // D_WEBVTT/DESCRIPTIONS and METADATA can use non-subtitle
+            // TrackTypes; all WebVTT streams resolve to a subtitle decoder.
+            params.media_type = MediaType::Subtitle;
+            params.options = params.options.set("webvtt_packet_format", "text");
+        }
         // Codec-specific CodecPrivate normalisation:
         //   * `V_MS/VFW/FOURCC`: the outer 40-byte BITMAPINFOHEADER wraps
         //     real codec extradata — strip it so decoders see their own
@@ -1139,6 +1148,8 @@ fn open_typed_impl(
         frame_decompressions,
         track_codecs,
         frame_parsers,
+        webvtt_tracks: tracks.iter().map(|t| t.codec_id_string.starts_with("D_WEBVTT/")).collect(),
+        last_webvtt_metadata: None,
         video_interlacings,
         video_geometries,
         video_colours,
@@ -8679,6 +8690,7 @@ struct QueuedPacket {
     packet: Packet,
     additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
     meta: Option<std::sync::Arc<BlockGroupMeta>>,
+    webvtt: Option<std::sync::Arc<WebVttMetadata>>,
     /// `Some` when the packet was synthesised by TrackOperation
     /// application (RFC 9559 §18.8) rather than read from its own track's
     /// Block — see [`MkvDemuxer::virtual_packet_origin`].
@@ -8808,6 +8820,8 @@ pub struct MkvDemuxer {
     /// of each frame flags it a keyframe; `None` where FFmpeg runs none
     /// (the Block's keyframe signal stands). See [`parser::FrameParser`].
     frame_parsers: Vec<Option<parser::FrameParser>>,
+    webvtt_tracks: Vec<bool>,
+    last_webvtt_metadata: Option<std::sync::Arc<WebVttMetadata>>,
     /// Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 +
     /// §5.1.4.1.28.2), indexed by stream index. `None` for non-video tracks
     /// and for video tracks whose `TrackEntry` carried no `Video` master —
@@ -8991,6 +9005,7 @@ impl Demuxer for MkvDemuxer {
                 self.last_block_additions = q.additions;
                 self.last_block_group_meta = q.meta;
                 self.last_virtual_origin = q.origin;
+                self.last_webvtt_metadata = q.webvtt;
                 return Ok(q.packet);
             }
             let before = self
@@ -9146,6 +9161,7 @@ impl Demuxer for MkvDemuxer {
         self.last_block_additions = None;
         self.last_block_group_meta = None;
         self.last_virtual_origin = None;
+        self.last_webvtt_metadata = None;
 
         // RFC 9559 §5.1.5.1.2.3: when the Cues entry carries a
         // `CueRelativePosition`, the referenced SimpleBlock / BlockGroup
@@ -9178,6 +9194,14 @@ impl Demuxer for MkvDemuxer {
 }
 
 impl MkvDemuxer {
+    /// Identifier and settings split off the last D_WEBVTT packet.
+    /// S_TEXT/WEBVTT packets remain raw and have no such side data.
+    /// Like `block_additions`, this typed side channel lasts until the next
+    /// returned packet or seek; oxideav-core's Packet has no side-data field.
+    pub fn webvtt_metadata(&self) -> Option<&WebVttMetadata> {
+        self.last_webvtt_metadata.as_deref()
+    }
+
     /// Typed `Tags\Tag` collection (RFC 9559 §5.1.8.1) parsed from the
     /// Segment, with every `Targets\Tag*UID` already resolved against the
     /// Segment's track / edition / chapter / attachment tables.
@@ -11165,6 +11189,7 @@ impl MkvDemuxer {
         self.last_block_additions = None;
         self.last_block_group_meta = None;
         self.last_virtual_origin = None;
+        self.last_webvtt_metadata = None;
         Ok(self.ticks_to_stream_pts(stream_index, landed_ticks))
     }
 
@@ -11352,6 +11377,7 @@ impl MkvDemuxer {
         self.last_block_additions = None;
         self.last_block_group_meta = None;
         self.last_virtual_origin = None;
+        self.last_webvtt_metadata = None;
         if kf.at_cluster_start {
             self.input.seek(SeekFrom::Start(kf.cluster))?;
             self.cluster_state = ClusterState::Idle;
@@ -11741,7 +11767,7 @@ impl MkvDemuxer {
             // contents, excluding lacing data": each de-laced frame is
             // decompressed on its own.
             let chain = self.frame_decompressions.get(stream_idx as usize);
-            let frame_bytes = match chain.and_then(Option::as_ref) {
+            let mut frame_bytes = match chain.and_then(Option::as_ref) {
                 Some(chain) => content::decompress(chain, f)?,
                 None => f,
             };
@@ -11750,6 +11776,11 @@ impl MkvDemuxer {
             // intra-only codec or a non-audio-video track; the Block's
             // keyframe signal otherwise.
             let si = stream_idx as usize;
+            let webvtt = if self.webvtt_tracks[si] {
+                Some(std::sync::Arc::new(webvtt::split(&mut frame_bytes)?))
+            } else {
+                None
+            };
             let keyframe = match self.frame_parsers.get_mut(si).and_then(Option::as_mut) {
                 _ if self.track_codecs.get(si).is_some_and(|c| c.intra_only()) => true,
                 Some(parser) => parser.keyframe(&frame_bytes, container_key),
@@ -11790,6 +11821,7 @@ impl MkvDemuxer {
                             additions: additions.clone(),
                             meta: meta.clone(),
                             origin: Some(origin),
+                            webvtt: webvtt.clone(),
                         }
                     })
                     .collect()
@@ -11801,6 +11833,7 @@ impl MkvDemuxer {
                 additions: additions.clone(),
                 meta: meta.clone(),
                 origin: None,
+                webvtt,
             });
             self.out_queue.extend(synth);
         }
