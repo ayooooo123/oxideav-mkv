@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     keyframe of the sought track at or before the target: on the Cluster's
     start when the track's first Block there is a keyframe, else on the
     keyframe's Block.
+- `ContentEncodings` compression is undone for every algorithm, not just
+  Header Stripping: zlib, bzip2 and LZO1X frames are decompressed (each
+  de-laced frame on its own, highest `ContentEncodingOrder` first), and a
+  compressed `CodecPrivate` (scope `0x2`) reaches the stream's extradata
+  decompressed. A frame that fails to decompress is an error. A chain
+  holding an encryption still leaves the data as stored.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.10...v0.0.11) - 2026-10-04
 

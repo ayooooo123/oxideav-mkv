@@ -16,11 +16,10 @@
 //!   `ContentEncKeyID` (§5.1.4.1.31.10), and `ContentEncAESSettings`
 //!   (§5.1.4.1.31.11) → `AESSettingsCipherMode` (§5.1.4.1.31.12).
 //!
-//! The container surfaces these *headers* only — it never decompresses or
-//! decrypts a frame. Encodings are returned through
-//! `MkvDemuxer::content_encodings(stream_index)` /
-//! `all_content_encodings()`, sorted into decode order (descending
-//! `ContentEncodingOrder`).
+//! Encodings are returned through `MkvDemuxer::content_encodings(stream_index)`
+//! / `all_content_encodings()`, sorted into decode order (descending
+//! `ContentEncodingOrder`). The demuxer undoes the compression steps on
+//! frames and `CodecPrivate`; it never decrypts.
 
 use std::io::Cursor;
 
@@ -723,4 +722,115 @@ fn unsupported_step_in_chain_leaves_packets_encoded() {
         pkt.data, on_disk,
         "encrypted chain → packet left untouched, not partially stripped"
     );
+}
+
+// RFC 9559 §5.1.4.1.31.6 algos 0–2: zlib, bzip2 and LZO1X compression are
+// undone by the demuxer too, on each de-laced frame (Block scope) and on
+// `CodecPrivate` (Private scope).
+
+/// Build a `ContentEncoding` compressing with `algo` at `order` / `scope`.
+fn compression_encoding(order: u64, scope: u64, algo: u64) -> Vec<u8> {
+    let comp = elem_uint(ids::CONTENT_COMP_ALGO, algo);
+    let mut ce = Vec::new();
+    ce.extend_from_slice(&elem_uint(ids::CONTENT_ENCODING_ORDER, order));
+    ce.extend_from_slice(&elem_uint(ids::CONTENT_ENCODING_SCOPE, scope));
+    ce.extend_from_slice(&elem_master(ids::CONTENT_COMPRESSION, &comp));
+    elem_master(ids::CONTENT_ENCODING, &ce)
+}
+
+fn compress(algo: u64, data: &[u8]) -> Vec<u8> {
+    match algo {
+        ids::CONTENT_COMP_ALGO_ZLIB => {
+            compcol::vec::compress_to_vec::<compcol::zlib::Zlib>(data).expect("zlib")
+        }
+        ids::CONTENT_COMP_ALGO_BZLIB => {
+            compcol::vec::compress_to_vec::<compcol::bzip2::Bzip2>(data).expect("bzip2")
+        }
+        ids::CONTENT_COMP_ALGO_LZO1X => {
+            let mut out = Vec::new();
+            compcol::lzo::block::encode_block(data, &mut out);
+            out
+        }
+        other => panic!("not a compression algorithm: {other}"),
+    }
+}
+
+/// A Block-scoped zlib / bzip2 / LZO1X encoding: every packet carries the
+/// decompressed frame.
+#[test]
+fn compressed_frames_are_decompressed() {
+    let frame: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+    for algo in [
+        ids::CONTENT_COMP_ALGO_ZLIB,
+        ids::CONTENT_COMP_ALGO_BZLIB,
+        ids::CONTENT_COMP_ALGO_LZO1X,
+    ] {
+        let enc = compression_encoding(0, ids::CONTENT_ENCODING_SCOPE_BLOCK, algo);
+        let track = video_track(1, 0x1, &elem_master(ids::CONTENT_ENCODINGS, &enc));
+        let tracks_body = elem_master(ids::TRACK_ENTRY, &track);
+        let stored = compress(algo, &frame);
+        let mut dmx = open(assemble_with_cluster(&tracks_body, &cluster_with(&stored)));
+        let pkt = dmx.next_packet().expect("packet");
+        assert_eq!(pkt.data, frame, "algo {algo}: decompressed frame");
+    }
+}
+
+/// Scope `0x3` compresses both the frames and `CodecPrivate`: the stream's
+/// extradata is the decompressed `CodecPrivate`.
+#[test]
+fn compressed_codec_private_is_decompressed() {
+    let private: Vec<u8> = b"codec private bytes, codec private bytes".to_vec();
+    let frame = b"frame payload, frame payload, frame payload".to_vec();
+    let scope = ids::CONTENT_ENCODING_SCOPE_BLOCK | ids::CONTENT_ENCODING_SCOPE_PRIVATE;
+    let enc = compression_encoding(0, scope, ids::CONTENT_COMP_ALGO_ZLIB);
+    let mut extra = elem_bin(
+        ids::CODEC_PRIVATE,
+        &compress(ids::CONTENT_COMP_ALGO_ZLIB, &private),
+    );
+    extra.extend_from_slice(&elem_master(ids::CONTENT_ENCODINGS, &enc));
+    let tracks_body = elem_master(ids::TRACK_ENTRY, &video_track(1, 0x1, &extra));
+    let stored = compress(ids::CONTENT_COMP_ALGO_ZLIB, &frame);
+    let mut dmx = open(assemble_with_cluster(&tracks_body, &cluster_with(&stored)));
+    assert_eq!(dmx.streams()[0].params.extradata, private);
+    assert_eq!(dmx.next_packet().expect("packet").data, frame);
+}
+
+/// A chain mixing compression and Header Stripping is undone highest order
+/// first: on write the frame lost its header (order 0), then was zlib
+/// compressed (order 1); on read it is inflated, then the header restored.
+#[test]
+fn compression_and_header_stripping_chain() {
+    let header = [0x0F, 0x1E];
+    let rest = b"the rest of the frame, the rest of the frame".to_vec();
+    let mut body = header_stripping_encoding(0, ids::CONTENT_ENCODING_SCOPE_BLOCK, &header);
+    body.extend_from_slice(&compression_encoding(
+        1,
+        ids::CONTENT_ENCODING_SCOPE_BLOCK,
+        ids::CONTENT_COMP_ALGO_ZLIB,
+    ));
+    let track = video_track(1, 0x1, &elem_master(ids::CONTENT_ENCODINGS, &body));
+    let tracks_body = elem_master(ids::TRACK_ENTRY, &track);
+    let stored = compress(ids::CONTENT_COMP_ALGO_ZLIB, &rest);
+    let mut dmx = open(assemble_with_cluster(&tracks_body, &cluster_with(&stored)));
+    let mut expected = header.to_vec();
+    expected.extend_from_slice(&rest);
+    assert_eq!(dmx.next_packet().expect("packet").data, expected);
+}
+
+/// A frame that doesn't decompress fails the packet instead of passing
+/// garbage on.
+#[test]
+fn corrupt_compressed_frame_is_an_error() {
+    let enc = compression_encoding(
+        0,
+        ids::CONTENT_ENCODING_SCOPE_BLOCK,
+        ids::CONTENT_COMP_ALGO_ZLIB,
+    );
+    let track = video_track(1, 0x1, &elem_master(ids::CONTENT_ENCODINGS, &enc));
+    let tracks_body = elem_master(ids::TRACK_ENTRY, &track);
+    let mut dmx = open(assemble_with_cluster(
+        &tracks_body,
+        &cluster_with(&[0x78, 0x9C, 0xFF, 0xFF, 0x00]),
+    ));
+    assert!(dmx.next_packet().is_err());
 }

@@ -849,20 +849,23 @@ to register every codec the build enables.
   pre-sorted into *decode* order
   (highest `ContentEncodingOrder` first, per §5.1.4.1.31.2). Element
   defaults are honoured (order 0, scope 0x1 Block, type 0 compression,
-  comp-algo 0 zlib). The headers are surfaced; zlib/bzlib/lzo1x and
-  encryption are never decompressed or decrypted (out of container scope).
-- **Header-Stripping applied on read** (RFC 9559 §5.1.4.1.31.6 algo 3,
-  §5.1.4.1.31.7): Header Stripping is the one `ContentEncoding` transform
-  the container can reverse without a codec — the `ContentCompSettings`
-  bytes were removed from the front of each frame on write, so the demuxer
-  prepends them back to every de-laced frame, and `next_packet` returns the
-  original (un-stripped) frame data. Block scope (§5.1.4.1.31.3 bit 0x1) is
-  honoured per-frame (the prefix lands on each laced sub-frame, not the
-  Block once); a chain of several Header-Stripping steps is combined in
-  decode order. If the Block-scoped chain contains any step the container
-  can't undo (zlib/bzlib/lzo1x compression or encryption), packets pass
-  through encoded — the demuxer never *partially* strips. Private-scope
-  (`CodecPrivate`-only) Header Stripping leaves frame data untouched.
+  comp-algo 0 zlib). Encryption is never decrypted (out of container
+  scope); compression is undone, see below.
+- **Compression undone on read** (RFC 9559 §5.1.4.1.31.6,
+  §5.1.4.1.31.7): every registered `ContentCompAlgo` is reversible by the
+  container — zlib (RFC 1950), bzip2 and LZO1X are decompressed (through
+  `compcol`), and Header Stripping's `ContentCompSettings` bytes, removed
+  from the front of each frame on write, are prepended back — so
+  `next_packet` returns the original frame data. Block scope
+  (§5.1.4.1.31.3 bit 0x1) is honoured per-frame (each laced sub-frame is
+  decompressed on its own); a chain of several steps is undone in decode
+  order. Private scope (bit 0x2) decompresses `CodecPrivate` into the
+  stream's extradata (dropped when it doesn't decompress, as FFmpeg does).
+  If a chain contains a step the container can't undo (encryption, an
+  unregistered algorithm), the data it applies to passes through encoded
+  — the demuxer never *partially* decodes. A decompressed frame may not
+  outgrow FFmpeg's bound (the first `input × 3^k` reaching 10 MB, inputs
+  of 10 MB or more refused); a frame that fails to decompress is an error.
 - **`Video` geometry quartet typed decode** (RFC 9559
   §5.1.4.1.28.8..§5.1.4.1.28.14):
   `MkvDemuxer::video_geometry(stream_index)` (and the per-stream
@@ -1978,12 +1981,12 @@ so the demuxer never hides an unrecognised track.
   (`open_typed` / `open_resilient_typed`); the boxed trait `open` keeps
   the default off behaviour.
 - `ContentEncodings` is decoded and surfaced (compression / encryption
-  headers). The demuxer *undoes* a Block-scoped Header-Stripping chain
-  (algo 3) on read — packets carry the original frame bytes — but the
-  generic compression algorithms (zlib / bzlib / lzo1x) and encryption are
-  not reversed: for those a caller that wants raw codec bytes must apply the
-  reported encoding chain itself. zlib/bzlib/lzo1x decompression and
-  decryption are out of container scope. The mux side now *writes* the
+  headers). The demuxer *undoes* the compression (zlib / bzlib / lzo1x /
+  Header Stripping) on read — packets carry the original frame bytes and
+  extradata the original `CodecPrivate` — but encryption is not reversed:
+  for an encrypted track a caller that wants raw codec bytes must apply
+  the reported encoding chain itself. Decryption is out of container
+  scope. The mux side now *writes* the
   `ContentEncodings` master (`MkvMuxer::set_track_content_encodings`, see
   the Muxer section) — it carries the declared chain but does not itself
   compress or encrypt the frame bytes; the caller supplies already-encoded

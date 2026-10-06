@@ -15,6 +15,10 @@ categories = ["multimedia::video", "parser-implementations"]
 
 [dependencies]
 oxideav-core = "0.1"
+# `compcol` (Karpelès Lab's compression collection, the workspace-wide
+# choice for byte-stream codecs) undoes the ContentEncodings compression
+# algorithms of RFC 9559 §5.1.4.1.31.6: zlib, bzip2 and LZO1X.
+compcol = { version = "0.6", default-features = false, features = ["zlib", "bzip2", "lzo"] }
 
 [dev-dependencies]
 oxideav-basic = "0.0"
