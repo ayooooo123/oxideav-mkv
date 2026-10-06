@@ -100,7 +100,7 @@ impl PacketClock {
 
     pub(super) fn reset(&mut self) {
         self.next = 0;
-        if let AudioTiming::Vorbis(v) = &mut self.codec { v.previous = v.sizes[0]; }
+        if let AudioTiming::Vorbis(v) = &mut self.codec { v.previous = v.initial; }
     }
 
     pub(super) fn frame_duration(&mut self, data: &[u8], tb: TimeBase) -> Option<i64> {
@@ -162,6 +162,9 @@ struct Vorbis {
     modes: [bool; 64],
     count: usize,
     mode_bits: u32,
+    /// The window before the first packet: mode 0's (FFmpeg's
+    /// `previous_blocksize` initialisation), restored by a seek.
+    initial: u32,
     previous: u32,
 }
 
@@ -189,7 +192,7 @@ impl Vorbis {
         let last = setup.iter().rposition(|&b| b != 0)?;
         let framing = last * 8 + (7 - setup[last].leading_zeros() as usize);
         let mut count = 0;
-        for n in 1..=63 {
+        for n in 1..=64 {
             let Some(start) = framing.checked_sub(n * 41) else { break };
             if start < 7 * 8 + 6 { break; }
             if bits(setup, start + 1, 16)? != 0 || bits(setup, start + 17, 16)? != 0
@@ -202,7 +205,8 @@ impl Vorbis {
         for (i, mode) in modes[..count].iter_mut().enumerate() { *mode = bits(setup, start + i * 41, 1)? != 0; }
         let sizes = [1u32 << (id[28] & 15), 1u32 << (id[28] >> 4)];
         let mode_bits = usize::BITS - (count - 1).leading_zeros();
-        Some(Self { sizes, modes, count, mode_bits, previous: sizes[usize::from(modes[0])] })
+        let initial = sizes[usize::from(modes[0])];
+        Some(Self { sizes, modes, count, mode_bits, initial, previous: initial })
     }
 
     fn samples(&mut self, data: &[u8]) -> Option<u32> {
@@ -297,5 +301,39 @@ mod tests {
         assert_eq!(v.samples(&[2]), Some(576));
         assert_eq!(v.samples(&[6]), Some(1024));
         assert_eq!(v.samples(&[0]), Some(576));
+    }
+    #[test]
+    fn vorbis_64_modes_and_seek_reset_keep_the_initial_window() {
+        fn short(clock: &mut PacketClock) -> Option<u32> {
+            match &mut clock.codec {
+                AudioTiming::Vorbis(v) => v.samples(&[2]),
+                _ => None,
+            }
+        }
+        let mut id = [0u8; 30];
+        id[..7].copy_from_slice(b"\x01vorbis");
+        id[28] = 0xb8; // 256 / 2048-sample windows
+        id[29] = 1;
+        let (start, count) = (120, 64);
+        let framing = start + count * 41;
+        let mut setup = vec![0u8; framing / 8 + 1];
+        setup[..7].copy_from_slice(b"\x05vorbis");
+        let mut set = |bit: usize| setup[bit / 8] |= 1 << (bit % 8);
+        for bit in start - 6..start {
+            set(bit); // mode count - 1 = 63
+        }
+        set(start); // mode 0 is long; modes 1..64 are short
+        set(framing);
+        let mut extra = vec![2, 30, 0];
+        extra.extend_from_slice(&id);
+        extra.extend_from_slice(&setup);
+        let codec = AudioTiming::Vorbis(Vorbis::new(&extra).unwrap());
+        let mut clock = PacketClock { codec, rate: 48000, next: 0 };
+        // A short first packet overlaps mode 0's long window, after open and
+        // after a seek alike.
+        let fresh = [short(&mut clock), short(&mut clock)];
+        assert_eq!(fresh, [Some(576), Some(128)]);
+        clock.reset();
+        assert_eq!([short(&mut clock), short(&mut clock)], fresh);
     }
 }

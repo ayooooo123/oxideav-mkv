@@ -258,6 +258,7 @@ fn open_typed_impl(
     // child is walked; surfaced via `MkvDemuxer::crc_status`.
     let mut crc_status: Vec<CrcStatus> = Vec::new();
 
+    let mut seek_heads = 0usize;
     while input.stream_position()? < segment_data_end {
         let walk_pos = input.stream_position()?;
         let e = match read_element_header(&mut *input) {
@@ -374,7 +375,8 @@ fn open_typed_impl(
                         &mut attachments,
                     )?;
                 }
-                ids::SEEK_HEAD => {
+                ids::SEEK_HEAD if seek_heads < MAX_SEEK_HEADS => {
+                    seek_heads += 1;
                     let end = body_end_known.unwrap_or(segment_data_end);
                     parse_seek_head(&mut *input, end, &mut seek_entries)?;
                 }
@@ -458,11 +460,12 @@ fn open_typed_impl(
     // merged, so a hostile SeekHead can't corrupt the surfaced state.
     if first_cluster_offset.is_some() {
         let resume_pos = input.stream_position()?;
-        let mut visited = std::collections::HashSet::new();
+        // RFC 9559 §5.1.1 permits two SeekHeads. Follow at most one target
+        // per other master ID, parsed or not, so a hostile index can neither
+        // chain indexes nor make the open reread overlapping/empty targets.
+        let mut followed: Vec<u32> = Vec::new();
         let mut cursor = 0;
-        // Follow nested SeekHeads without recursion; reject cycles and bound
-        // the work even when a hostile file chains many distinct indexes.
-        while cursor < seek_entries.len() && visited.len() < 4096 {
+        while cursor < seek_entries.len() {
             let se = &seek_entries[cursor];
             cursor += 1;
             let Some(id) = se.seek_id() else { continue };
@@ -472,7 +475,7 @@ fn open_typed_impl(
             let wanted = match id {
                 ids::INFO => !have_info,
                 ids::TRACKS => tracks.is_empty(),
-                ids::SEEK_HEAD => true,
+                ids::SEEK_HEAD => seek_heads < MAX_SEEK_HEADS,
                 ids::CUES => cues.is_empty(),
                 ids::TAGS => pending_tags.is_empty(),
                 ids::CHAPTERS => editions.is_empty(),
@@ -480,12 +483,15 @@ fn open_typed_impl(
                 _ => false,
             };
             let abs = segment_data_start.saturating_add(se.seek_position());
-            if !wanted || abs < resume_pos || abs >= segment_data_end
-                || !visited.insert((id, abs))
-            {
+            if !wanted || abs < resume_pos || abs >= segment_data_end || followed.contains(&id) {
                 continue;
             }
-            let _ = follow_seek_target(
+            if id == ids::SEEK_HEAD {
+                seek_heads += 1;
+            } else {
+                followed.push(id);
+            }
+            let followed_target = follow_seek_target(
                 &mut *input,
                 id,
                 abs,
@@ -505,6 +511,12 @@ fn open_typed_impl(
                 &mut attachment_uid_to_index,
                 &mut attachments,
             );
+            // A stale or damaged target is ignored; a transport failure is not.
+            if let Err(e) = followed_target {
+                if !is_damage(&e) {
+                    return Err(e);
+                }
+            }
         }
         input.seek(SeekFrom::Start(resume_pos))?;
     }
@@ -524,6 +536,8 @@ fn open_typed_impl(
     // A `CodecPrivate` compressed by the track's ContentEncodings (scope
     // bit 0x2, RFC 9559 §5.1.4.1.31.3) is decompressed before anything
     // reads it; one that fails to decompress is dropped, as FFmpeg does.
+    // Output past the CodecPrivate budget is invalid data instead.
+    let mut private_total: usize = tracks.iter().map(|t| t.codec_private.len()).sum();
     for t in &mut tracks {
         let chain = t
             .content_encodings
@@ -532,7 +546,16 @@ fn open_typed_impl(
         if let Some(chain) = chain {
             if !t.codec_private.is_empty() {
                 let stored = std::mem::take(&mut t.codec_private);
-                t.codec_private = content::decompress(&chain, stored).unwrap_or_default();
+                private_total -= stored.len();
+                let budget = MAX_CODEC_PRIVATE.min(MAX_CODEC_PRIVATE_TOTAL.saturating_sub(private_total));
+                t.codec_private = match content::decompress(&chain, stored, budget) {
+                    Ok(data) => data,
+                    Err(content::Undo::Corrupt(_)) => Vec::new(),
+                    Err(content::Undo::OverBudget) => {
+                        return Err(Error::invalid("MKV: CodecPrivate exceeds its budget"));
+                    }
+                };
+                private_total += t.codec_private.len();
             }
         }
     }
@@ -1612,6 +1635,57 @@ const TOP_LEVEL_IDS: [u32; 9] = [
     ids::SIGNATURE_SLOT,
 ];
 
+/// Segment children that end an unknown-size Cluster (the rewind arm of
+/// `MkvDemuxer::advance`). Only these may sit in a Cluster without fitting
+/// it; any other child, including a forged legacy `SignatureSlot`, must fit
+/// or the Cluster is damaged.
+const CLUSTER_SIBLING_IDS: [u32; 8] = [
+    ids::CLUSTER,
+    ids::CUES,
+    ids::TAGS,
+    ids::ATTACHMENTS,
+    ids::CHAPTERS,
+    ids::SEEK_HEAD,
+    ids::INFO,
+    ids::TRACKS,
+];
+
+/// RFC 9559 §5.1.1: a Segment holds at most two `SeekHead` elements.
+const MAX_SEEK_HEADS: usize = 2;
+/// `SeekHead` entries retained across both indexes.
+const MAX_SEEK_ENTRIES: usize = 4096;
+/// Bytes one Block retains: its frames after undoing ContentEncodings and
+/// restoring codec framing, every virtual-track copy, and its
+/// BlockAdditions / BlockGroup side data.
+const MAX_BLOCK_BYTES: usize = 32 << 20;
+/// One track's `CodecPrivate`, stored or decompressed.
+const MAX_CODEC_PRIVATE: usize = 4 << 20;
+/// Every track's `CodecPrivate` together.
+const MAX_CODEC_PRIVATE_TOTAL: usize = 16 << 20;
+/// `TrackEntry` elements per Segment.
+const MAX_TRACKS: usize = 256;
+/// Startup DTS analysis holds packets until the H.264 reorder delay is
+/// known: at most this many packets and bytes (payload, side data and
+/// per-packet overhead), plus the Block being read.
+const MAX_PROBE_PACKETS: usize = 1024;
+const MAX_PROBE_BYTES: usize = 512 << 10;
+
+/// Whether `e` reports malformed or physically truncated input, which the
+/// Cluster walk recovers from. Transport, permission and other I/O failures
+/// reach the caller instead of ending the stream as if the file were
+/// complete. A seek outside the input (`InvalidInput`) is a truncated
+/// file's size field, not a transport failure.
+fn is_damage(e: &Error) -> bool {
+    match e {
+        Error::InvalidData(_) | Error::Unsupported(_) => true,
+        Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidInput
+        ),
+        _ => false,
+    }
+}
+
 /// Child-element IDs that legitimately start a `Cluster` body. Used to
 /// validate a scanned `Cluster` candidate: after the id+size header, the
 /// first child must itself parse and carry one of these IDs (RFC 9559
@@ -1667,7 +1741,7 @@ fn scan_top_level_element(r: &mut dyn ReadSeek, from: u64, end: u64) -> Result<O
                 Ok(0) => break,
                 Ok(n) => filled += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(e) => return Err(e.into()),
             }
         }
         if filled == 0 {
@@ -1706,19 +1780,18 @@ fn vet_top_level_candidate(r: &mut dyn ReadSeek, candidate: u64, end: u64) -> Re
     r.seek(SeekFrom::Start(candidate))?;
     let hdr = match read_element_header(&mut *r) {
         Ok(h) => h,
-        Err(_) => return Ok(None),
+        Err(e) if is_damage(&e) || matches!(e, Error::Eof) => return Ok(None),
+        Err(e) => return Err(e),
     };
-    let body_start = match r.stream_position() {
-        Ok(p) => p,
-        Err(_) => return Ok(None),
-    };
+    let body_start = r.stream_position()?;
     if hdr.id == ids::CLUSTER {
         // Unknown-size is legal on Cluster; a bounded body overrunning
         // `end` is accepted too (truncated final Cluster — the caller
         // clamps the walk). Vet the first child.
         let first_child = match read_element_header(&mut *r) {
             Ok(c) => c,
-            Err(_) => return Ok(None),
+            Err(e) if is_damage(&e) || matches!(e, Error::Eof) => return Ok(None),
+            Err(e) => return Err(e),
         };
         if CLUSTER_FIRST_CHILD_IDS.contains(&first_child.id) {
             return Ok(Some(candidate));
@@ -2705,12 +2778,20 @@ fn parse_seek_head(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<SeekEntry>) -> 
         match e.id {
             ids::SEEK => {
                 let seek_end = r.stream_position()?.saturating_add(e.size);
-                out.push(parse_seek(r, seek_end)?);
+                let entry = parse_seek(r, seek_end)?;
+                push_seek_entry(out, entry);
             }
             _ => skip(r, e.size)?,
         }
     }
     Ok(())
+}
+
+/// Retain a distinct `SeekHead` entry while under [`MAX_SEEK_ENTRIES`].
+fn push_seek_entry(out: &mut Vec<SeekEntry>, entry: SeekEntry) {
+    if out.len() < MAX_SEEK_ENTRIES && !out.contains(&entry) {
+        out.push(entry);
+    }
 }
 
 /// Parse a single `SeekHead > Seek` master (RFC 9559 §5.1.1.1) into a
@@ -2720,7 +2801,9 @@ fn parse_seek(r: &mut dyn ReadSeek, end: u64) -> Result<SeekEntry> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
-            ids::SEEK_ID => out.seek_id_bytes = read_bytes(r, e.size as usize)?,
+            // An EBML ID spans at most 8 octets; a longer SeekID names no
+            // element and isn't retained.
+            ids::SEEK_ID if e.size <= 8 => out.seek_id_bytes = read_bytes(r, e.size as usize)?,
             ids::SEEK_POSITION => {
                 out.seek_position = read_uint(r, e.size as usize)?;
                 out.has_position = true;
@@ -3819,6 +3902,16 @@ pub struct BlockGroupMeta {
     reference_virtual: Option<i64>,
     slices: Vec<TimeSlice>,
     reference_frame: Option<ReferenceFrame>,
+}
+
+impl BlockGroupMeta {
+    /// Heap bytes this side data retains.
+    fn retained_bytes(&self) -> usize {
+        self.reference_blocks.len() * std::mem::size_of::<i64>()
+            + self.codec_state.as_ref().map_or(0, Vec::len)
+            + self.block_virtual.as_ref().map_or(0, Vec::len)
+            + self.slices.len() * std::mem::size_of::<TimeSlice>()
+    }
 }
 
 /// A reclaimed `Slices > TimeSlice` master (RFC 9559 Appendix A.6..A.11)
@@ -7654,7 +7747,9 @@ fn follow_seek_target(
         ids::SEEK_HEAD => {
             let mut tmp = Vec::new();
             parse_seek_head(r, end, &mut tmp)?;
-            seek_entries.extend(tmp);
+            for entry in tmp {
+                push_seek_entry(seek_entries, entry);
+            }
         }
         ids::CUES => {
             let mut tmp_cues = Vec::new();
@@ -7711,9 +7806,16 @@ fn parse_tracks(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TrackEntry>) -> Re
         let e = read_element_header(r)?;
         match e.id {
             ids::TRACK_ENTRY => {
+                if out.len() >= MAX_TRACKS {
+                    return Err(Error::invalid("MKV: more than 256 tracks"));
+                }
                 let body_end = r.stream_position()?.saturating_add(e.size);
                 let mut t = TrackEntry::default();
                 parse_track_entry(r, body_end, &mut t)?;
+                let private: usize = out.iter().map(|t| t.codec_private.len()).sum();
+                if private.saturating_add(t.codec_private.len()) > MAX_CODEC_PRIVATE_TOTAL {
+                    return Err(Error::invalid("MKV: CodecPrivate data exceeds its budget"));
+                }
                 out.push(t);
             }
             _ => skip(r, e.size)?,
@@ -7730,6 +7832,9 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
             ids::TRACK_UID => t.uid = read_uint(r, e.size as usize)?,
             ids::TRACK_TYPE => t.track_type = read_uint(r, e.size as usize)?,
             ids::CODEC_ID => t.codec_id_string = read_string(r, e.size as usize)?,
+            ids::CODEC_PRIVATE if e.size > MAX_CODEC_PRIVATE as u64 => {
+                return Err(Error::invalid("MKV: CodecPrivate exceeds its budget"));
+            }
             ids::CODEC_PRIVATE => t.codec_private = read_bytes(r, e.size as usize)?,
             ids::LANGUAGE => t.language = Some(read_string(r, e.size as usize)?),
             // Track identity strings (RFC 9559 §5.1.4.1.18 / .20 / .23). `Name`
@@ -9053,7 +9158,8 @@ impl Demuxer for MkvDemuxer {
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
             if !self.timestamps_primed
-                && (self.timestamp_probe_bytes >= 512 * 1024
+                && (self.timestamp_probe_bytes >= MAX_PROBE_BYTES
+                    || self.out_queue.len() >= MAX_PROBE_PACKETS
                     || self.decode_orders.iter().flatten().all(|o| !o.needs_probe()))
             {
                 self.finish_timestamp_probe();
@@ -9070,16 +9176,15 @@ impl Demuxer for MkvDemuxer {
                     return Ok(q.packet);
                 }
             }
-            let before = self
-                .input
-                .stream_position()
-                .unwrap_or(self.segment_data_end);
+            let before = self.input.stream_position()?;
             let step = match self.advance() {
                 Ok(()) => Ok(()),
                 Err(Error::Eof) => Err(Error::Eof),
                 // Damaged Cluster stream — seek the next Top-Level element
                 // without discarding packets held for timestamp analysis.
-                Err(_) => self.resync_cluster_stream(before),
+                // Transport failures are not damage; they reach the caller.
+                Err(e) if is_damage(&e) => self.resync_cluster_stream(before),
+                Err(e) => Err(e),
             };
             match step {
                 Ok(()) => {}
@@ -9221,6 +9326,7 @@ impl Demuxer for MkvDemuxer {
         self.last_webvtt_metadata = None;
         self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
         self.decode_orders.iter_mut().flatten().for_each(timing::DecodeOrder::reset);
+        self.resync_floor = 0;
 
         // RFC 9559 §5.1.5.1.2.3: when the Cues entry carries a
         // `CueRelativePosition`, the referenced SimpleBlock / BlockGroup
@@ -11037,8 +11143,11 @@ impl MkvDemuxer {
         self.cluster_state = ClusterState::Idle;
         self.input.crc = None;
         let from = failed_at.saturating_add(1).max(self.resync_floor);
-        let found =
-            scan_top_level_element(&mut *self.input, from, self.segment_data_end).unwrap_or(None);
+        let found = match scan_top_level_element(&mut *self.input, from, self.segment_data_end) {
+            Ok(found) => found,
+            Err(e) if is_damage(&e) => None,
+            Err(e) => return Err(e),
+        };
         match found {
             Some(off) => {
                 self.resync_floor = off.saturating_add(1);
@@ -11262,6 +11371,7 @@ impl MkvDemuxer {
         self.last_webvtt_metadata = None;
         self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
         self.decode_orders.iter_mut().flatten().for_each(timing::DecodeOrder::reset);
+        self.resync_floor = 0;
         Ok(self.ticks_to_stream_pts(stream_index, landed_ticks))
     }
 
@@ -11452,6 +11562,7 @@ impl MkvDemuxer {
         self.last_webvtt_metadata = None;
         self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
         self.decode_orders.iter_mut().flatten().for_each(timing::DecodeOrder::reset);
+        self.resync_floor = 0;
         if kf.at_cluster_start {
             self.input.seek(SeekFrom::Start(kf.cluster))?;
             self.cluster_state = ClusterState::Idle;
@@ -11607,11 +11718,16 @@ impl MkvDemuxer {
                 // Even an unknown child must fit this Cluster. Seeking over
                 // its forged size can otherwise leap past later Clusters
                 // without producing an error for the recovery path.
-                if !TOP_LEVEL_IDS.contains(&e.id)
+                if !CLUSTER_SIBLING_IDS.contains(&e.id)
                     && (e.size == VINT_UNKNOWN_SIZE
                         || self.input.stream_position()?.saturating_add(e.size) > body_end)
                 {
                     return Err(Error::invalid("MKV: child exceeds Cluster"));
+                }
+                if matches!(e.id, ids::SIMPLE_BLOCK | ids::BLOCK_GROUP | ids::ENCRYPTED_BLOCK)
+                    && e.size > MAX_BLOCK_BYTES as u64
+                {
+                    return Err(Error::invalid("MKV: Block exceeds its budget"));
                 }
                 match e.id {
                     ids::TIMECODE => {
@@ -11678,14 +11794,7 @@ impl MkvDemuxer {
                     // terminates when a sibling Segment-child element is
                     // encountered. Rewind to the start of that element and
                     // fall back to Idle so the outer loop can dispatch it.
-                    ids::CLUSTER
-                    | ids::CUES
-                    | ids::TAGS
-                    | ids::ATTACHMENTS
-                    | ids::CHAPTERS
-                    | ids::SEEK_HEAD
-                    | ids::INFO
-                    | ids::TRACKS => {
+                    id if CLUSTER_SIBLING_IDS.contains(&id) => {
                         self.input.seek(SeekFrom::Start(pos))?;
                         self.cluster_state = ClusterState::Idle;
                     }
@@ -11843,6 +11952,19 @@ impl MkvDemuxer {
         };
 
         let si = stream_idx as usize;
+        // Everything this Block retains shares one budget; an over-budget
+        // Block queues nothing.
+        let copies = 1 + if self.apply_track_operations {
+            self.virtual_consumers.get(si).map_or(0, Vec::len)
+        } else {
+            0
+        };
+        let side_data = additions.as_ref().map_or(0, |a| a.iter().map(|a| a.data.len()).sum::<usize>())
+            + meta.as_ref().map_or(0, |m| m.retained_bytes());
+        let over_budget = || Error::invalid("MKV: Block exceeds its 32 MiB budget");
+        let mut budget = MAX_BLOCK_BYTES.checked_sub(side_data).ok_or_else(over_budget)?;
+        let mut probe_charge = side_data;
+        let mut queued = Vec::new();
         let time_base = self.streams[si].time_base;
         let track_scale = self.track_timing[si].track_timestamp_scale();
         let mut block_pts = if cluster_timecode >= 0
@@ -11876,7 +11998,9 @@ impl MkvDemuxer {
             // decompressed on its own.
             let chain = self.frame_decompressions.get(stream_idx as usize);
             let mut frame_bytes = match chain.and_then(Option::as_ref) {
-                Some(chain) => content::decompress(chain, f)?,
+                Some(chain) => content::decompress(chain, f, budget / copies)
+                    .map_err(content::Undo::into_error)?,
+                None if f.len() > budget / copies => return Err(over_budget()),
                 None => f,
             };
             // Header stripping can restore data even to an empty stored
@@ -11905,6 +12029,10 @@ impl MkvDemuxer {
             } else {
                 None
             };
+            let retained = frame_bytes.len()
+                + webvtt.as_ref().map_or(0, |w| w.identifier.len() + w.settings.len());
+            budget = budget.checked_sub(retained.saturating_mul(copies)).ok_or_else(over_budget)?;
+            probe_charge += (retained + std::mem::size_of::<QueuedPacket>()) * copies;
             let keyframe = match self.frame_parsers.get_mut(si).and_then(Option::as_mut) {
                 _ if self.track_codecs.get(si).is_some_and(|c| c.intra_only()) => true,
                 Some(parser) => parser.keyframe(&frame_bytes, container_key),
@@ -11918,9 +12046,6 @@ impl MkvDemuxer {
             };
             pkt.duration = duration;
             pkt.flags.keyframe = keyframe;
-            if !self.timestamps_primed {
-                self.timestamp_probe_bytes = self.timestamp_probe_bytes.saturating_add(pkt.data.len());
-            }
             // BlockAdditions (RFC 9559 §5.1.3.5.2) and the BlockGroup meta
             // children attach to the Block as a whole; every frame de-laced
             // from a laced Block shares the same additions / meta (the spec
@@ -11958,15 +12083,19 @@ impl MkvDemuxer {
             } else {
                 Vec::new()
             };
-            self.out_queue.push_back(QueuedPacket {
+            queued.push(QueuedPacket {
                 packet: pkt,
                 additions: additions.clone(),
                 meta: meta.clone(),
                 origin: None,
                 webvtt,
             });
-            self.out_queue.extend(synth);
+            queued.extend(synth);
         }
+        if !self.timestamps_primed {
+            self.timestamp_probe_bytes = self.timestamp_probe_bytes.saturating_add(probe_charge);
+        }
+        self.out_queue.extend(queued);
         Ok(())
     }
 }

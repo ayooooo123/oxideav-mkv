@@ -11,7 +11,7 @@
 //! it: an input of 10 MB or more is refused, and a decompressed frame may
 //! not outgrow the first `input × 3^k` buffer that reaches 10 MB.
 
-use oxideav_core::{Error, Result};
+use oxideav_core::Error;
 
 use super::{ContentCompAlgo, ContentEncodingTransform, ContentEncodings};
 
@@ -61,41 +61,81 @@ pub(super) fn decompression_chain(
     }
 }
 
-/// `data` with `chain` undone.
-pub(super) fn decompress(chain: &[Decompression], mut data: Vec<u8>) -> Result<Vec<u8>> {
+/// Why a compression chain wasn't undone.
+#[derive(Debug)]
+pub(super) enum Undo {
+    /// Malformed data, or output past FFmpeg's per-step bound: FFmpeg
+    /// treats both as a failed decode.
+    Corrupt(Error),
+    /// The output would exceed the caller's retention budget.
+    OverBudget,
+}
+
+impl Undo {
+    /// Block frames treat either failure as invalid data.
+    pub(super) fn into_error(self) -> Error {
+        match self {
+            Undo::Corrupt(e) => e,
+            Undo::OverBudget => Error::invalid("MKV: decompressed frame exceeds its budget"),
+        }
+    }
+}
+
+/// `data` with `chain` undone, producing at most `budget` bytes.
+pub(super) fn decompress(
+    chain: &[Decompression],
+    mut data: Vec<u8>,
+    budget: usize,
+) -> std::result::Result<Vec<u8>, Undo> {
     for step in chain {
         if data.len() >= MAX_INPUT {
-            return Err(Error::invalid(format!(
+            return Err(Undo::Corrupt(Error::invalid(format!(
                 "MKV: encoded frame of {} bytes",
                 data.len()
-            )));
+            ))));
         }
+        let cap = output_cap(data.len());
         data = match step {
             Decompression::HeaderStripping(prefix) => {
-                let mut out = Vec::with_capacity(prefix.len() + data.len());
+                let len = prefix.len().saturating_add(data.len());
+                if len > budget {
+                    return Err(Undo::OverBudget);
+                }
+                let mut out = Vec::with_capacity(len);
                 out.extend_from_slice(prefix);
                 out.extend_from_slice(&data);
                 out
             }
-            Decompression::Zlib => inflate::<compcol::zlib::Zlib>(&data)?,
-            Decompression::Bzlib => inflate::<compcol::bzip2::Bzip2>(&data)?,
+            Decompression::Zlib => inflate::<compcol::zlib::Zlib>(&data, cap, budget)?,
+            Decompression::Bzlib => inflate::<compcol::bzip2::Bzip2>(&data, cap, budget)?,
             Decompression::Lzo1x => {
+                // LZO reports any exceeded limit as corruption, so decode to
+                // FFmpeg's bound and apply the budget to the result.
                 let mut out = Vec::new();
-                compcol::lzo::block::decode_block(&data, &mut out, output_cap(data.len()))
-                    .map_err(|e| Error::invalid(format!("MKV: lzo frame: {e:?}")))?;
+                compcol::lzo::block::decode_block(&data, &mut out, cap)
+                    .map_err(|e| Undo::Corrupt(Error::invalid(format!("MKV: lzo frame: {e:?}"))))?;
                 out
             }
         };
+        if data.len() > budget {
+            return Err(Undo::OverBudget);
+        }
     }
     Ok(data)
 }
 
-fn inflate<A: compcol::Algorithm>(data: &[u8]) -> Result<Vec<u8>> {
+fn inflate<A: compcol::Algorithm>(
+    data: &[u8],
+    cap: usize,
+    budget: usize,
+) -> std::result::Result<Vec<u8>, Undo> {
     if data.is_empty() {
-        return Err(Error::invalid(format!("MKV: empty {} frame", A::NAME)));
+        return Err(Undo::Corrupt(Error::invalid(format!("MKV: empty {} frame", A::NAME))));
     }
-    compcol::vec::decompress_to_vec_capped::<A>(data, output_cap(data.len()) as u64)
-        .map_err(|e| Error::invalid(format!("MKV: {} frame: {e:?}", A::NAME)))
+    compcol::vec::decompress_to_vec_capped::<A>(data, cap.min(budget) as u64).map_err(|e| match e {
+        compcol::Error::OutputLimitExceeded if budget < cap => Undo::OverBudget,
+        e => Undo::Corrupt(Error::invalid(format!("MKV: {} frame: {e:?}", A::NAME))),
+    })
 }
 
 /// The largest output an encoded input of `len` (< 10 MB) bytes may

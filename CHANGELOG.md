@@ -55,6 +55,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zero-byte frame still emits its restored header.
   Unrecoverable tails enter a terminal state instead of seeking to a
   possibly truncated Segment's declared end, including on HTTP Range inputs.
+- Untrusted input is bounded: at most two SeekHeads with 4096 distinct
+  retained entries and one followed target per other master; 256 tracks;
+  4 MiB per `CodecPrivate` and 16 MiB in total, stored or decompressed;
+  32 MiB retained per Block across laces, header stripping, virtual-track
+  copies and side data (an over-budget Block queues nothing); and startup
+  DTS analysis holds at most 1024 packets / 512 KiB including overhead.
+  Budget overruns are `InvalidData`. Transport and permission errors are
+  returned instead of being resynchronised into a clean end of stream;
+  seeking resets the resync floor; a forged `SignatureSlot` must fit its
+  Cluster; Vorbis recognises 64 modes and restores mode 0's window on seek.
 - Laces advance by their per-frame durations rather than repeating the
   first timestamp. BlockDuration and DefaultDuration use FFmpeg 9's integer
   remainder distribution; duration-less Vorbis, Opus, FLAC and WavPack
