@@ -229,15 +229,10 @@ fn resync_recovers_clusters_after_corrupt_cluster_header() {
         *b = 0x00;
     }
 
-    // Strict path: packets stop at the damage.
+    // Both paths recover stream damage; only metadata-open policy differs.
     let mut strict = open_strict(bytes.clone()).expect("open");
-    let mut got = Vec::new();
-    while let Ok(p) = strict.next_packet() {
-        got.push(p.pts.unwrap_or(-1));
-    }
-    assert_eq!(got, vec![0], "strict path must stop at the damage");
+    assert_eq!(drain(&mut strict), vec![(0, 0x11), (2000, 0x33)]);
 
-    // Resilient path: cluster 3 comes back.
     let mut dmx = open_resilient(bytes).expect("open");
     let packets = drain(&mut dmx);
     assert_eq!(
@@ -297,7 +292,7 @@ fn every_truncation_point_yields_packet_prefix_without_panic() {
 
     for cut in 0..bytes.len() {
         let truncated = bytes[..cut].to_vec();
-        match open_resilient(truncated) {
+        match open_strict(truncated) {
             Err(_) => {} // structurally unusable (header / Tracks cut) — fine
             Ok(mut dmx) => {
                 let mut got = Vec::new();

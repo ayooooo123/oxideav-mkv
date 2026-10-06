@@ -44,8 +44,8 @@ pub fn open_typed(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Resul
 
 /// Damage-tolerant variant of [`open`]. RFC 9559 §26 leaves error handling
 /// to the Reader ("Matroska Readers decide how to handle the errors whether
-/// or not they are recoverable in their code") — where the strict [`open`]
-/// fails on the first malformed byte, this path *recovers*:
+/// or not they are recoverable in their code"). This path also recovers
+/// damaged metadata at open time; both paths recover Cluster-stream damage:
 ///
 /// * a known-size Segment whose declared size runs past the end of the
 ///   input is clamped to the actual input length;
@@ -9049,10 +9049,7 @@ impl Demuxer for MkvDemuxer {
                 // `Error::Eof` is `advance`'s clean end-of-Segment signal,
                 // not damage — always propagate.
                 Err(Error::Eof) => return Err(Error::Eof),
-                Err(e) => {
-                    if !self.resilient {
-                        return Err(e);
-                    }
+                Err(_) => {
                     // Damaged Cluster stream — resynchronise on the next
                     // Top-Level element (RFC 9559 §5.1.3.2 anticipates
                     // Cluster-level resynchronisation of damaged streams)
@@ -9331,8 +9328,8 @@ impl MkvDemuxer {
     }
 
     /// `true` when this demuxer was constructed via [`open_resilient`] /
-    /// [`open_resilient_typed`] and will resynchronise on damaged input
-    /// instead of failing `next_packet`.
+    /// [`open_resilient_typed`] and tolerates damaged metadata at open time.
+    /// Both paths resynchronize Cluster-stream errors.
     pub fn is_resilient(&self) -> bool {
         self.resilient
     }
@@ -9341,8 +9338,7 @@ impl MkvDemuxer {
     /// master skips first, then Cluster-stream resyncs in the order they
     /// happened (the slice grows as `next_packet` walks the file).
     ///
-    /// Always empty for a strict [`open`] / [`open_typed`] demuxer, and
-    /// empty for a resilient demuxer over an undamaged file — so
+    /// Empty for an undamaged file on either open path, so
     /// `!damage_events().is_empty()` is exactly "this file needed
     /// recovery," which strict-minded callers can use to reject it after
     /// the fact.
@@ -11794,11 +11790,6 @@ impl MkvDemuxer {
         let n_frames = frames.len() as i64;
         let per_frame = explicit_duration.map(|d| d / n_frames.max(1));
         for (i, f) in frames.into_iter().enumerate() {
-            // An empty frame has no packet in FFmpeg unless BlockAdditions
-            // give it side-channel content (e.g. WebM alpha).
-            if f.is_empty() && additions.is_none() {
-                continue;
-            }
             let pts = pts_base + per_frame.unwrap_or(0) * i as i64;
             // Block scope (RFC 9559 §5.1.4.1.31.3 bit 0x1) is "all frame
             // contents, excluding lacing data": each de-laced frame is
@@ -11808,6 +11799,11 @@ impl MkvDemuxer {
                 Some(chain) => content::decompress(chain, f)?,
                 None => f,
             };
+            // Header stripping can restore data even to an empty stored
+            // frame. Only discard empties after undoing ContentEncodings.
+            if frame_bytes.is_empty() && additions.is_none() {
+                continue;
+            }
             // FFmpeg flags a packet a keyframe from what its codec parser
             // reads in the frame where it runs one, and every packet of an
             // intra-only codec or a non-audio-video track; the Block's

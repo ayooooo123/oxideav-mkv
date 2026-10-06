@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Open follows nested SeekHeads for trailing Info and Tracks, including
   tracks after an unknown-size Cluster. Cycles and excessive index chains
   are bounded. Empty frames without BlockAdditions no longer emit packets.
+- Both open paths resynchronize after Cluster-stream parse errors and end
+  a truncated tail with EOF, retaining complete packets before the damage.
+  Empty-frame filtering runs after decompression, so a header-stripped
+  zero-byte frame still emits its restored header.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.10...v0.0.11) - 2026-10-04
 
