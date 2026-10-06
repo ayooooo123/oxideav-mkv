@@ -55,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first timestamp. BlockDuration and DefaultDuration use FFmpeg 9's integer
   remainder distribution; duration-less Vorbis, Opus, FLAC and WavPack
   frames advance by durations parsed from their codec headers.
+- TrackTimestampScale changes each stream's reduced timebase and the
+  Cluster timestamp's conversion to track ticks. Negative absolute Block
+  timestamps are unspecified and interpolate from zero, matching FFmpeg.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.10...v0.0.11) - 2026-10-04
 

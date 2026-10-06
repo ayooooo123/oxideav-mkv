@@ -542,9 +542,6 @@ fn open_typed_impl(
     } else {
         info.timecode_scale
     };
-    // For simplicity expose every stream with the segment time base = scale/1e9 seconds per tick.
-    // 1 tick = timecode_scale_ns nanoseconds. So time base = timecode_scale_ns / 1_000_000_000.
-    let time_base = TimeBase::new(timecode_scale_ns as i64, 1_000_000_000);
 
     // Build public StreamInfo list, preserving the input track-number → output index mapping.
     let mut streams: Vec<StreamInfo> = Vec::new();
@@ -715,11 +712,16 @@ fn open_typed_impl(
         );
         track_codecs.push(codec);
         frame_parsers.push(parser::FrameParser::new(codec, &params.extradata));
+        // FFmpeg first narrows the scaled nanosecond tick to an unsigned
+        // integer, then reduces it against one second.
+        let track_scale = t.timing_raw.track_timestamp_scale.unwrap_or(1.0);
+        let tick_ns = (timecode_scale_ns as f64 * track_scale) as u32;
+        let time_base = TimeBase::new(i64::from(tick_ns.max(1)), 1_000_000_000);
         streams.push(StreamInfo {
             index: idx,
             time_base,
             duration: if info.duration > 0.0 {
-                Some(info.duration as i64)
+                Some((info.duration / track_scale) as i64)
             } else {
                 None
             },
@@ -9094,10 +9096,6 @@ impl Demuxer for MkvDemuxer {
         //   pts_seconds  = pts * stream.time_base.num / stream.time_base.den
         //   ticks        = pts_seconds * 1e9 / timecode_scale_ns
         //                = pts * num * 1e9 / (den * timecode_scale_ns)
-        // Every stream in this demuxer currently exposes the segment time
-        // base (timecode_scale_ns / 1e9), so the conversion collapses to
-        // a copy — but we still do the full calculation so behaviour is
-        // correct when other time bases are supplied.
         let target_ticks: u64 = self.stream_pts_to_ticks(stream_index, pts);
 
         // Find last cue entry for this track with time <= target_ticks.
@@ -11793,7 +11791,18 @@ impl MkvDemuxer {
 
         let si = stream_idx as usize;
         let time_base = self.streams[si].time_base;
-        let mut block_pts = Some(cluster_timecode.saturating_add(timecode_offset));
+        let track_scale = self.track_timing[si].track_timestamp_scale();
+        let mut block_pts = if cluster_timecode >= 0
+            && (timecode_offset >= 0 || cluster_timecode >= -timecode_offset)
+        {
+            Some(((cluster_timecode as f64 / track_scale) as u64)
+                .min(i64::MAX as u64) as i64)
+                .map(|pts| pts.saturating_add(timecode_offset))
+        } else {
+            // A negative absolute Block timestamp is unspecified, not a
+            // negative PTS. Duration interpolation starts relative to zero.
+            None
+        };
         let n_frames = frames.len().max(1) as i128;
         // FFmpeg 9 computes the whole Block duration in segment ticks first,
         // then distributes the integer remainder between laces.
