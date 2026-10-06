@@ -8,6 +8,7 @@
 //! Block` elements (lacing-aware) as the reader reaches them.
 
 mod content;
+mod framing;
 mod parser;
 mod timing;
 mod video_config;
@@ -631,6 +632,7 @@ fn open_typed_impl(
         let stripped = strip_bitmapinfoheader(&t.codec_id_string, &t.codec_private);
         params.extradata = match codec_id.as_str() {
             "flac" if stripped.starts_with(b"fLaC") => stripped[4..].to_vec(),
+            "wavpack" if stripped.len() < 2 => 0x410u16.to_le_bytes().to_vec(),
             _ => stripped,
         };
         if t.track_type == ids::TRACK_TYPE_AUDIO {
@@ -11838,6 +11840,15 @@ impl MkvDemuxer {
             let parsed_duration = self.packet_clocks[si].frame_duration(&frame_bytes, time_base);
             let duration = (lace_duration > 0).then_some(lace_duration).or(parsed_duration);
             let pts = self.packet_clocks[si].timestamp(source_pts, duration);
+            match self.streams[si].params.codec_id.as_str() {
+                "prores" => framing::prores(&mut frame_bytes)?,
+                "wavpack" => {
+                    let extra = &self.streams[si].params.extradata;
+                    let version = u16::from_le_bytes([extra[0], extra[1]]);
+                    frame_bytes = framing::wavpack(frame_bytes, version)?;
+                }
+                _ => {}
+            }
             let webvtt = if self.webvtt_tracks[si] {
                 Some(std::sync::Arc::new(webvtt::split(&mut frame_bytes)?))
             } else {

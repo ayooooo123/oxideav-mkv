@@ -41,6 +41,7 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
         "A_FLAC" => "flac",
         "A_OPUS" => "opus",
         "A_VORBIS" => "vorbis",
+        "A_WAVPACK4" => "wavpack",
         "A_PCM/INT/LIT" => "pcm_s16le",
         "A_PCM/INT/BIG" => "pcm_s16be",
         "A_PCM/FLOAT/IEEE" => "pcm_f32le",
@@ -72,6 +73,7 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
         "V_MPEGH/ISO/HEVC" => "h265",
         "V_FFV1" => "ffv1",
         "V_THEORA" => "theora",
+        "V_PRORES" => "prores",
         "V_MS/VFW/FOURCC" => return from_bitmapinfoheader(codec_private),
         // Subtitles. Matroska's "S_TEXT/*" family carries plain UTF-8 with
         // per-format markup; "S_HDMV/PGS" carries Blu-ray bitmap subs;

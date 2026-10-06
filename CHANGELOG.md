@@ -58,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TrackTimestampScale changes each stream's reduced timebase and the
   Cluster timestamp's conversion to track ticks. Negative absolute Block
   timestamps are unspecified and interpolate from zero, matching FFmpeg.
+- ProRes frames missing their size/`icpf` prefix and compact Matroska
+  WavPack blocks regain their standard codec headers. WavPack without a
+  valid CodecPrivate version uses 4.10, as FFmpeg does.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.10...v0.0.11) - 2026-10-04
 
