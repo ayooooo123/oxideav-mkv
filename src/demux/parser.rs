@@ -211,6 +211,13 @@ impl FrameParser {
             || (self.key_frame == -1 && self.pict_type == PictType::I)
             || (self.key_frame == -1 && self.pict_type == PictType::None && container_key)
     }
+    pub(super) fn reorder_delay(&self) -> Option<usize> {
+        match &self.kind {
+            Kind::H264(h) => Some(h.reorder_delay.unwrap_or(0) as usize),
+            _ => None,
+        }
+    }
+
 
     fn parse(&mut self, frame: &[u8]) {
         match &mut self.kind {
@@ -398,6 +405,7 @@ const H264_NAL_PPS: u8 = 8;
 struct H264Sps {
     /// `max_num_ref_frames`.
     ref_frame_count: u32,
+    reorder_frames: Option<u32>,
 }
 
 /// What h264_parser.c keeps of a picture parameter set (H.264 §7.3.2.2).
@@ -417,6 +425,7 @@ struct H264 {
     nal_length_size: Option<usize>,
     sps: [Option<H264Sps>; 32],
     pps: Vec<Option<H264Pps>>,
+    reorder_delay: Option<u32>,
 }
 
 impl H264 {
@@ -425,8 +434,10 @@ impl H264 {
             nal_length_size: None,
             sps: [None; 32],
             pps: vec![None; 256],
+            reorder_delay: None,
         };
         h.decode_extradata(extradata);
+        h.reorder_delay = h.sps.iter().flatten().find_map(|s| s.reorder_frames);
         h
     }
 
@@ -542,12 +553,18 @@ impl H264 {
                     }
                     let pps = self.pps.get(r.ue() as usize).copied().flatten();
                     if let Some(pps) = pps {
+                        if let Some(delay) = pps.sps.reorder_frames {
+                            self.reorder_delay = Some(delay);
+                        }
                         if pps.sps.ref_frame_count <= 1
                             && pps.ref_count0 <= 1
                             && pict_type == PictType::I
                         {
                             key_frame = 1;
                         }
+                    }
+                    if pict_type == PictType::B && self.reorder_delay.unwrap_or(0) == 0 {
+                        self.reorder_delay = Some(1);
                     }
                     // The first slice decides; the rest is not read.
                     break;
@@ -628,7 +645,47 @@ fn decode_sps(rbsp: &[u8]) -> Option<(usize, H264Sps)> {
     if r.overread() {
         return None;
     }
-    Some((sps_id, H264Sps { ref_frame_count }))
+    let reorder_frames = h264_reorder_frames(&mut r);
+    Some((sps_id, H264Sps { ref_frame_count, reorder_frames }))
+}
+
+/// H.264 SPS tail and VUI bitstream_restriction (Annex E.1.1).
+fn h264_reorder_frames(r: &mut Bits<'_>) -> Option<u32> {
+    r.skip(1); // gaps_in_frame_num_value_allowed_flag
+    r.ue(); r.ue(); // picture dimensions
+    if r.bit() == 0 { r.skip(1); } // mb_adaptive_frame_field_flag
+    r.skip(1); // direct_8x8_inference_flag
+    if r.bit() != 0 { for _ in 0..4 { r.ue(); } }
+    if r.bit() == 0 { return None; } // vui_parameters_present_flag
+    if r.bit() != 0 && r.bits(8) == 255 { r.skip(32); }
+    if r.bit() != 0 { r.skip(1); } // overscan
+    if r.bit() != 0 {
+        r.skip(4); // video_format, video_full_range_flag
+        if r.bit() != 0 { r.skip(24); }
+    }
+    if r.bit() != 0 { r.ue(); r.ue(); } // chroma location
+    if r.bit() != 0 { r.skip(65); } // timing information
+    let nal_hrd = r.bit() != 0;
+    if nal_hrd { skip_hrd(r)?; }
+    let vcl_hrd = r.bit() != 0;
+    if vcl_hrd { skip_hrd(r)?; }
+    if nal_hrd || vcl_hrd { r.skip(1); }
+    r.skip(1); // pic_struct_present_flag
+    if r.bit() == 0 { return None; }
+    r.skip(1);
+    for _ in 0..4 { r.ue(); }
+    let reorder = r.ue();
+    r.ue(); // max_dec_frame_buffering
+    (!r.overread() && reorder <= 16).then_some(reorder)
+}
+
+fn skip_hrd(r: &mut Bits<'_>) -> Option<()> {
+    let count = r.ue();
+    if count > 31 { return None; }
+    r.skip(8);
+    for _ in 0..=count { r.ue(); r.ue(); r.skip(1); }
+    r.skip(20);
+    (!r.overread()).then_some(())
 }
 
 /// Whether an SEI RBSP (H.264 §7.3.2.3) carries a valid recovery point

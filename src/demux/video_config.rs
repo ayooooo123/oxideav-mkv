@@ -73,6 +73,10 @@ pub(crate) fn cropped_dimensions_from_config(
     }
 }
 
+pub(super) fn hevc_reorder_frames(extradata: &[u8]) -> Option<usize> {
+    hevc_sps_info(hvcc_first_sps(extradata)?).and_then(|(_, delay)| delay)
+}
+
 /// The first SPS NAL unit of an `AVCDecoderConfigurationRecord`
 /// (ISO/IEC 14496-15 §5.3.3.1).
 fn avcc_first_sps(rec: &[u8]) -> Option<&[u8]> {
@@ -221,6 +225,10 @@ fn skip_scaling_list(r: &mut BitReader<'_>, size: usize) -> Option<()> {
 /// H.265 §7.3.2.2.1 `seq_parameter_set_rbsp()` up to the conformance
 /// window → the cropped output size (§7.4.3.2.1).
 fn hevc_sps_cropped_size(nal: &[u8]) -> Option<(u32, u32)> {
+    hevc_sps_info(nal).map(|(dimensions, _)| dimensions)
+}
+
+fn hevc_sps_info(nal: &[u8]) -> Option<((u32, u32), Option<usize>)> {
     // Two-byte NAL unit header; nal_unit_type 33 = SPS_NUT.
     if (nal.first()? >> 1) & 0x3f != 33 {
         return None;
@@ -256,10 +264,11 @@ fn hevc_sps_cropped_size(nal: &[u8]) -> Option<(u32, u32)> {
     let separate_colour_plane = chroma_format_idc == 3 && r.bit()?;
     let width = r.ue()?;
     let height = r.ue()?;
-    if !r.bit()? {
-        return Some((width, height));
-    }
-    let (left, right, top, bottom) = (r.ue()?, r.ue()?, r.ue()?, r.ue()?);
+    let (left, right, top, bottom) = if r.bit()? {
+        (r.ue()?, r.ue()?, r.ue()?, r.ue()?)
+    } else {
+        (0, 0, 0, 0)
+    };
     // Table 6-1: SubWidthC / SubHeightC (1 / 1 when ChromaArrayType is 0).
     let (sub_w, sub_h) = match (chroma_format_idc, separate_colour_plane) {
         (1, _) => (2, 2),
@@ -271,7 +280,20 @@ fn hevc_sps_cropped_size(nal: &[u8]) -> Option<(u32, u32)> {
     if crop_x >= width || crop_y >= height {
         return None;
     }
-    Some((width - crop_x, height - crop_y))
+    let delay = (|| {
+        r.ue()?; r.ue()?; // bit_depth_luma/chroma_minus8
+        r.ue()?; // log2_max_pic_order_cnt_lsb_minus4
+        let all_layers = r.bit()?;
+        let start = if all_layers { 0 } else { max_sub_layers_minus1 };
+        let mut reorder = 0;
+        for _ in start..=max_sub_layers_minus1 {
+            r.ue()?; // sps_max_dec_pic_buffering_minus1
+            reorder = r.ue()?;
+            r.ue()?; // sps_max_latency_increase_plus1
+        }
+        (reorder <= 16).then_some(reorder as usize)
+    })();
+    Some(((width - crop_x, height - crop_y), delay))
 }
 
 /// `(chroma_format_idc, luma bits, chroma bits)` from the first SPS of

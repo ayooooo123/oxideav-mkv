@@ -3,6 +3,34 @@
 //! subsequent audio packets advance by their codec's decoded sample count.
 use oxideav_core::{CodecParameters, TimeBase};
 
+/// The bounded PTS window used to infer DTS for reordered video. Missing
+/// slots sort before real timestamps, retaining N/A during initial delay.
+pub(super) struct DecodeOrder {
+    delay: usize,
+    pts: [Option<i64>; 17],
+}
+
+impl DecodeOrder {
+    pub(super) fn new(delay: usize) -> Self {
+        Self { delay, pts: [None; 17] }
+    }
+    pub(super) fn reset(&mut self) { self.pts.fill(None); }
+    pub(super) fn dts(&mut self, pts: Option<i64>, delay: Option<usize>) -> Option<i64> {
+        if let Some(delay) = delay { self.delay = delay; }
+        if self.delay >= self.pts.len() { return None; }
+        if let Some(pts) = pts {
+            self.pts[0] = Some(pts);
+            for i in 0..self.delay {
+                if self.pts[i] <= self.pts[i + 1] { break; }
+                self.pts.swap(i, i + 1);
+            }
+            self.pts[0]
+        } else {
+            None
+        }
+    }
+}
+
 pub(super) struct PacketClock {
     codec: AudioTiming,
     rate: u32,
@@ -158,6 +186,15 @@ fn bits(data: &[u8], pos: usize, count: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reordered_pts_window_preserves_initial_na() {
+        let mut clock = DecodeOrder::new(2);
+        let actual: Vec<_> = [0, 160, 80, 40, 120].into_iter()
+            .map(|pts| clock.dts(Some(pts), None)).collect();
+        assert_eq!(actual, [None, None, Some(0), Some(40), Some(80)]);
+        clock.reset();
+        assert_eq!(clock.dts(Some(200), None), None);
+    }
     #[test]
     fn opus_toc_durations() {
         assert_eq!(opus_samples(&[0]), Some(480));

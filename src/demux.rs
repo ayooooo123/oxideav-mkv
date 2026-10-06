@@ -732,6 +732,14 @@ fn open_typed_impl(
         });
     }
     let packet_clocks = streams.iter().map(|s| timing::PacketClock::new(&s.params)).collect();
+    let decode_orders = streams.iter().enumerate().map(|(i, stream)| {
+        let delay = match track_codecs[i] {
+            parser::Codec::H264 => frame_parsers[i].as_ref().and_then(parser::FrameParser::reorder_delay),
+            parser::Codec::Hevc => Some(video_config::hevc_reorder_frames(&stream.params.extradata).unwrap_or(0)),
+            _ => None,
+        };
+        delay.map(timing::DecodeOrder::new)
+    }).collect();
 
     // Resolve `Tags.Targets.Tag*UID` references now that the full segment
     // has been walked. Tags appearing before Tracks in segment order are
@@ -1164,6 +1172,7 @@ fn open_typed_impl(
         track_codecs,
         frame_parsers,
         packet_clocks,
+        decode_orders,
         webvtt_tracks: tracks.iter().map(|t| t.codec_id_string.starts_with("D_WEBVTT/")).collect(),
         last_webvtt_metadata: None,
         video_interlacings,
@@ -8858,6 +8867,7 @@ pub struct MkvDemuxer {
     /// (the Block's keyframe signal stands). See [`parser::FrameParser`].
     frame_parsers: Vec<Option<parser::FrameParser>>,
     packet_clocks: Vec<timing::PacketClock>,
+    decode_orders: Vec<Option<timing::DecodeOrder>>,
     webvtt_tracks: Vec<bool>,
     last_webvtt_metadata: Option<std::sync::Arc<WebVttMetadata>>,
     /// Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 +
@@ -9193,6 +9203,7 @@ impl Demuxer for MkvDemuxer {
         self.last_virtual_origin = None;
         self.last_webvtt_metadata = None;
         self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
+        self.decode_orders.iter_mut().flatten().for_each(timing::DecodeOrder::reset);
 
         // RFC 9559 §5.1.5.1.2.3: when the Cues entry carries a
         // `CueRelativePosition`, the referenced SimpleBlock / BlockGroup
@@ -11221,6 +11232,7 @@ impl MkvDemuxer {
         self.last_virtual_origin = None;
         self.last_webvtt_metadata = None;
         self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
+        self.decode_orders.iter_mut().flatten().for_each(timing::DecodeOrder::reset);
         Ok(self.ticks_to_stream_pts(stream_index, landed_ticks))
     }
 
@@ -11410,6 +11422,7 @@ impl MkvDemuxer {
         self.last_virtual_origin = None;
         self.last_webvtt_metadata = None;
         self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
+        self.decode_orders.iter_mut().flatten().for_each(timing::DecodeOrder::reset);
         if kf.at_cluster_start {
             self.input.seek(SeekFrom::Start(kf.cluster))?;
             self.cluster_state = ClusterState::Idle;
@@ -11869,7 +11882,10 @@ impl MkvDemuxer {
             };
             let mut pkt = Packet::new(stream_idx, time_base, frame_bytes);
             pkt.pts = pts;
-            pkt.dts = pts;
+            pkt.dts = match &mut self.decode_orders[si] {
+                Some(order) => order.dts(pts, self.frame_parsers[si].as_ref().and_then(parser::FrameParser::reorder_delay)),
+                None => pts,
+            };
             pkt.duration = duration;
             pkt.flags.keyframe = keyframe;
             // BlockAdditions (RFC 9559 §5.1.3.5.2) and the BlockGroup meta

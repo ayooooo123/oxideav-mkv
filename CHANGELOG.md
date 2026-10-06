@@ -63,6 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ProRes frames missing their size/`icpf` prefix and compact Matroska
   WavPack blocks regain their standard codec headers. WavPack without a
   valid CodecPrivate version uses 4.10, as FFmpeg does.
+- H.264 / HEVC packets infer DTS through a bounded PTS reorder window,
+  preserving unknown DTS at the beginning instead of copying PTS.
+  Delay comes from H.264 VUI / HEVC SPS reorder counts and H.264 B slices.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.10...v0.0.11) - 2026-10-04
 
