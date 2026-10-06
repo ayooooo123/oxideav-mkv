@@ -217,6 +217,12 @@ impl FrameParser {
             _ => None,
         }
     }
+    pub(super) fn has_reorder_restriction(&self) -> bool {
+        match &self.kind {
+            Kind::H264(h) => h.sps.iter().flatten().any(|s| s.reorder_frames.is_some()),
+            _ => false,
+        }
+    }
 
 
     fn parse(&mut self, frame: &[u8]) {

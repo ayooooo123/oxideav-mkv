@@ -732,13 +732,16 @@ fn open_typed_impl(
         });
     }
     let packet_clocks = streams.iter().map(|s| timing::PacketClock::new(&s.params)).collect();
-    let decode_orders = streams.iter().enumerate().map(|(i, stream)| {
-        let delay = match track_codecs[i] {
-            parser::Codec::H264 => frame_parsers[i].as_ref().and_then(parser::FrameParser::reorder_delay),
-            parser::Codec::Hevc => Some(video_config::hevc_reorder_frames(&stream.params.extradata).unwrap_or(0)),
-            _ => None,
-        };
-        delay.map(timing::DecodeOrder::new)
+    let decode_orders = streams.iter().enumerate().map(|(i, stream)| match track_codecs[i] {
+        parser::Codec::H264 => frame_parsers[i].as_ref().map(|parser| {
+            timing::DecodeOrder::h264(
+                parser.reorder_delay().unwrap_or(0), parser.has_reorder_restriction(),
+            )
+        }),
+        parser::Codec::Hevc => Some(timing::DecodeOrder::new(
+            video_config::hevc_reorder_frames(&stream.params.extradata).unwrap_or(0),
+        )),
+        _ => None,
     }).collect();
 
     // Resolve `Tags.Targets.Tag*UID` references now that the full segment
@@ -1173,6 +1176,8 @@ fn open_typed_impl(
         frame_parsers,
         packet_clocks,
         decode_orders,
+        timestamps_primed: false,
+        timestamp_probe_bytes: 0,
         webvtt_tracks: tracks.iter().map(|t| t.codec_id_string.starts_with("D_WEBVTT/")).collect(),
         last_webvtt_metadata: None,
         video_interlacings,
@@ -8868,6 +8873,8 @@ pub struct MkvDemuxer {
     frame_parsers: Vec<Option<parser::FrameParser>>,
     packet_clocks: Vec<timing::PacketClock>,
     decode_orders: Vec<Option<timing::DecodeOrder>>,
+    timestamps_primed: bool,
+    timestamp_probe_bytes: usize,
     webvtt_tracks: Vec<bool>,
     last_webvtt_metadata: Option<std::sync::Arc<WebVttMetadata>>,
     /// Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 +
@@ -9043,34 +9050,42 @@ impl Demuxer for MkvDemuxer {
 
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
-            if let Some(q) = self.out_queue.pop_front() {
-                // Keep the Block's `BlockAdditions` (RFC 9559 §5.1.3.5.2)
-                // and the `BlockGroup` meta children (§5.1.3.5.4..§5.1.3.5.7)
-                // reachable through `block_additions()` / `block_group_meta()`
-                // until the next packet is returned (or a seek invalidates
-                // them).
-                self.last_block_additions = q.additions;
-                self.last_block_group_meta = q.meta;
-                self.last_virtual_origin = q.origin;
-                self.last_webvtt_metadata = q.webvtt;
-                return Ok(q.packet);
+            if !self.timestamps_primed
+                && (self.timestamp_probe_bytes >= 512 * 1024
+                    || self.decode_orders.iter().flatten().all(|o| !o.needs_probe()))
+            {
+                self.finish_timestamp_probe();
+            }
+            if self.timestamps_primed {
+                if let Some(q) = self.out_queue.pop_front() {
+                    // Keep the Block's `BlockAdditions` (RFC 9559 §5.1.3.5.2)
+                    // and `BlockGroup` metadata paired with the packet,
+                    // including packets buffered for DTS initialization.
+                    self.last_block_additions = q.additions;
+                    self.last_block_group_meta = q.meta;
+                    self.last_virtual_origin = q.origin;
+                    self.last_webvtt_metadata = q.webvtt;
+                    return Ok(q.packet);
+                }
             }
             let before = self
                 .input
                 .stream_position()
                 .unwrap_or(self.segment_data_end);
-            match self.advance() {
+            let step = match self.advance() {
+                Ok(()) => Ok(()),
+                Err(Error::Eof) => Err(Error::Eof),
+                // Damaged Cluster stream — seek the next Top-Level element
+                // without discarding packets held for timestamp analysis.
+                Err(_) => self.resync_cluster_stream(before),
+            };
+            match step {
                 Ok(()) => {}
-                // `Error::Eof` is `advance`'s clean end-of-Segment signal,
-                // not damage — always propagate.
-                Err(Error::Eof) => return Err(Error::Eof),
-                Err(_) => {
-                    // Damaged Cluster stream — resynchronise on the next
-                    // Top-Level element (RFC 9559 §5.1.3.2 anticipates
-                    // Cluster-level resynchronisation of damaged streams)
-                    // and keep going. Unrecoverable → clean Eof.
-                    self.resync_cluster_stream(before)?;
+                Err(Error::Eof) => {
+                    self.finish_timestamp_probe();
+                    if self.out_queue.is_empty() { return Err(Error::Eof); }
                 }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -9236,6 +9251,21 @@ impl Demuxer for MkvDemuxer {
 }
 
 impl MkvDemuxer {
+    fn finish_timestamp_probe(&mut self) {
+        for (si, order) in self.decode_orders.iter_mut().enumerate() {
+            let Some(order) = order else { continue };
+            if order.finish_probe() {
+                for queued in &mut self.out_queue {
+                    if queued.packet.stream_index as usize == si {
+                        queued.packet.dts = order.dts(queued.packet.pts, None);
+                    }
+                }
+            }
+        }
+        self.timestamps_primed = true;
+        self.timestamp_probe_bytes = 0;
+    }
+
     /// Identifier and settings split off the last D_WEBVTT packet.
     /// S_TEXT/WEBVTT packets remain raw and have no such side data.
     /// Like `block_additions`, this typed side channel lasts until the next
@@ -11888,6 +11918,9 @@ impl MkvDemuxer {
             };
             pkt.duration = duration;
             pkt.flags.keyframe = keyframe;
+            if !self.timestamps_primed {
+                self.timestamp_probe_bytes = self.timestamp_probe_bytes.saturating_add(pkt.data.len());
+            }
             // BlockAdditions (RFC 9559 §5.1.3.5.2) and the BlockGroup meta
             // children attach to the Block as a whole; every frame de-laced
             // from a laced Block shares the same additions / meta (the spec

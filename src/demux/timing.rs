@@ -8,21 +8,63 @@ use oxideav_core::{CodecParameters, TimeBase};
 pub(super) struct DecodeOrder {
     delay: usize,
     pts: [Option<i64>; 17],
+    probe: Option<H264Probe>,
+}
+
+struct H264Probe {
+    frames: usize,
+    explicit: bool,
+    found_dts: bool,
 }
 
 impl DecodeOrder {
     pub(super) fn new(delay: usize) -> Self {
-        Self { delay, pts: [None; 17] }
+        Self { delay, pts: [None; 17], probe: None }
     }
-    pub(super) fn reset(&mut self) { self.pts.fill(None); }
+    pub(super) fn h264(delay: usize, explicit: bool) -> Self {
+        let mut order = Self::new(delay);
+        if !explicit || delay > 0 {
+            order.probe = Some(H264Probe { frames: 0, explicit, found_dts: false });
+        }
+        order
+    }
+    pub(super) fn reset(&mut self) {
+        self.pts.fill(None);
+        self.probe = None;
+    }
+    pub(super) fn needs_probe(&self) -> bool {
+        self.probe.as_ref().is_some_and(|p| {
+            if p.explicit { !p.found_dts } else { p.frames < 7 }
+        })
+    }
+    /// Once delay is known, replay the queued prefix just as the reference
+    /// parser does. A restricted SPS that never produced a DTS at EOF keeps
+    /// N/A, rather than inventing a timestamp for an incomplete sequence.
+    pub(super) fn finish_probe(&mut self) -> bool {
+        let replay = self.probe.take().is_some_and(|p| !p.explicit || p.found_dts);
+        if replay { self.pts.fill(None); }
+        replay
+    }
     pub(super) fn dts(&mut self, pts: Option<i64>, delay: Option<usize>) -> Option<i64> {
         if let Some(delay) = delay { self.delay = delay; }
+        if let Some(probe) = &mut self.probe {
+            probe.frames += 1;
+            if probe.explicit && probe.frames == 1 {
+                // The H.264 decoder learns SPS reorder delay after the first
+                // packet was parsed; that initial PTS slot is overwritten.
+                self.pts[0] = pts;
+                return None;
+            }
+        }
         if self.delay >= self.pts.len() { return None; }
         if let Some(pts) = pts {
             self.pts[0] = Some(pts);
             for i in 0..self.delay {
                 if self.pts[i] <= self.pts[i + 1] { break; }
                 self.pts.swap(i, i + 1);
+            }
+            if let Some(probe) = &mut self.probe {
+                probe.found_dts |= self.pts[0].is_some();
             }
             self.pts[0]
         } else {
@@ -194,6 +236,27 @@ mod tests {
         assert_eq!(actual, [None, None, Some(0), Some(40), Some(80)]);
         clock.reset();
         assert_eq!(clock.dts(Some(200), None), None);
+    }
+    #[test]
+    fn h264_delayed_sps_keeps_short_sequence_dts_unknown() {
+        let mut order = DecodeOrder::h264(4, true);
+        for pts in [1086, 1003, 1044, 1211, 1128] {
+            assert_eq!(order.dts(Some(pts), Some(4)), None);
+        }
+        assert!(order.needs_probe());
+        assert!(!order.finish_probe());
+    }
+    #[test]
+    fn h264_inferred_delay_replays_prefix() {
+        let mut order = DecodeOrder::h264(0, false);
+        let pts = [0, 42, 83, 125, 167, 250, 209];
+        for (i, &pts) in pts.iter().enumerate() {
+            order.dts(Some(pts), Some(usize::from(i >= 6)));
+        }
+        assert!(!order.needs_probe());
+        assert!(order.finish_probe());
+        let dts: Vec<_> = pts.into_iter().map(|pts| order.dts(Some(pts), None)).collect();
+        assert_eq!(dts, [None, Some(0), Some(42), Some(83), Some(125), Some(167), Some(209)]);
     }
     #[test]
     fn opus_toc_durations() {

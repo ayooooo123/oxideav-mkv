@@ -66,6 +66,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - H.264 / HEVC packets infer DTS through a bounded PTS reorder window,
   preserving unknown DTS at the beginning instead of copying PTS.
   Delay comes from H.264 VUI / HEVC SPS reorder counts and H.264 B slices.
+  A bounded H.264 prefix (at most 512 KiB of queued payload, plus the
+  current Block) is replayed once the delay is established; an incomplete
+  restricted-SPS sequence retains unknown DTS. Seeking clears the window.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.10...v0.0.11) - 2026-10-04
 
