@@ -743,27 +743,33 @@ fn length_prefixed_nals(mut data: &[u8], n: usize) -> impl Iterator<Item = &[u8]
     })
 }
 
-/// The NAL units of an Annex B byte stream, split at start codes.
+/// The NAL units of an Annex B byte stream, split at start codes: each runs
+/// from after its start code to the next one, less the zero bytes before
+/// it. Found as the iteration goes, so splitting holds no memory however
+/// many start codes the data packs.
 fn annex_b_nals(data: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let mut starts = Vec::new();
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            starts.push(i + 3);
-            i += 3;
-        } else {
+    // The offset just past the first start code at or after `from`.
+    let next_start = move |from: usize| {
+        let mut i = from;
+        while i + 3 <= data.len() {
+            if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+                return Some(i + 3);
+            }
             i += 1;
         }
-    }
-    let mut nals = Vec::with_capacity(starts.len());
-    for (k, &start) in starts.iter().enumerate() {
-        let mut end = starts.get(k + 1).map_or(data.len(), |&next| next - 3);
-        while end > start && data[end - 1] == 0 {
+        None
+    };
+    let mut start = next_start(0);
+    std::iter::from_fn(move || {
+        let nal_start = start?;
+        let following = next_start(nal_start);
+        let mut end = following.map_or(data.len(), |next| next - 3);
+        while end > nal_start && data[end - 1] == 0 {
             end -= 1;
         }
-        nals.push(&data[start..end]);
-    }
-    nals.into_iter()
+        start = following;
+        Some(&data[nal_start..end])
+    })
 }
 
 /// The RBSP of a NAL unit payload: emulation prevention bytes (`00 00

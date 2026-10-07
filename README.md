@@ -107,20 +107,33 @@ damaged master. Between Clusters it is damage in the Cluster stream, so the
 walk resumes at the next Cluster; a SeekHead target of unknown size is
 ignored unread. In `Info`, `SegmentUUID`, `PrevUUID` and `NextUUID` must be
 16 octets, each text field holds at most 64 KiB, and the `Info` masters
-keep at most 1 MiB together. Sizes are checked before a read, and a `Void`
-is stepped over unread. The Cues index keeps at most 32 MiB of CuePoints,
-positions, references and seek entries. Past that, the CuePoints that fit
-are kept and a `DamagedMaster(Cues)` event is recorded on either open. A
-seek past the last `CueTime` kept for its track, or on a track with no
-kept cue, scans the Clusters as a Cues-less seek does. Known limit: that
-scan starts at the first Cluster, so on a large remote file it costs reads
-up to the target.
+keep at most 1 MiB together. `Chapters` and `Attachments` text fields hold
+at most 64 KiB too, and each of the two keeps at most 1 MiB: editions,
+chapters, displays, processes, UID indexes and flat entries, or attachment
+records with their names, MIME types, descriptions, referrals, UID index
+and flat entries. Attachment payloads are never read at open;
+`attachment_data()` reads one on request and keeps nothing. Sizes are
+checked before a read, and a `Void` is stepped over unread. Everything the
+open keeps from `Tracks` and from `Tags` is charged to the master's 32 MiB
+limit before it is allocated: records, strings, byte strings and lists,
+the per-stream views, tag resolution with its flat entries, and working
+room for parsing a codec configuration. The per-stream views take the
+parsed data instead of copying it, and a stream's extradata takes its
+CodecPrivate bytes. A master past one of these budgets is InvalidData: a
+strict open fails and a resilient open skips it. A mid-stream `Tags` may
+use what the current tag state leaves of the 32 MiB. The Cues index keeps
+at most 32 MiB of CuePoints, positions, references and seek entries. Past
+that, the CuePoints that fit are kept and a `DamagedMaster(Cues)` event is
+recorded on either open. A seek past the last `CueTime` kept for its track,
+or on a track with no kept cue, scans the Clusters as a Cues-less seek
+does. Known limit: that scan starts at the first Cluster, so on a large
+remote file it costs reads up to the target.
 
 Known network cost: an `Info`, `Cues`, `Chapters` or `Attachments` master
 whose first child is a `CRC-32` is read in full to check it, in 16 KiB
-chunks with small heap. These masters have no size budget, so a large one
-costs its whole size in reads before the first packet when it precedes the
-Clusters, or at open when the SeekHead leads to it.
+chunks with small heap. These masters have no limit on their declared size,
+so a large one costs its whole size in reads before the first packet when
+it precedes the Clusters, or at open when the SeekHead leads to it.
 
 Duration-less laces use codec frame timing, including AAC/HE-AAC, MP3,
 AC-3/E-AC-3 and 16-bit DTS core headers. AAC preserves FFmpeg 9's untimed

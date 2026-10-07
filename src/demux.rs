@@ -22,7 +22,7 @@ use oxideav_core::{
 };
 use oxideav_core::{Demuxer, ReadSeek};
 
-use crate::codec_id::{from_matroska, strip_bitmapinfoheader};
+use crate::codec_id::from_matroska;
 use crate::ebml::{
     crc32_ieee, crc32_ieee_update, into_string, read_bytes, read_element_header, read_float,
     read_int, read_string, read_uint, read_vint, skip, VINT_UNKNOWN_SIZE,
@@ -258,11 +258,19 @@ fn open_typed_impl(
     // §6.2). Populated as each Top-Level master with a leading CRC-32
     // child is walked; surfaced via `MkvDemuxer::crc_status`.
     let mut crc_status: Vec<CrcStatus> = Vec::new();
-    // What the Info masters and the Cues index may keep, together over the
-    // walk below and the SeekHead chase after it — see [`MAX_INFO_BYTES`]
-    // and [`MAX_CUE_BYTES`]. A Cues index cut at its budget keeps the
-    // CuePoints that fit; seeks past them scan the Clusters.
+    // What the Info, Chapters, Attachments, Tags and Tracks masters and the
+    // Cues index may keep, each together over the walk below and the
+    // SeekHead chase after it — see [`MAX_INFO_BYTES`],
+    // [`MAX_CHAPTER_BYTES`], [`MAX_ATTACHMENT_BYTES`], [`MAX_TAGS_BYTES`],
+    // [`MAX_TRACKS_BYTES`] and [`MAX_CUE_BYTES`]. The Tags and Tracks
+    // budgets also cover what the open builds from those records. A Cues
+    // index cut at its budget keeps the CuePoints that fit; seeks past them
+    // scan the Clusters.
     let mut info_budget = Budget::new(MAX_INFO_BYTES, "MKV: Info exceeds its 1 MiB budget");
+    let mut chapter_budget = Budget::new(MAX_CHAPTER_BYTES, "MKV: Chapters exceed their 1 MiB budget");
+    let mut attachment_budget = Budget::new(MAX_ATTACHMENT_BYTES, "MKV: Attachments exceed their 1 MiB budget");
+    let mut tag_budget = Budget::new(MAX_TAGS_BYTES as usize, TAGS_OVER_BUDGET);
+    let mut track_budget = Budget::new(MAX_TRACKS_BYTES as usize, "MKV: Tracks records exceed their 32 MiB budget");
     let mut cue_budget = Budget::new(MAX_CUE_BYTES, "MKV: Cues exceed their 32 MiB budget");
     let mut cues_cut = false;
 
@@ -361,10 +369,10 @@ fn open_typed_impl(
                     have_info = true;
                 }
                 ids::TRACKS => {
-                    parse_tracks(&mut *input, end, &mut tracks)?;
+                    parse_tracks(&mut *input, end, &mut tracks, &mut track_budget)?;
                 }
                 ids::TAGS => {
-                    parse_tags(&mut *input, end, &mut pending_tags)?;
+                    parse_tags(&mut *input, end, &mut pending_tags, &mut tag_budget)?;
                 }
                 ids::CUES => {
                     if let Some(stop) = parse_cues(&mut *input, end, &mut cues, &mut cue_points, &mut cue_budget)? {
@@ -380,6 +388,7 @@ fn open_typed_impl(
                         &mut chapter_uid_to_index,
                         &mut edition_uid_to_index,
                         &mut editions,
+                        &mut chapter_budget,
                     )?;
                 }
                 ids::ATTACHMENTS => {
@@ -389,6 +398,7 @@ fn open_typed_impl(
                         &mut metadata,
                         &mut attachment_uid_to_index,
                         &mut attachments,
+                        &mut attachment_budget,
                     )?;
                 }
                 ids::SEEK_HEAD if !over_quota => {
@@ -419,14 +429,11 @@ fn open_typed_impl(
             // The master is damaged. Keep whatever was lifted before the
             // error, then resume the walk: at the element's declared end
             // when it is sane, otherwise at the next Top-Level element ID
-            // the scanner can find.
+            // the scanner can find from the end of its header, where an
+            // element of unknown size with no body has its successor.
             let resume = match body_end_known {
                 Some(end) if end <= segment_data_end => Some(end),
-                _ => scan_top_level_element(
-                    &mut *input,
-                    body_start.saturating_add(1),
-                    segment_data_end,
-                )?,
+                _ => scan_top_level_element(&mut *input, body_start, segment_data_end)?,
             };
             match resume {
                 Some(off) => {
@@ -515,6 +522,10 @@ fn open_typed_impl(
                 &mut attachments,
                 MetadataBudgets {
                     info: &mut info_budget,
+                    chapters: &mut chapter_budget,
+                    attachments: &mut attachment_budget,
+                    tags: &mut tag_budget,
+                    tracks: &mut track_budget,
                     cues: &mut cue_budget,
                     cues_cut: &mut cues_cut,
                     damage_events: &mut damage_events,
@@ -545,7 +556,9 @@ fn open_typed_impl(
     // A `CodecPrivate` compressed by the track's ContentEncodings (scope
     // bit 0x2, RFC 9559 §5.1.4.1.31.3) is decompressed before anything
     // reads it; one that fails to decompress is dropped, as FFmpeg does.
-    // Output past the CodecPrivate budget is invalid data instead.
+    // Output past the CodecPrivate budget, or past half of what the Tracks
+    // records may still keep (an output buffer can double as it grows), is
+    // invalid data instead.
     let mut private_total: usize = tracks.iter().map(|t| t.codec_private.len()).sum();
     for t in &mut tracks {
         let chain = t
@@ -556,7 +569,9 @@ fn open_typed_impl(
             if !t.codec_private.is_empty() {
                 let stored = std::mem::take(&mut t.codec_private);
                 private_total -= stored.len();
-                let budget = MAX_CODEC_PRIVATE.min(MAX_CODEC_PRIVATE_TOTAL.saturating_sub(private_total));
+                let budget = MAX_CODEC_PRIVATE
+                    .min(MAX_CODEC_PRIVATE_TOTAL.saturating_sub(private_total))
+                    .min(track_budget.left() / 2);
                 t.codec_private = match content::decompress(&chain, stored, budget) {
                     Ok(data) => data,
                     Err(content::Undo::Corrupt(_)) => Vec::new(),
@@ -564,6 +579,8 @@ fn open_typed_impl(
                         return Err(Error::invalid("MKV: CodecPrivate exceeds its budget"));
                     }
                 };
+                track_budget.charge(t.codec_private.capacity())?;
+                track_budget.reserve_scratch(t.codec_private.len())?;
                 private_total += t.codec_private.len();
             }
         }
@@ -584,7 +601,7 @@ fn open_typed_impl(
     // runs over its packets — see `parser`.
     let mut track_codecs: Vec<parser::Codec> = Vec::new();
     let mut frame_parsers: Vec<Option<parser::FrameParser>> = Vec::new();
-    for t in &tracks {
+    for t in &mut tracks {
         let idx = streams.len() as u32;
         track_index_by_number.insert(t.number, idx);
         // Ask the CodecResolver registry first (codec crates can claim
@@ -655,17 +672,24 @@ fn open_typed_impl(
             params.media_type = MediaType::Subtitle;
             params.options = params.options.set("webvtt_packet_format", "text");
         }
-        // Codec-specific CodecPrivate normalisation:
+        // Codec-specific CodecPrivate normalisation, done in place so the
+        // stream takes the bytes without a copy:
         //   * `V_MS/VFW/FOURCC`: the outer 40-byte BITMAPINFOHEADER wraps
         //     real codec extradata — strip it so decoders see their own
         //     config record.
         //   * `A_FLAC`: the CodecPrivate sometimes has a leading `"fLaC"`
         //     magic; our FLAC decoder expects metadata blocks only.
-        let stripped = strip_bitmapinfoheader(&t.codec_id_string, &t.codec_private);
+        let mut extradata = std::mem::take(&mut t.codec_private);
+        if t.codec_id_string == "V_MS/VFW/FOURCC" && extradata.len() >= 40 {
+            extradata.drain(..40);
+        }
         params.extradata = match codec_id.as_str() {
-            "flac" if stripped.starts_with(b"fLaC") => stripped[4..].to_vec(),
-            "wavpack" if stripped.len() < 2 => 0x410u16.to_le_bytes().to_vec(),
-            _ => stripped,
+            "flac" if extradata.starts_with(b"fLaC") => {
+                extradata.drain(..4);
+                extradata
+            }
+            "wavpack" if extradata.len() < 2 => 0x410u16.to_le_bytes().to_vec(),
+            _ => extradata,
         };
         if t.track_type == ids::TRACK_TYPE_AUDIO {
             params.sample_rate = Some(t.sample_rate.round() as u32);
@@ -835,34 +859,37 @@ fn open_typed_impl(
 
     // Per-stream `ContentEncodings` (RFC 9559 §5.1.4.1.31), indexed by
     // stream index. No UID resolution needed — encodings are self-contained.
+    // This and the per-stream views below take their data from the track
+    // records rather than copying it, so they cost no more than the records
+    // were charged.
     let content_encodings: Vec<Option<ContentEncodings>> =
-        tracks.iter().map(|t| t.content_encodings.clone()).collect();
+        tracks.iter_mut().map(|t| t.content_encodings.take()).collect();
 
     // Per-stream `BlockAdditionMapping`s (RFC 9559 §5.1.4.1.17), indexed by
     // stream index. Each entry is one mapping master in on-disk order;
     // tracks with no `BlockAdditionMapping` child get an empty `Vec`.
     let block_addition_mappings: Vec<Vec<BlockAdditionMapping>> = tracks
-        .iter()
-        .map(|t| t.block_addition_mappings.clone())
+        .iter_mut()
+        .map(|t| std::mem::take(&mut t.block_addition_mappings))
         .collect();
 
     // Per-stream `TrackTranslate` lists (RFC 9559 §5.1.4.1.27), indexed by
     // stream index. Empty for tracks with no chapter-codec mapping (the
     // common case).
     let track_translates: Vec<Vec<TrackTranslate>> =
-        tracks.iter().map(|t| t.track_translates.clone()).collect();
+        tracks.iter_mut().map(|t| std::mem::take(&mut t.track_translates)).collect();
 
     // Per-stream reclaimed Appendix-A `TrackLegacy` records (RFC 9559
     // Appendix A.19..A.23 + A.28..A.32), indexed by stream index. `None` for
     // a track that carried none of the legacy elements (the common case for a
     // modern file), so a `Some(_)` always holds at least one populated field.
     let track_legacy: Vec<Option<TrackLegacy>> = tracks
-        .iter()
+        .iter_mut()
         .map(|t| {
             if t.legacy.is_empty() {
                 None
             } else {
-                Some(t.legacy.clone())
+                Some(std::mem::take(&mut t.legacy))
             }
         })
         .collect();
@@ -960,16 +987,16 @@ fn open_typed_impl(
     // defaults (`1`) are folded in on the typed surface, with the on-disk
     // presence preserved via the `*_explicit` accessors.
     let track_identity: Vec<TrackIdentity> = tracks
-        .iter()
+        .iter_mut()
         .map(|t| TrackIdentity {
-            name: t.name.clone(),
-            codec_name: t.codec_name.clone(),
-            language: t.language.clone(),
-            language_bcp47: t.language_bcp47.clone(),
+            name: t.name.take(),
+            codec_name: t.codec_name.take(),
+            language: t.language.take(),
+            language_bcp47: t.language_bcp47.take(),
             flag_enabled: t.flag_enabled,
             flag_default: t.flag_default,
             flag_lacing: t.flag_lacing,
-            attachment_links: t.attachment_links.clone(),
+            attachment_links: std::mem::take(&mut t.attachment_links),
         })
         .collect();
 
@@ -1056,11 +1083,11 @@ fn open_typed_impl(
     // pose components `0.0`) — so an empty `Projection` master decodes to a
     // fully-typed identity projection.
     let video_projections: Vec<Option<Projection>> = tracks
-        .iter()
+        .iter_mut()
         .map(|t| {
-            t.projection_raw.as_ref().map(|p| Projection {
+            t.projection_raw.as_mut().map(|p| Projection {
                 projection_type: ProjectionType::from_raw(p.projection_type_raw),
-                private: p.private.clone(),
+                private: p.private.take(),
                 pose_yaw: p.pose_yaw,
                 pose_pitch: p.pose_pitch,
                 pose_roll: p.pose_roll,
@@ -1089,12 +1116,8 @@ fn open_typed_impl(
     // (§5.1.4.1.28.15 Table 11 makes it mandatory only when
     // `CodecID == "V_UNCOMPRESSED"` and there is no spec default).
     let video_uncompressed_fourccs: Vec<Option<UncompressedFourCC>> = tracks
-        .iter()
-        .map(|t| {
-            t.uncompressed_fourcc_raw
-                .as_ref()
-                .map(|raw| UncompressedFourCC { bytes: raw.clone() })
-        })
+        .iter_mut()
+        .map(|t| t.uncompressed_fourcc_raw.take().map(|bytes| UncompressedFourCC { bytes }))
         .collect();
 
     let video_geometries: Vec<Option<VideoGeometry>> = tracks
@@ -1247,6 +1270,7 @@ fn open_typed_impl(
         attachment_uid_to_index,
         edition_uid_to_index,
         tag_metadata_entries,
+        tags_charge: MAX_TAGS_BYTES as usize - tag_budget.left(),
     })
 }
 
@@ -1741,24 +1765,65 @@ const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
 /// the lists holding them and the set of elements already recorded, each
 /// charged before it is allocated.
 const MAX_CLUSTER_RECORD_BYTES: usize = 32 << 20;
-/// One `Info` text field: a filename, `Title`, `MuxingApp` or `WritingApp`.
-const MAX_INFO_TEXT_BYTES: usize = 64 << 10;
+/// One text field of an `Info`, `Chapters` or `Attachments` master: a title,
+/// filename, language, MIME type or the like.
+const MAX_TEXT_BYTES: usize = 64 << 10;
 /// Everything the `Info` masters keep together: strings, UIDs, families,
 /// `ChapterTranslate`s, their lists and flat metadata entries.
 const MAX_INFO_BYTES: usize = 1 << 20;
+/// Everything the `Chapters` masters keep together: editions, chapters,
+/// their displays, processes and lists, the UID indexes and flat metadata
+/// entries.
+const MAX_CHAPTER_BYTES: usize = 1 << 20;
+/// Everything the `Attachments` masters keep together: the attachment
+/// records, their names, MIME types, descriptions and referrals, the UID
+/// index and flat metadata entries. The payloads stay on disk.
+const MAX_ATTACHMENT_BYTES: usize = 1 << 20;
+/// What the open builds for each `TrackEntry` besides its own fields: its
+/// stream, codec parser, clocks and per-stream views. Charged to the
+/// `Tracks` record budget once per entry.
+const TRACK_OVERHEAD_BYTES: usize = 16 << 10;
+/// The longest scope prefix a resolved tag's flat key carries,
+/// `tag:attachment:4294967295:`.
+const MAX_TAG_KEY_PREFIX: usize = 26;
 /// The `Cues` index the demuxer keeps: its CuePoints, CueTrackPositions,
 /// CueReferences and flat seek entries, with their lists. The CuePoints
 /// past it are dropped, and a seek past the last kept one scans the
 /// Clusters as a Cues-less seek does.
 const MAX_CUE_BYTES: usize = 32 << 20;
+const TAGS_OVER_BUDGET: &str = "MKV: Tags records exceed their 32 MiB budget";
 
 /// The budgets the open shares between its walk and the SeekHead chase,
 /// and where a Cues index cut at its budget is noted.
 struct MetadataBudgets<'a> {
     info: &'a mut Budget,
+    chapters: &'a mut Budget,
+    attachments: &'a mut Budget,
+    tags: &'a mut Budget,
+    tracks: &'a mut Budget,
     cues: &'a mut Budget,
     cues_cut: &'a mut bool,
     damage_events: &'a mut DamageLog,
+}
+
+/// Append `more` to `into`, taking it whole when `into` is empty so the
+/// records are not copied.
+fn merge<T>(into: &mut Vec<T>, mut more: Vec<T>) {
+    if into.is_empty() {
+        *into = more;
+    } else {
+        into.append(&mut more);
+    }
+}
+
+/// Add `more` to `into`, taking it whole when `into` is empty so the table
+/// is not rebuilt.
+fn merge_map(into: &mut std::collections::HashMap<u64, u32>, more: std::collections::HashMap<u64, u32>) {
+    if into.is_empty() {
+        *into = more;
+    } else {
+        into.extend(more);
+    }
 }
 
 /// The damage a Cues index cut at its budget records: the CuePoints from
@@ -2784,7 +2849,7 @@ struct RawTrackOperation {
 
 /// Parse an `Info` master ending at `end`; every child must fit it. The
 /// three Segment UIDs must be 16 octets and each text field at most
-/// [`MAX_INFO_TEXT_BYTES`], checked before it is read. What is kept is
+/// [`MAX_TEXT_BYTES`], checked before it is read. What is kept is
 /// charged to `budget` (see [`MAX_INFO_BYTES`]) before it is read or
 /// stored.
 fn parse_info(
@@ -2846,11 +2911,18 @@ fn parse_info(
     Ok(())
 }
 
-/// One `Info` text field of `size` octets at the reader: at most
-/// [`MAX_INFO_TEXT_BYTES`], charged to `budget` before it is read.
+/// One `Info` text field of `size` octets at the reader — see
+/// [`text_field`].
 fn info_text(r: &mut dyn ReadSeek, size: u64, budget: &mut Budget) -> Result<String> {
-    if size > MAX_INFO_TEXT_BYTES as u64 {
-        return Err(Error::invalid("MKV: Info text field exceeds 64 KiB"));
+    text_field(r, size, budget, "MKV: Info text field exceeds 64 KiB")
+}
+
+/// One text field of `size` octets at the reader: at most
+/// [`MAX_TEXT_BYTES`], else invalid data with `exceeded`, and charged to
+/// `budget` before it is read.
+fn text_field(r: &mut dyn ReadSeek, size: u64, budget: &mut Budget, exceeded: &'static str) -> Result<String> {
+    if size > MAX_TEXT_BYTES as u64 {
+        return Err(Error::invalid(exceeded));
     }
     into_string(budget.read(r, size)?)
 }
@@ -2874,6 +2946,15 @@ fn keep_info_entry(metadata: &mut Vec<(String, String)>, key: &str, value: Strin
         budget.charge(2 * std::mem::size_of::<(String, String)>() + key.len())?;
         metadata.push((key.into(), value));
     }
+    Ok(())
+}
+
+/// Keep the flat metadata entry `key` = `value`, charging the key, a copy
+/// of the value and two of the shared list's slots, the most a list that
+/// doubles as it grows holds per entry, before the value is copied.
+fn keep_entry(metadata: &mut Vec<(String, String)>, key: String, value: &str, budget: &mut Budget) -> Result<()> {
+    budget.charge(2 * std::mem::size_of::<(String, String)>() + key.capacity() + value.len())?;
+    metadata.push((key, value.to_owned()));
     Ok(())
 }
 
@@ -2912,16 +2993,18 @@ fn parse_chapter_translate(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) 
 /// using the given codec" per §5.1.4.1.27.3. The `TrackTranslateTrackID` bytes
 /// are surfaced verbatim; their meaning is defined by the chapter codec, not
 /// the container.
-fn parse_track_translate(r: &mut dyn ReadSeek, end: u64) -> Result<TrackTranslate> {
+fn parse_track_translate(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<TrackTranslate> {
     let mut out = TrackTranslate::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         child_end(r, e.size, end)?;
         match e.id {
-            ids::TRACK_TRANSLATE_TRACK_ID => out.track_id = read_bytes(r, e.size as usize)?,
+            ids::TRACK_TRANSLATE_TRACK_ID => out.track_id = budget.read(r, e.size)?,
             ids::TRACK_TRANSLATE_CODEC => out.codec = read_uint(r, e.size as usize)?,
             ids::TRACK_TRANSLATE_EDITION_UID => {
-                out.edition_uids.push(read_uint(r, e.size as usize)?);
+                let uid = read_uint(r, e.size as usize)?;
+                budget.room(&mut out.edition_uids)?;
+                out.edition_uids.push(uid);
             }
             _ => skip(r, e.size)?,
         }
@@ -3046,8 +3129,12 @@ struct RawSimpleTag {
 const MAX_SIMPLE_TAG_DEPTH: u32 = 16;
 
 /// Parse a `Tags` master ending at `end`. Every element in its tree must
-/// fit its parent.
-fn parse_tags(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<RawTag>) -> Result<()> {
+/// fit its parent. Each record, string and list is charged to `budget`
+/// (see [`MAX_TAGS_BYTES`]) before it is read or stored, together with
+/// what resolving it will add — see [`resolved_tag_bytes`] and
+/// [`resolved_simple_tag_bytes`] — so resolution stays within the budget
+/// too.
+fn parse_tags(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<RawTag>, budget: &mut Budget) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let tag_end = child_end(r, e.size, end)?;
@@ -3063,8 +3150,10 @@ fn parse_tags(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<RawTag>) -> Result<(
                     target_type: None,
                     simple_tags: Vec::new(),
                 };
-                parse_tag(r, tag_end, &mut t)?;
+                parse_tag(r, tag_end, &mut t, budget)?;
                 if !t.simple_tags.is_empty() {
+                    budget.charge(resolved_tag_bytes(&t))?;
+                    budget.room(out)?;
                     out.push(t);
                 }
             }
@@ -3074,27 +3163,48 @@ fn parse_tags(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<RawTag>) -> Result<(
     Ok(())
 }
 
-fn parse_tag(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
+/// What resolving a `Tag` adds besides its SimpleTags, which are counted
+/// one by one: its typed record, its resolved targets and the scope
+/// prefix of its flat keys.
+fn resolved_tag_bytes(t: &RawTag) -> usize {
+    let uids = t.track_uids.len() + t.edition_uids.len() + t.chapter_uids.len() + t.attachment_uids.len();
+    std::mem::size_of::<Tag>() + uids * std::mem::size_of::<TargetUid>() + 2 * MAX_TAG_KEY_PREFIX
+}
+
+/// What resolving a `SimpleTag` adds besides the strings it holds, which
+/// resolution moves: its typed record and, for a named string value
+/// directly under a `Tag` (`flat`), its flat entry and the copy of that
+/// entry kept to undo it — the key (scope prefix and lowercase name) and
+/// the value twice, and four list slots.
+fn resolved_simple_tag_bytes(s: &RawSimpleTag, flat: bool) -> usize {
+    let entry = match &s.value {
+        SimpleTagValue::String(v) if flat && !s.name.is_empty() && !v.is_empty() => {
+            2 * (MAX_TAG_KEY_PREFIX + s.name.len() + v.len()) + 4 * std::mem::size_of::<(String, String)>()
+        }
+        _ => 0,
+    };
+    std::mem::size_of::<SimpleTag>() + entry
+}
+
+fn parse_tag(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag, budget: &mut Budget) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::TARGETS => {
-                parse_targets(r, e_end, t)?;
+                parse_targets(r, e_end, t, budget)?;
             }
             ids::SIMPLE_TAG => {
                 let mut s = RawSimpleTag {
-                    name: String::new(),
-                    value: SimpleTagValue::None,
-                    language: String::from("und"),
-                    language_bcp47: None,
                     default: true,
-                    children: Vec::new(),
+                    ..RawSimpleTag::default()
                 };
-                parse_simple_tag(r, e_end, &mut s, MAX_SIMPLE_TAG_DEPTH)?;
+                parse_simple_tag(r, e_end, &mut s, MAX_SIMPLE_TAG_DEPTH, budget)?;
                 // Drop SimpleTags with no name — they're malformed per
                 // RFC 9559 §5.1.8.1.2.1 (TagName has minOccurs 1).
                 if !s.name.is_empty() {
+                    budget.charge(resolved_simple_tag_bytes(&s, true))?;
+                    budget.room(&mut t.simple_tags)?;
                     t.simple_tags.push(s);
                 }
             }
@@ -3104,25 +3214,29 @@ fn parse_tag(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
     Ok(())
 }
 
-fn parse_targets(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
+fn parse_targets(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag, budget: &mut Budget) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         child_end(r, e.size, end)?;
         match e.id {
             ids::TAG_TRACK_UID => {
                 let v = read_uint(r, e.size as usize)?;
+                budget.room(&mut t.track_uids)?;
                 t.track_uids.push(v);
             }
             ids::TAG_EDITION_UID => {
                 let v = read_uint(r, e.size as usize)?;
+                budget.room(&mut t.edition_uids)?;
                 t.edition_uids.push(v);
             }
             ids::TAG_CHAPTER_UID => {
                 let v = read_uint(r, e.size as usize)?;
+                budget.room(&mut t.chapter_uids)?;
                 t.chapter_uids.push(v);
             }
             ids::TAG_ATTACHMENT_UID => {
                 let v = read_uint(r, e.size as usize)?;
+                budget.room(&mut t.attachment_uids)?;
                 t.attachment_uids.push(v);
             }
             // TagBlockAddIDValue (Matroska v5, staged
@@ -3132,13 +3246,14 @@ fn parse_targets(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
             // (`Targets::applies_to_block_addition`), not at parse time.
             ids::TAG_BLOCK_ADD_ID_VALUE => {
                 let v = read_uint(r, e.size as usize)?;
+                budget.room(&mut t.block_add_id_values)?;
                 t.block_add_id_values.push(v);
             }
             ids::TARGET_TYPE_VALUE => {
                 t.target_type_value = Some(read_uint(r, e.size as usize)?);
             }
             ids::TARGET_TYPE => {
-                let s = read_string(r, e.size as usize)?;
+                let s = into_string(budget.read(r, e.size)?)?;
                 if !s.is_empty() {
                     t.target_type = Some(s);
                 }
@@ -3154,12 +3269,13 @@ fn parse_simple_tag(
     end: u64,
     s: &mut RawSimpleTag,
     depth: u32,
+    budget: &mut Budget,
 ) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let e_end = child_end(r, e.size, end)?;
         match e.id {
-            ids::TAG_NAME => s.name = read_string(r, e.size as usize)?,
+            ids::TAG_NAME => s.name = into_string(budget.read(r, e.size)?)?,
             ids::SIMPLE_TAG => {
                 // RFC 9559 §5.1.8.1.2 is `recursive: True` — a SimpleTag
                 // MAY carry child SimpleTags. Parse them up to the depth
@@ -3172,37 +3288,35 @@ fn parse_simple_tag(
                     continue;
                 }
                 let mut child = RawSimpleTag {
-                    name: String::new(),
-                    value: SimpleTagValue::None,
-                    language: String::from("und"),
-                    language_bcp47: None,
                     default: true,
-                    children: Vec::new(),
+                    ..RawSimpleTag::default()
                 };
-                parse_simple_tag(r, e_end, &mut child, depth - 1)?;
+                parse_simple_tag(r, e_end, &mut child, depth - 1, budget)?;
                 if !child.name.is_empty() {
+                    budget.charge(resolved_simple_tag_bytes(&child, false))?;
+                    budget.room(&mut s.children)?;
                     s.children.push(child);
                 }
             }
             ids::TAG_STRING => {
-                let v = read_string(r, e.size as usize)?;
+                let v = into_string(budget.read(r, e.size)?)?;
                 // RFC 9559 §5.1.8.1.2.5/§5.1.8.1.2.6 say TagString and
                 // TagBinary are mutually exclusive within one SimpleTag;
                 // if a producer violates this, the last one wins.
                 s.value = SimpleTagValue::String(v);
             }
             ids::TAG_BINARY => {
-                let v = read_bytes(r, e.size as usize)?;
+                let v = budget.read(r, e.size)?;
                 s.value = SimpleTagValue::Binary(v);
             }
             ids::TAG_LANGUAGE => {
-                let v = read_string(r, e.size as usize)?;
+                let v = into_string(budget.read(r, e.size)?)?;
                 if !v.is_empty() {
                     s.language = v;
                 }
             }
             ids::TAG_LANGUAGE_BCP47 => {
-                let v = read_string(r, e.size as usize)?;
+                let v = into_string(budget.read(r, e.size)?)?;
                 if !v.is_empty() {
                     s.language_bcp47 = Some(v);
                 }
@@ -3218,6 +3332,11 @@ fn parse_simple_tag(
             }
             _ => skip(r, e.size)?,
         }
+    }
+    // `TagLanguage` defaults to "und" (§5.1.8.1.2.2).
+    if s.language.is_empty() {
+        budget.charge(3)?;
+        s.language = String::from("und");
     }
     Ok(())
 }
@@ -3253,15 +3372,15 @@ fn parse_simple_tag(
 /// fidelity.
 /// Recursively map a parsed [`RawSimpleTag`] (including its nested
 /// `children`, RFC 9559 §5.1.8.1.2 `recursive: True`) onto the public
-/// [`SimpleTag`] surface.
-fn simple_tag_from_raw(raw: &RawSimpleTag) -> SimpleTag {
+/// [`SimpleTag`] surface, moving its strings rather than copying them.
+fn simple_tag_from_raw(raw: RawSimpleTag) -> SimpleTag {
     SimpleTag {
-        name: raw.name.clone(),
-        value: raw.value.clone(),
-        language: raw.language.clone(),
-        language_bcp47: raw.language_bcp47.clone(),
+        name: raw.name,
+        value: raw.value,
+        language: raw.language,
+        language_bcp47: raw.language_bcp47,
         default: raw.default,
-        children: raw.children.iter().map(simple_tag_from_raw).collect(),
+        children: raw.children.into_iter().map(simple_tag_from_raw).collect(),
     }
 }
 
@@ -3275,12 +3394,14 @@ fn resolve_tags(
     metadata: &mut Vec<(String, String)>,
     tags_out: &mut Vec<Tag>,
 ) {
+    tags_out.reserve_exact(raw_tags.len());
     for tag in raw_tags {
         // Translate every non-zero UID to a TargetUid, dropping the ones
         // that don't resolve. A Tag with no UIDs at all is a global tag
         // (RFC 9559 §5.1.8.1.1, "If empty or omitted, then the tag value
         // describes everything in the Segment").
-        let mut resolved_uids: Vec<TargetUid> = Vec::new();
+        let uids = tag.track_uids.len() + tag.edition_uids.len() + tag.chapter_uids.len() + tag.attachment_uids.len();
+        let mut resolved_uids: Vec<TargetUid> = Vec::with_capacity(uids);
         let mut had_any_uid = false;
         for &uid in &tag.track_uids {
             had_any_uid = true;
@@ -3370,30 +3491,32 @@ fn resolve_tags(
             String::new()
         };
 
-        // Build the typed surface. Each `SimpleTag` keeps its original
-        // case / language / default flag / binary payload — none of which
-        // the flat view exposes.
+        // Build the typed surface, moving each `SimpleTag`'s strings. Each
+        // keeps its original case / language / default flag / binary
+        // payload — none of which the flat view exposes.
         let mut typed_simple: Vec<SimpleTag> = Vec::with_capacity(tag.simple_tags.len());
-        for raw in &tag.simple_tags {
-            typed_simple.push(simple_tag_from_raw(raw));
+        for raw in tag.simple_tags {
             // Project into the legacy flat view only when the value is a
             // non-empty string. Binary tag values (cover art, etc.) and
             // empty placeholders are skipped to match the pre-typed
             // behaviour where only `(name, str)` pairs surfaced.
-            if let SimpleTagValue::String(ref v) = raw.value {
+            if let SimpleTagValue::String(v) = &raw.value {
                 if !raw.name.is_empty() && !v.is_empty() {
-                    let key = format!("{prefix}{}", raw.name.to_ascii_lowercase());
+                    let mut key = String::with_capacity(prefix.len() + raw.name.len());
+                    key.push_str(&prefix);
+                    key.extend(raw.name.chars().map(|c| c.to_ascii_lowercase()));
                     metadata.push((key, v.clone()));
                 }
             }
+            typed_simple.push(simple_tag_from_raw(raw));
         }
 
         tags_out.push(Tag {
             targets: Targets {
                 target_type_value: tag.target_type_value,
-                target_type: tag.target_type.clone(),
+                target_type: tag.target_type,
                 uids: resolved_uids,
-                block_add_id_values: tag.block_add_id_values.clone(),
+                block_add_id_values: tag.block_add_id_values,
             },
             simple_tags: typed_simple,
         });
@@ -7041,6 +7164,10 @@ pub struct ChapProcessCommand {
 /// timecode-scale ticks — that's spec-defined and independent of the
 /// segment's `TimecodeScale`. The flat view surfaces them as integer
 /// milliseconds; the typed view keeps the raw nanoseconds.
+///
+/// Each text field holds at most [`MAX_TEXT_BYTES`], and everything both
+/// views and the UID indexes keep is charged to `budget` (see
+/// [`MAX_CHAPTER_BYTES`]) before it is read or stored.
 #[allow(clippy::too_many_arguments)]
 fn parse_chapters_typed(
     r: &mut dyn ReadSeek,
@@ -7049,6 +7176,7 @@ fn parse_chapters_typed(
     chapter_uid_to_index: &mut std::collections::HashMap<u64, u32>,
     edition_uid_to_index: &mut std::collections::HashMap<u64, u32>,
     editions: &mut Vec<Edition>,
+    budget: &mut Budget,
 ) -> Result<()> {
     // Shared 1-based counter across the whole Chapters element (every
     // EditionEntry, every nesting level), assigned depth-first in document
@@ -7070,7 +7198,9 @@ fn parse_chapters_typed(
                     edition_index,
                     chapter_uid_to_index,
                     edition_uid_to_index,
+                    budget,
                 )?;
+                budget.room(editions)?;
                 editions.push(edition);
             }
             _ => skip(r, e.size)?,
@@ -7078,6 +7208,8 @@ fn parse_chapters_typed(
     }
     Ok(())
 }
+
+const CHAPTER_TEXT_EXCEEDED: &str = "MKV: Chapters text field exceeds 64 KiB";
 
 #[allow(clippy::too_many_arguments)]
 fn parse_edition_entry(
@@ -7088,6 +7220,7 @@ fn parse_edition_entry(
     edition_index: u32,
     chapter_uid_to_index: &mut std::collections::HashMap<u64, u32>,
     edition_uid_to_index: &mut std::collections::HashMap<u64, u32>,
+    budget: &mut Budget,
 ) -> Result<Edition> {
     let mut edition = Edition::default();
     while r.stream_position()? < end {
@@ -7096,6 +7229,7 @@ fn parse_edition_entry(
             ids::EDITION_UID => {
                 let uid = read_uint(r, e.size as usize)?;
                 if uid != 0 {
+                    budget.map_room(edition_uid_to_index)?;
                     edition_uid_to_index.insert(uid, edition_index);
                     edition.uid = Some(uid);
                 }
@@ -7113,7 +7247,8 @@ fn parse_edition_entry(
             // (minOccurs: 1, no default) and dropped.
             ids::EDITION_DISPLAY => {
                 let ed_end = r.stream_position()?.saturating_add(e.size);
-                if let Some(disp) = parse_edition_display(r, ed_end)? {
+                if let Some(disp) = parse_edition_display(r, ed_end, budget)? {
+                    budget.room(&mut edition.displays)?;
                     edition.displays.push(disp);
                 }
             }
@@ -7126,7 +7261,9 @@ fn parse_edition_entry(
                     chapter_index,
                     chapter_uid_to_index,
                     0,
+                    budget,
                 )?;
+                budget.room(&mut edition.chapters)?;
                 edition.chapters.push(atom);
             }
             _ => skip(r, e.size)?,
@@ -7151,6 +7288,7 @@ fn parse_chapter_atom(
     chapter_index: &mut u32,
     chapter_uid_to_index: &mut std::collections::HashMap<u64, u32>,
     depth: u32,
+    budget: &mut Budget,
 ) -> Result<Chapter> {
     if depth >= MAX_CHAPTER_NESTING {
         return Err(Error::invalid(format!(
@@ -7171,12 +7309,13 @@ fn parse_chapter_atom(
             ids::CHAPTER_UID => {
                 let uid = read_uint(r, e.size as usize)?;
                 if uid != 0 {
+                    budget.map_room(chapter_uid_to_index)?;
                     chapter_uid_to_index.insert(uid, index);
                     atom.uid = Some(uid);
                 }
             }
             ids::CHAPTER_STRING_UID => {
-                atom.string_uid = Some(read_string(r, e.size as usize)?);
+                atom.string_uid = Some(text_field(r, e.size, budget, CHAPTER_TEXT_EXCEEDED)?);
             }
             ids::CHAPTER_TIME_START => atom.time_start_ns = read_uint(r, e.size as usize)?,
             ids::CHAPTER_TIME_END => atom.time_end_ns = Some(read_uint(r, e.size as usize)?),
@@ -7187,7 +7326,7 @@ fn parse_chapter_atom(
                 // A malformed file may carry a different length; we read
                 // exactly what's there and let the consumer treat any
                 // value with `len() != 16` as malformed.
-                atom.segment_uuid = Some(crate::ebml::read_bytes(r, e.size as usize)?);
+                atom.segment_uuid = Some(budget.read(r, e.size)?);
             }
             ids::CHAPTER_SEGMENT_EDITION_UID => {
                 let v = read_uint(r, e.size as usize)?;
@@ -7210,13 +7349,16 @@ fn parse_chapter_atom(
             }
             ids::CHAPTER_DISPLAY => {
                 let cd_end = r.stream_position()?.saturating_add(e.size);
-                if let Some(disp) = parse_chapter_display(r, cd_end)? {
+                if let Some(disp) = parse_chapter_display(r, cd_end, budget)? {
+                    budget.room(&mut atom.displays)?;
                     atom.displays.push(disp);
                 }
             }
             ids::CHAP_PROCESS => {
                 let cp_end = r.stream_position()?.saturating_add(e.size);
-                atom.chap_processes.push(parse_chap_process(r, cp_end)?);
+                let process = parse_chap_process(r, cp_end, budget)?;
+                budget.room(&mut atom.chap_processes)?;
+                atom.chap_processes.push(process);
             }
             // Legacy ChapterTrack master (0x8F, outside the RFC 9559
             // registry — staged legacy-element-ids.md): collect its
@@ -7230,6 +7372,7 @@ fn parse_chapter_atom(
                         ids::CHAPTER_TRACK_UID => {
                             let v = read_uint(r, c.size as usize)?;
                             if v != 0 {
+                                budget.room(&mut atom.track_uids)?;
                                 atom.track_uids.push(v);
                             }
                         }
@@ -7246,7 +7389,9 @@ fn parse_chapter_atom(
                     chapter_index,
                     chapter_uid_to_index,
                     depth + 1,
+                    budget,
                 )?;
+                budget.room(&mut atom.children)?;
                 atom.children.push(child);
             }
             _ => skip(r, e.size)?,
@@ -7255,15 +7400,9 @@ fn parse_chapter_atom(
     // Flat metadata view: only top-of-atom fields, keyed by the 1-based
     // index. `title` is the first non-empty display string (back-compat
     // with the pre-typed behaviour).
-    metadata.push((
-        format!("chapter:{index}:start_ms"),
-        (atom.time_start_ns / 1_000_000).to_string(),
-    ));
+    keep_entry(metadata, format!("chapter:{index}:start_ms"), &(atom.time_start_ns / 1_000_000).to_string(), budget)?;
     if let Some(ns) = atom.time_end_ns {
-        metadata.push((
-            format!("chapter:{index}:end_ms"),
-            (ns / 1_000_000).to_string(),
-        ));
+        keep_entry(metadata, format!("chapter:{index}:end_ms"), &(ns / 1_000_000).to_string(), budget)?;
     }
     if let Some(t) = atom
         .displays
@@ -7271,7 +7410,7 @@ fn parse_chapter_atom(
         .map(|d| &d.string)
         .find(|s| !s.is_empty())
     {
-        metadata.push((format!("chapter:{index}:title"), t.clone()));
+        keep_entry(metadata, format!("chapter:{index}:title"), t, budget)?;
     }
     Ok(atom)
 }
@@ -7284,14 +7423,14 @@ fn parse_chapter_atom(
 /// present-but-*empty* `EditionString` is kept: the schema does not
 /// prohibit an empty string and there is no legacy flat-view behaviour
 /// to preserve. Unknown children are skipped per the normal EBML rule.
-fn parse_edition_display(r: &mut dyn ReadSeek, end: u64) -> Result<Option<EditionDisplay>> {
+fn parse_edition_display(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<Option<EditionDisplay>> {
     let mut string: Option<String> = None;
     let mut languages: Vec<String> = Vec::new();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
             ids::EDITION_STRING => {
-                let v = read_string(r, e.size as usize)?;
+                let v = text_field(r, e.size, budget, CHAPTER_TEXT_EXCEEDED)?;
                 // maxOccurs: 1 — first occurrence wins on a malformed
                 // duplicate, mirroring the ChapString handling.
                 if string.is_none() {
@@ -7299,7 +7438,9 @@ fn parse_edition_display(r: &mut dyn ReadSeek, end: u64) -> Result<Option<Editio
                 }
             }
             ids::EDITION_LANGUAGE_IETF => {
-                languages.push(read_string(r, e.size as usize)?);
+                let language = text_field(r, e.size, budget, CHAPTER_TEXT_EXCEEDED)?;
+                budget.room(&mut languages)?;
+                languages.push(language);
             }
             _ => skip(r, e.size)?,
         }
@@ -7311,7 +7452,7 @@ fn parse_edition_display(r: &mut dyn ReadSeek, end: u64) -> Result<Option<Editio
 /// Returns `None` only when the master carries no (or an empty) `ChapString`
 /// — an unusable row the flat view always dropped. `ChapLanguage` defaults
 /// to `"eng"` per RFC 9559 §5.1.7.1.4.11.
-fn parse_chapter_display(r: &mut dyn ReadSeek, end: u64) -> Result<Option<ChapterDisplay>> {
+fn parse_chapter_display(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<Option<ChapterDisplay>> {
     let mut string: Option<String> = None;
     let mut language: Option<String> = None;
     let mut language_bcp47: Option<String> = None;
@@ -7320,14 +7461,16 @@ fn parse_chapter_display(r: &mut dyn ReadSeek, end: u64) -> Result<Option<Chapte
         let e = read_element_header(r)?;
         match e.id {
             ids::CHAP_STRING => {
-                let v = read_string(r, e.size as usize)?;
+                let v = text_field(r, e.size, budget, CHAPTER_TEXT_EXCEEDED)?;
                 if string.is_none() {
                     string = Some(v);
                 }
             }
-            ids::CHAP_LANGUAGE => language = Some(read_string(r, e.size as usize)?),
-            ids::CHAP_LANGUAGE_BCP47 => language_bcp47 = Some(read_string(r, e.size as usize)?),
-            ids::CHAP_COUNTRY => country = Some(read_string(r, e.size as usize)?),
+            ids::CHAP_LANGUAGE => language = Some(text_field(r, e.size, budget, CHAPTER_TEXT_EXCEEDED)?),
+            ids::CHAP_LANGUAGE_BCP47 => {
+                language_bcp47 = Some(text_field(r, e.size, budget, CHAPTER_TEXT_EXCEEDED)?);
+            }
+            ids::CHAP_COUNTRY => country = Some(text_field(r, e.size, budget, CHAPTER_TEXT_EXCEEDED)?),
             _ => skip(r, e.size)?,
         }
     }
@@ -7335,9 +7478,16 @@ fn parse_chapter_display(r: &mut dyn ReadSeek, end: u64) -> Result<Option<Chapte
         Some(s) if !s.is_empty() => s,
         _ => return Ok(None),
     };
+    let language = match language {
+        Some(language) => language,
+        None => {
+            budget.charge(3)?;
+            "eng".to_string()
+        }
+    };
     Ok(Some(ChapterDisplay {
         string,
-        language: language.unwrap_or_else(|| "eng".to_string()),
+        language,
         language_bcp47,
         country,
     }))
@@ -7347,18 +7497,20 @@ fn parse_chapter_display(r: &mut dyn ReadSeek, end: u64) -> Result<Option<Chapte
 /// [`ChapProcess`]. `ChapProcessCodecID` defaults to `0` (Matroska Script)
 /// per §5.1.7.1.4.15; the private data and command payloads are surfaced
 /// as raw bytes — the container never executes a chapter command.
-fn parse_chap_process(r: &mut dyn ReadSeek, end: u64) -> Result<ChapProcess> {
+fn parse_chap_process(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<ChapProcess> {
     let mut proc = ChapProcess::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
             ids::CHAP_PROCESS_CODEC_ID => proc.codec_id = read_uint(r, e.size as usize)?,
             ids::CHAP_PROCESS_PRIVATE => {
-                proc.private = Some(crate::ebml::read_bytes(r, e.size as usize)?);
+                proc.private = Some(budget.read(r, e.size)?);
             }
             ids::CHAP_PROCESS_COMMAND => {
                 let cc_end = r.stream_position()?.saturating_add(e.size);
-                proc.commands.push(parse_chap_process_command(r, cc_end)?);
+                let command = parse_chap_process_command(r, cc_end, budget)?;
+                budget.room(&mut proc.commands)?;
+                proc.commands.push(command);
             }
             _ => skip(r, e.size)?,
         }
@@ -7370,13 +7522,13 @@ fn parse_chap_process(r: &mut dyn ReadSeek, end: u64) -> Result<ChapProcess> {
 /// typed [`ChapProcessCommand`]. `ChapProcessTime` defaults to `0` ("during
 /// the whole chapter") when the (mandatory) element is absent; the
 /// `ChapProcessData` payload is surfaced as raw bytes.
-fn parse_chap_process_command(r: &mut dyn ReadSeek, end: u64) -> Result<ChapProcessCommand> {
+fn parse_chap_process_command(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<ChapProcessCommand> {
     let mut cmd = ChapProcessCommand::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
             ids::CHAP_PROCESS_TIME => cmd.time = read_uint(r, e.size as usize)?,
-            ids::CHAP_PROCESS_DATA => cmd.data = crate::ebml::read_bytes(r, e.size as usize)?,
+            ids::CHAP_PROCESS_DATA => cmd.data = budget.read(r, e.size)?,
             _ => skip(r, e.size)?,
         }
     }
@@ -7394,13 +7546,17 @@ fn parse_chap_process_command(r: &mut dyn ReadSeek, end: u64) -> Result<ChapProc
 /// File payloads are skipped via seek during the up-front walk so we don't
 /// pull megabytes of data into memory just to expose a filename. Sizes are
 /// reported from the `FileData` element header so the `size_bytes` value
-/// is the on-disk size (no compression decoded).
+/// is the on-disk size (no compression decoded). Each text field holds at
+/// most [`MAX_TEXT_BYTES`], and the records, the UID index and the flat
+/// entries are charged to `budget` (see [`MAX_ATTACHMENT_BYTES`]) before
+/// they are read or stored.
 fn parse_attachments(
     r: &mut dyn ReadSeek,
     end: u64,
     metadata: &mut Vec<(String, String)>,
     attachment_uid_to_index: &mut std::collections::HashMap<u64, u32>,
     attachments: &mut Vec<Attachment>,
+    budget: &mut Budget,
 ) -> Result<()> {
     let mut idx: u32 = 0;
     while r.stream_position()? < end {
@@ -7416,6 +7572,7 @@ fn parse_attachments(
                     idx,
                     attachment_uid_to_index,
                     attachments,
+                    budget,
                 )?;
             }
             _ => skip(r, e.size)?,
@@ -7424,6 +7581,8 @@ fn parse_attachments(
     Ok(())
 }
 
+const ATTACHMENT_TEXT_EXCEEDED: &str = "MKV: Attachments text field exceeds 64 KiB";
+
 fn parse_attached_file(
     r: &mut dyn ReadSeek,
     end: u64,
@@ -7431,6 +7590,7 @@ fn parse_attached_file(
     index: u32,
     attachment_uid_to_index: &mut std::collections::HashMap<u64, u32>,
     attachments: &mut Vec<Attachment>,
+    budget: &mut Budget,
 ) -> Result<()> {
     let mut filename: Option<String> = None;
     let mut mime: Option<String> = None;
@@ -7448,24 +7608,23 @@ fn parse_attached_file(
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
-            ids::FILE_NAME => filename = Some(read_string(r, e.size as usize)?),
-            ids::FILE_MIME_TYPE => mime = Some(read_string(r, e.size as usize)?),
-            ids::FILE_DESCRIPTION => description = Some(read_string(r, e.size as usize)?),
+            ids::FILE_NAME => filename = Some(text_field(r, e.size, budget, ATTACHMENT_TEXT_EXCEEDED)?),
+            ids::FILE_MIME_TYPE => mime = Some(text_field(r, e.size, budget, ATTACHMENT_TEXT_EXCEEDED)?),
+            ids::FILE_DESCRIPTION => {
+                description = Some(text_field(r, e.size, budget, ATTACHMENT_TEXT_EXCEEDED)?);
+            }
             ids::FILE_UID => {
                 let v = read_uint(r, e.size as usize)?;
                 if v != 0 {
                     uid = v;
+                    budget.map_room(attachment_uid_to_index)?;
                     attachment_uid_to_index.insert(v, index);
                 }
             }
             ids::FILE_REFERRAL => {
-                // Bounded allocation (`ebml::read_bytes` discipline): the
-                // size is attacker-controlled — a forged value (or the
-                // unknown-size sentinel, whose `as usize` cast exceeds
-                // `isize::MAX`) must not reach `vec![0u8; n]`, which would
-                // panic on capacity overflow before any read failed.
-                // Fuzz-found 2026-08.
-                referral = Some(crate::ebml::read_bytes(r, e.size as usize)?);
+                // Charged to the budget before any of it is read, so a
+                // forged size cannot reach an allocation.
+                referral = Some(budget.read(r, e.size)?);
             }
             ids::FILE_USED_START_TIME => {
                 used_start_time = Some(read_uint(r, e.size as usize)?);
@@ -7487,27 +7646,25 @@ fn parse_attached_file(
             _ => skip(r, e.size)?,
         }
     }
-    if let Some(ref n) = filename {
+    if let Some(n) = &filename {
         if !n.is_empty() {
-            metadata.push((format!("attachment:{index}:filename"), n.clone()));
+            keep_entry(metadata, format!("attachment:{index}:filename"), n, budget)?;
         }
     }
-    if let Some(ref m) = mime {
+    if let Some(m) = &mime {
         if !m.is_empty() {
-            metadata.push((format!("attachment:{index}:mime_type"), m.clone()));
+            keep_entry(metadata, format!("attachment:{index}:mime_type"), m, budget)?;
         }
     }
     if has_data {
-        metadata.push((
-            format!("attachment:{index}:size_bytes"),
-            data_size.to_string(),
-        ));
+        keep_entry(metadata, format!("attachment:{index}:size_bytes"), &data_size.to_string(), budget)?;
     }
-    if let Some(ref d) = description {
+    if let Some(d) = &description {
         if !d.is_empty() {
-            metadata.push((format!("attachment:{index}:description"), d.clone()));
+            keep_entry(metadata, format!("attachment:{index}:description"), d, budget)?;
         }
     }
+    budget.room(attachments)?;
     attachments.push(Attachment {
         index,
         filename: filename.unwrap_or_default(),
@@ -7937,12 +8094,12 @@ fn follow_seek_target(
             parse_info(r, end, &mut tmp_info, &mut tmp_meta, budgets.info)?;
             *info = tmp_info;
             *have_info = true;
-            metadata.extend(tmp_meta);
+            merge(metadata, tmp_meta);
         }
         ids::TRACKS => {
             let mut tmp = Vec::new();
-            parse_tracks(r, end, &mut tmp)?;
-            tracks.extend(tmp);
+            parse_tracks(r, end, &mut tmp, budgets.tracks)?;
+            merge(tracks, tmp);
         }
         ids::SEEK_HEAD => {
             let mut tmp = Vec::new();
@@ -7969,8 +8126,8 @@ fn follow_seek_target(
         }
         ids::TAGS => {
             let mut tmp = Vec::new();
-            parse_tags(r, end, &mut tmp)?;
-            pending_tags.extend(tmp);
+            parse_tags(r, end, &mut tmp, budgets.tags)?;
+            merge(pending_tags, tmp);
         }
         ids::CHAPTERS => {
             // The chase only runs when no `Chapters` was parsed yet, so
@@ -7987,20 +8144,21 @@ fn follow_seek_target(
                 &mut tmp_chap_map,
                 &mut tmp_ed_map,
                 &mut tmp_editions,
+                budgets.chapters,
             )?;
-            metadata.extend(tmp_meta);
-            chapter_uid_to_index.extend(tmp_chap_map);
-            edition_uid_to_index.extend(tmp_ed_map);
-            editions.extend(tmp_editions);
+            merge(metadata, tmp_meta);
+            merge_map(chapter_uid_to_index, tmp_chap_map);
+            merge_map(edition_uid_to_index, tmp_ed_map);
+            merge(editions, tmp_editions);
         }
         ids::ATTACHMENTS => {
             let mut tmp_meta = Vec::new();
             let mut tmp_att_map = std::collections::HashMap::new();
             let mut tmp_atts = Vec::new();
-            parse_attachments(r, end, &mut tmp_meta, &mut tmp_att_map, &mut tmp_atts)?;
-            metadata.extend(tmp_meta);
-            attachment_uid_to_index.extend(tmp_att_map);
-            attachments.extend(tmp_atts);
+            parse_attachments(r, end, &mut tmp_meta, &mut tmp_att_map, &mut tmp_atts, budgets.attachments)?;
+            merge(metadata, tmp_meta);
+            merge_map(attachment_uid_to_index, tmp_att_map);
+            merge(attachments, tmp_atts);
         }
         _ => return Ok(()),
     }
@@ -8011,8 +8169,13 @@ fn follow_seek_target(
 }
 
 /// Parse a `Tracks` master ending at `end`. Every element in its tree must
-/// fit its parent.
-fn parse_tracks(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TrackEntry>) -> Result<()> {
+/// fit its parent. Each record, string, byte string and list is charged to
+/// `budget` (see [`MAX_TRACKS_BYTES`]) before it is read or stored, with
+/// [`TRACK_OVERHEAD_BYTES`] per entry for what the open builds from it, the
+/// copies the open makes of a CodecID, language or header-stripping
+/// setting, and the largest CodecPrivate again as working room for the
+/// codec configuration parse.
+fn parse_tracks(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TrackEntry>, budget: &mut Budget) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let e_end = child_end(r, e.size, end)?;
@@ -8021,12 +8184,14 @@ fn parse_tracks(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TrackEntry>) -> Re
                 if out.len() >= MAX_TRACKS {
                     return Err(Error::invalid("MKV: more than 256 tracks"));
                 }
+                budget.charge(TRACK_OVERHEAD_BYTES)?;
                 let mut t = TrackEntry::default();
-                parse_track_entry(r, e_end, &mut t)?;
+                parse_track_entry(r, e_end, &mut t, budget)?;
                 let private: usize = out.iter().map(|t| t.codec_private.len()).sum();
                 if private.saturating_add(t.codec_private.len()) > MAX_CODEC_PRIVATE_TOTAL {
                     return Err(Error::invalid("MKV: CodecPrivate data exceeds its budget"));
                 }
+                budget.room(out)?;
                 out.push(t);
             }
             _ => skip(r, e.size)?,
@@ -8035,7 +8200,7 @@ fn parse_tracks(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TrackEntry>) -> Re
     Ok(())
 }
 
-fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()> {
+fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry, budget: &mut Budget) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let e_end = child_end(r, e.size, end)?;
@@ -8043,19 +8208,37 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
             ids::TRACK_NUMBER => t.number = read_uint(r, e.size as usize)?,
             ids::TRACK_UID => t.uid = read_uint(r, e.size as usize)?,
             ids::TRACK_TYPE => t.track_type = read_uint(r, e.size as usize)?,
-            ids::CODEC_ID => t.codec_id_string = read_string(r, e.size as usize)?,
+            ids::CODEC_ID => {
+                t.codec_id_string = into_string(budget.read(r, e.size)?)?;
+                // The codec lookup copies it, and may keep a copy.
+                budget.charge(2 * t.codec_id_string.len())?;
+            }
             ids::CODEC_PRIVATE if e.size > MAX_CODEC_PRIVATE as u64 => {
                 return Err(Error::invalid("MKV: CodecPrivate exceeds its budget"));
             }
-            ids::CODEC_PRIVATE => t.codec_private = read_bytes(r, e.size as usize)?,
-            ids::LANGUAGE => t.language = Some(read_string(r, e.size as usize)?),
+            ids::CODEC_PRIVATE => {
+                t.codec_private = budget.read(r, e.size)?;
+                // Parsing the codec configuration copies parts of it, one
+                // at a time.
+                budget.reserve_scratch(t.codec_private.len())?;
+            }
+            ids::LANGUAGE => {
+                let language = into_string(budget.read(r, e.size)?)?;
+                // The stream's parameters keep a copy.
+                budget.charge(language.len())?;
+                t.language = Some(language);
+            }
             // Track identity strings (RFC 9559 §5.1.4.1.18 / .20 / .23). `Name`
             // and `CodecName` are utf-8; `LanguageBCP47` is an ASCII `string`.
             // Each is `maxOccurs: 1` and carries no spec default — absence stays
             // observable as `None` on the typed [`TrackIdentity`] surface.
-            ids::NAME => t.name = Some(read_string(r, e.size as usize)?),
-            ids::CODEC_NAME => t.codec_name = Some(read_string(r, e.size as usize)?),
-            ids::LANGUAGE_BCP47 => t.language_bcp47 = Some(read_string(r, e.size as usize)?),
+            ids::NAME => t.name = Some(into_string(budget.read(r, e.size)?)?),
+            ids::CODEC_NAME => t.codec_name = Some(into_string(budget.read(r, e.size)?)?),
+            ids::LANGUAGE_BCP47 => {
+                let language = into_string(budget.read(r, e.size)?)?;
+                budget.charge(language.len())?;
+                t.language_bcp47 = Some(language);
+            }
             // Track-selection / behaviour flags (RFC 9559 §5.1.4.1.4 / .5 / .12).
             // All three are 0-or-1 uintegers with spec default `1`; the on-disk
             // presence is preserved as `Some(_)` so the typed surface can
@@ -8072,21 +8255,23 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
             ids::ATTACHMENT_LINK => {
                 let v = read_uint(r, e.size as usize)?;
                 if v != 0 {
+                    budget.room(&mut t.attachment_links)?;
                     t.attachment_links.push(v);
                 }
             }
-            ids::AUDIO => parse_audio(r, e_end, t)?,
-            ids::VIDEO => parse_video(r, e_end, t)?,
+            ids::AUDIO => parse_audio(r, e_end, t, budget)?,
+            ids::VIDEO => parse_video(r, e_end, t, budget)?,
             ids::TRACK_OPERATION => {
                 let mut op = RawTrackOperation::default();
-                parse_track_operation(r, e_end, &mut op)?;
+                parse_track_operation(r, e_end, &mut op, budget)?;
                 t.track_operation = Some(op);
             }
             ids::CONTENT_ENCODINGS => {
-                t.content_encodings = Some(parse_content_encodings(r, e_end)?);
+                t.content_encodings = Some(parse_content_encodings(r, e_end, budget)?);
             }
             ids::BLOCK_ADDITION_MAPPING => {
-                let mapping = parse_block_addition_mapping(r, e_end)?;
+                let mapping = parse_block_addition_mapping(r, e_end, budget)?;
+                budget.room(&mut t.block_addition_mappings)?;
                 t.block_addition_mappings.push(mapping);
             }
             // TrackTranslate (RFC 9559 §5.1.4.1.27) — the chapter-codec
@@ -8097,7 +8282,8 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
             // malformed file sees what the writer emitted, mirroring the
             // tolerant `ChapterTranslate` parse.
             ids::TRACK_TRANSLATE => {
-                let tt = parse_track_translate(r, e_end)?;
+                let tt = parse_track_translate(r, e_end, budget)?;
+                budget.room(&mut t.track_translates)?;
                 t.track_translates.push(tt);
             }
             // Reclaimed Appendix-A `TrackEntry`-level legacy elements (RFC 9559
@@ -8109,17 +8295,17 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
             // load-bearing per A.23), so they accumulate in on-disk order; the
             // rest are singletons where a duplicate keeps the last on-disk value.
             ids::CODEC_SETTINGS => {
-                t.legacy.codec_settings = Some(read_string(r, e.size as usize)?);
+                t.legacy.codec_settings = Some(into_string(budget.read(r, e.size)?)?);
             }
             ids::CODEC_INFO_URL => {
-                t.legacy
-                    .codec_info_urls
-                    .push(read_string(r, e.size as usize)?);
+                let url = into_string(budget.read(r, e.size)?)?;
+                budget.room(&mut t.legacy.codec_info_urls)?;
+                t.legacy.codec_info_urls.push(url);
             }
             ids::CODEC_DOWNLOAD_URL => {
-                t.legacy
-                    .codec_download_urls
-                    .push(read_string(r, e.size as usize)?);
+                let url = into_string(budget.read(r, e.size)?)?;
+                budget.room(&mut t.legacy.codec_download_urls)?;
+                t.legacy.codec_download_urls.push(url);
             }
             ids::CODEC_DECODE_ALL => {
                 t.legacy.decode_all = Some(read_uint(r, e.size as usize)?);
@@ -8134,13 +8320,15 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
                 t.legacy.track_offset = Some(read_int(r, e.size as usize)?);
             }
             ids::TRACK_OVERLAY => {
-                t.legacy.track_overlays.push(read_uint(r, e.size as usize)?);
+                let v = read_uint(r, e.size as usize)?;
+                budget.room(&mut t.legacy.track_overlays)?;
+                t.legacy.track_overlays.push(v);
             }
             ids::TRICK_TRACK_UID => {
                 t.legacy.trick_track_uid = Some(read_uint(r, e.size as usize)?);
             }
             ids::TRICK_TRACK_SEGMENT_UID => {
-                t.legacy.trick_track_segment_uid = Some(read_bytes(r, e.size as usize)?);
+                t.legacy.trick_track_segment_uid = Some(budget.read(r, e.size)?);
             }
             ids::TRICK_TRACK_FLAG => {
                 t.legacy.trick_track_flag = Some(read_uint(r, e.size as usize)?);
@@ -8149,7 +8337,7 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
                 t.legacy.trick_master_track_uid = Some(read_uint(r, e.size as usize)?);
             }
             ids::TRICK_MASTER_TRACK_SEGMENT_UID => {
-                t.legacy.trick_master_track_segment_uid = Some(read_bytes(r, e.size as usize)?);
+                t.legacy.trick_master_track_segment_uid = Some(budget.read(r, e.size)?);
             }
             // RFC 9559 §5.1.4.1.16 — maximum BlockAddID value the track's
             // Blocks may carry. Default 0 = "no BlockAdditions"; absence
@@ -8229,15 +8417,20 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
 /// (§5.1.4.1.31.2: start with the highest order, work down).
 ///
 /// Parse-only: the compression/encryption *settings* are surfaced, but no
-/// frame is ever decompressed or decrypted here.
-fn parse_content_encodings(r: &mut dyn ReadSeek, end: u64) -> Result<ContentEncodings> {
+/// frame is ever decompressed or decrypted here. Each encoding is charged
+/// to `budget` with the steps the open's two decompression chains build
+/// from it.
+fn parse_content_encodings(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<ContentEncodings> {
     let mut encodings: Vec<ContentEncoding> = Vec::new();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::CONTENT_ENCODING => {
-                encodings.push(parse_content_encoding(r, e_end)?);
+                let encoding = parse_content_encoding(r, e_end, budget)?;
+                budget.charge(4 * std::mem::size_of::<content::Decompression>())?;
+                budget.room(&mut encodings)?;
+                encodings.push(encoding);
             }
             _ => skip(r, e.size)?,
         }
@@ -8257,7 +8450,7 @@ fn parse_content_encodings(r: &mut dyn ReadSeek, end: u64) -> Result<ContentEnco
 /// matching child be present and the other absent, but we tolerate either
 /// by keying off the type and defaulting a missing compression to zlib /
 /// missing encryption to "not encrypted" per the element defaults.
-fn parse_content_encoding(r: &mut dyn ReadSeek, end: u64) -> Result<ContentEncoding> {
+fn parse_content_encoding(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<ContentEncoding> {
     let mut order: u64 = 0; // §5.1.4.1.31.2 default
     let mut scope: u64 = ids::CONTENT_ENCODING_SCOPE_BLOCK; // §5.1.4.1.31.3 default 0x1
     let mut enc_type: u64 = ids::CONTENT_ENCODING_TYPE_COMPRESSION; // §5.1.4.1.31.4 default 0
@@ -8271,10 +8464,10 @@ fn parse_content_encoding(r: &mut dyn ReadSeek, end: u64) -> Result<ContentEncod
             ids::CONTENT_ENCODING_SCOPE => scope = read_uint(r, e.size as usize)?,
             ids::CONTENT_ENCODING_TYPE => enc_type = read_uint(r, e.size as usize)?,
             ids::CONTENT_COMPRESSION => {
-                comp = Some(parse_content_compression(r, e_end)?);
+                comp = Some(parse_content_compression(r, e_end, budget)?);
             }
             ids::CONTENT_ENCRYPTION => {
-                encr = Some(parse_content_encryption(r, e_end)?);
+                encr = Some(parse_content_encryption(r, e_end, budget)?);
             }
             _ => skip(r, e.size)?,
         }
@@ -8309,8 +8502,10 @@ fn parse_content_encoding(r: &mut dyn ReadSeek, end: u64) -> Result<ContentEncod
 }
 
 /// Parse a `ContentCompression` master (RFC 9559 §5.1.4.1.31.5) into
-/// `(ContentCompAlgo, ContentCompSettings)`.
-fn parse_content_compression(r: &mut dyn ReadSeek, end: u64) -> Result<(u64, Vec<u8>)> {
+/// `(ContentCompAlgo, ContentCompSettings)`. The settings are charged to
+/// `budget` three times: kept, and copied by each decompression chain the
+/// open builds.
+fn parse_content_compression(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<(u64, Vec<u8>)> {
     let mut algo: u64 = ids::CONTENT_COMP_ALGO_ZLIB; // §5.1.4.1.31.6 default 0
     let mut settings: Vec<u8> = Vec::new();
     while r.stream_position()? < end {
@@ -8318,7 +8513,10 @@ fn parse_content_compression(r: &mut dyn ReadSeek, end: u64) -> Result<(u64, Vec
         child_end(r, e.size, end)?;
         match e.id {
             ids::CONTENT_COMP_ALGO => algo = read_uint(r, e.size as usize)?,
-            ids::CONTENT_COMP_SETTINGS => settings = read_bytes(r, e.size as usize)?,
+            ids::CONTENT_COMP_SETTINGS => {
+                settings = budget.read(r, e.size)?;
+                budget.charge(2 * settings.len())?;
+            }
             _ => skip(r, e.size)?,
         }
     }
@@ -8333,6 +8531,7 @@ fn parse_content_compression(r: &mut dyn ReadSeek, end: u64) -> Result<(u64, Vec
 fn parse_content_encryption(
     r: &mut dyn ReadSeek,
     end: u64,
+    budget: &mut Budget,
 ) -> Result<(u64, Vec<u8>, Option<u64>, ContentSigning)> {
     let mut algo: u64 = ids::CONTENT_ENC_ALGO_NONE; // §5.1.4.1.31.9 default 0
     let mut key_id: Vec<u8> = Vec::new();
@@ -8343,15 +8542,15 @@ fn parse_content_encryption(
         let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::CONTENT_ENC_ALGO => algo = read_uint(r, e.size as usize)?,
-            ids::CONTENT_ENC_KEY_ID => key_id = read_bytes(r, e.size as usize)?,
+            ids::CONTENT_ENC_KEY_ID => key_id = budget.read(r, e.size)?,
             ids::CONTENT_ENC_AES_SETTINGS => {
                 cipher_mode = parse_aes_settings(r, e_end)?;
             }
             // Reclaimed content-signing quartet (Appendix A.33..A.36). The
             // appendix defines no defaults, so each element surfaces verbatim
             // and absence stays `None`.
-            ids::CONTENT_SIGNATURE => signing.signature = Some(read_bytes(r, e.size as usize)?),
-            ids::CONTENT_SIG_KEY_ID => signing.key_id = Some(read_bytes(r, e.size as usize)?),
+            ids::CONTENT_SIGNATURE => signing.signature = Some(budget.read(r, e.size)?),
+            ids::CONTENT_SIG_KEY_ID => signing.key_id = Some(budget.read(r, e.size)?),
             ids::CONTENT_SIG_ALGO => signing.algo = Some(read_uint(r, e.size as usize)?),
             ids::CONTENT_SIG_HASH_ALGO => signing.hash_algo = Some(read_uint(r, e.size as usize)?),
             _ => skip(r, e.size)?,
@@ -8378,16 +8577,16 @@ fn parse_aes_settings(r: &mut dyn ReadSeek, end: u64) -> Result<Option<u64>> {
 /// Parse `TrackOperation` (RFC 9559 §5.1.4.1.30): a virtual track built
 /// from other tracks via `TrackCombinePlanes` (3D plane combining) and/or
 /// `TrackJoinBlocks` (block timeline joining).
-fn parse_track_operation(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation) -> Result<()> {
+fn parse_track_operation(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation, budget: &mut Budget) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::TRACK_COMBINE_PLANES => {
-                parse_combine_planes(r, e_end, op)?;
+                parse_combine_planes(r, e_end, op, budget)?;
             }
             ids::TRACK_JOIN_BLOCKS => {
-                parse_join_blocks(r, e_end, op)?;
+                parse_join_blocks(r, e_end, op, budget)?;
             }
             _ => skip(r, e.size)?,
         }
@@ -8395,9 +8594,16 @@ fn parse_track_operation(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperat
     Ok(())
 }
 
+/// What the open builds for each plane or joined track of a
+/// `TrackOperation`: its resolved reference, and its place in the list of
+/// tracks whose packets are copied, counted twice since such lists double
+/// as they grow.
+const TRACK_OPERATION_ENTRY_BYTES: usize =
+    std::mem::size_of::<TrackPlane>() + 2 * std::mem::size_of::<VirtualPacketOrigin>();
+
 /// Parse `TrackCombinePlanes` (RFC 9559 §5.1.4.1.30.1) — a list of
 /// `TrackPlane` masters, each carrying a `TrackPlaneUID` + `TrackPlaneType`.
-fn parse_combine_planes(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation) -> Result<()> {
+fn parse_combine_planes(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation, budget: &mut Budget) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let e_end = child_end(r, e.size, end)?;
@@ -8420,6 +8626,8 @@ fn parse_combine_planes(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperati
                 // plane without one is malformed and dropped.
                 if let Some(u) = uid {
                     if u != 0 {
+                        budget.charge(TRACK_OPERATION_ENTRY_BYTES)?;
+                        budget.room(&mut op.planes)?;
                         op.planes.push((u, plane_type));
                     }
                 }
@@ -8432,7 +8640,7 @@ fn parse_combine_planes(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperati
 
 /// Parse `TrackJoinBlocks` (RFC 9559 §5.1.4.1.30.5) — a list of
 /// `TrackJoinUID`s naming tracks whose Blocks are joined into this one.
-fn parse_join_blocks(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation) -> Result<()> {
+fn parse_join_blocks(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation, budget: &mut Budget) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         child_end(r, e.size, end)?;
@@ -8441,6 +8649,8 @@ fn parse_join_blocks(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation)
                 let u = read_uint(r, e.size as usize)?;
                 // "not 0" per §5.1.4.1.30.6.
                 if u != 0 {
+                    budget.charge(TRACK_OPERATION_ENTRY_BYTES)?;
+                    budget.room(&mut op.join_uids)?;
                     op.join_uids.push(u);
                 }
             }
@@ -8458,7 +8668,7 @@ fn parse_join_blocks(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation)
 /// defaults (`maxOccurs == 1`, no `default:` clause) so they stay
 /// `Option<…>` and an absent child surfaces as `None`. Unknown children
 /// are skipped — forward-compat with future schema extensions.
-fn parse_block_addition_mapping(r: &mut dyn ReadSeek, end: u64) -> Result<BlockAdditionMapping> {
+fn parse_block_addition_mapping(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<BlockAdditionMapping> {
     let mut value: Option<u64> = None;
     let mut name: Option<String> = None;
     // §5.1.4.1.17.3 default is `0` (codec-defined): "If BlockAddIDType is
@@ -8470,9 +8680,9 @@ fn parse_block_addition_mapping(r: &mut dyn ReadSeek, end: u64) -> Result<BlockA
         child_end(r, e.size, end)?;
         match e.id {
             ids::BLOCK_ADD_ID_VALUE => value = Some(read_uint(r, e.size as usize)?),
-            ids::BLOCK_ADD_ID_NAME => name = Some(read_string(r, e.size as usize)?),
+            ids::BLOCK_ADD_ID_NAME => name = Some(into_string(budget.read(r, e.size)?)?),
             ids::BLOCK_ADD_ID_TYPE => addid_type = read_uint(r, e.size as usize)?,
-            ids::BLOCK_ADD_ID_EXTRA_DATA => extra_data = Some(read_bytes(r, e.size as usize)?),
+            ids::BLOCK_ADD_ID_EXTRA_DATA => extra_data = Some(budget.read(r, e.size)?),
             _ => skip(r, e.size)?,
         }
     }
@@ -8485,9 +8695,10 @@ fn parse_block_addition_mapping(r: &mut dyn ReadSeek, end: u64) -> Result<BlockA
 }
 
 /// What a bounded structure may still retain: one Block while it is read
-/// (see [`MAX_BLOCK_BYTES`]), the Cluster records, the `Info` masters or
-/// the Cues index. Charged before each read or allocation, so whatever is
-/// over its budget fails before it holds the memory.
+/// (see [`MAX_BLOCK_BYTES`]), the Cluster records, or what the open keeps
+/// from a metadata master or the Cues index. Charged before each read or
+/// allocation, so whatever is over its budget fails before it holds the
+/// memory.
 #[derive(Clone, Copy)]
 struct Budget {
     left: usize,
@@ -8495,11 +8706,25 @@ struct Budget {
     exceeded: &'static str,
     /// Whether a charge has failed since [`Self::exhausted`] last looked.
     spent: bool,
+    /// The largest working buffer reserved so far — see
+    /// [`Self::reserve_scratch`].
+    scratch: usize,
 }
 
 impl Budget {
     fn new(max: usize, exceeded: &'static str) -> Self {
-        Self { left: max, exceeded, spent: false }
+        Self { left: max, exceeded, spent: false, scratch: 0 }
+    }
+
+    /// Reserve room for a working buffer of `bytes` that is dropped before
+    /// the next one is made: only what exceeds the largest reservation so
+    /// far is charged.
+    fn reserve_scratch(&mut self, bytes: usize) -> Result<()> {
+        if bytes > self.scratch {
+            self.charge(bytes - self.scratch)?;
+            self.scratch = bytes;
+        }
+        Ok(())
     }
 
     fn charge(&mut self, bytes: usize) -> Result<()> {
@@ -8579,6 +8804,11 @@ impl Budget {
     /// kept did not fit, rather than being malformed.
     fn exhausted(&mut self) -> bool {
         std::mem::take(&mut self.spent)
+    }
+
+    /// What the budget may still charge.
+    fn left(&self) -> usize {
+        self.left
     }
 }
 
@@ -8743,7 +8973,7 @@ fn parse_silent_tracks(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> R
     Ok(out)
 }
 
-fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()> {
+fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry, budget: &mut Budget) -> Result<()> {
     // Materialise the typed staging record on first call. An `Audio` master
     // with no children still surfaces a record so the typed builder
     // ([`build_typed_track_audio`]) can fold the §5.1.4.1.29.1 / .3 defaults
@@ -8778,7 +9008,7 @@ fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
                 t.bit_depth = v;
             }
             ids::CHANNEL_POSITIONS => {
-                channel_positions = Some(read_bytes(r, e.size as usize)?);
+                channel_positions = Some(budget.read(r, e.size)?);
             }
             // Emphasis (Matroska v5 0x52F1, staged
             // post-rfc9559-elements.md): mandatory-but-defaulted `0`.
@@ -8826,7 +9056,7 @@ fn parse_doc_type_extension(r: &mut dyn ReadSeek, end: u64) -> Result<Option<Doc
     }
 }
 
-fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()> {
+fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry, budget: &mut Budget) -> Result<()> {
     // The `Video` master was seen. Materialise the spec defaults for
     // FlagInterlaced (§5.1.4.1.28.1, default 0 = undetermined) and
     // FieldOrder (§5.1.4.1.28.2, default 2 = undetermined); explicit
@@ -8884,7 +9114,7 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
                 // 4-byte binary FourCC (§5.1.4.1.28.15). Preserve verbatim;
                 // the typed `fourcc()` accessor rejects payloads whose length
                 // isn't exactly 4.
-                t.uncompressed_fourcc_raw = Some(read_bytes(r, e.size as usize)?)
+                t.uncompressed_fourcc_raw = Some(budget.read(r, e.size)?)
             }
             ids::PIXEL_CROP_TOP => crop_top = read_uint(r, e.size as usize)?,
             ids::PIXEL_CROP_BOTTOM => crop_bottom = read_uint(r, e.size as usize)?,
@@ -8923,7 +9153,7 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
                     projection_type_raw: ids::PROJECTION_TYPE_RECTANGULAR,
                     ..Default::default()
                 };
-                parse_projection(r, e_end, &mut p)?;
+                parse_projection(r, e_end, &mut p, budget)?;
                 t.projection_raw = Some(p);
             }
             _ => skip(r, e.size)?,
@@ -9037,13 +9267,13 @@ fn parse_mastering_metadata(
 /// pre-populated by `parse_video` with the spec defaults for every child
 /// that has one — this routine overrides only the children the file actually
 /// carries. Unknown elements are skipped (forward-compat).
-fn parse_projection(r: &mut dyn ReadSeek, end: u64, p: &mut RawProjection) -> Result<()> {
+fn parse_projection(r: &mut dyn ReadSeek, end: u64, p: &mut RawProjection, budget: &mut Budget) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         child_end(r, e.size, end)?;
         match e.id {
             ids::PROJECTION_TYPE => p.projection_type_raw = read_uint(r, e.size as usize)?,
-            ids::PROJECTION_PRIVATE => p.private = Some(read_bytes(r, e.size as usize)?),
+            ids::PROJECTION_PRIVATE => p.private = Some(budget.read(r, e.size)?),
             ids::PROJECTION_POSE_YAW => p.pose_yaw = read_float(r, e.size as usize)?,
             ids::PROJECTION_POSE_PITCH => p.pose_pitch = read_float(r, e.size as usize)?,
             ids::PROJECTION_POSE_ROLL => p.pose_roll = read_float(r, e.size as usize)?,
@@ -9567,6 +9797,10 @@ pub struct MkvDemuxer {
     /// element — removed and re-added when a mid-stream `Tags` resets
     /// the tag state per RFC 9559 §23.2.
     tag_metadata_entries: Vec<(String, String)>,
+    /// What the current tag state was charged when it was parsed and
+    /// resolved. A mid-stream `Tags` may use the rest of
+    /// [`MAX_TAGS_BYTES`], since both states are held until the swap.
+    tags_charge: usize,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -12100,8 +12334,10 @@ impl MkvDemuxer {
         if let Some(Some(status)) = crc {
             self.crc_status.push(status);
         }
+        let allowance = (MAX_TAGS_BYTES as usize).saturating_sub(self.tags_charge);
+        let mut budget = Budget::new(allowance, TAGS_OVER_BUDGET);
         let mut pending: Vec<RawTag> = Vec::new();
-        if crc.is_none() || recoverable(parse_tags(&mut *self.input, end, &mut pending))?.is_none() {
+        if crc.is_none() || recoverable(parse_tags(&mut *self.input, end, &mut pending, &mut budget))?.is_none() {
             // Malformed or truncated mid-stream Tags: skip it whole, reset
             // nothing.
             self.input.seek(SeekFrom::Start(end))?;
@@ -12129,6 +12365,7 @@ impl MkvDemuxer {
         self.metadata.extend(new_entries.iter().cloned());
         self.tag_metadata_entries = new_entries;
         self.tags = new_typed;
+        self.tags_charge = allowance - budget.left();
         Ok(())
     }
 

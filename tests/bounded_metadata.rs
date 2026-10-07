@@ -262,6 +262,10 @@ fn only_a_cluster_may_use_the_unknown_size() {
         let inline = file(&[tracks(), master.clone(), cluster(0, b"a")]);
         cases.check(&format!("{name} in line"), inline.clone(), false, Err("InvalidData"));
         cases.check(&format!("{name} in line, resilient"), inline, true, Ok(b"a"));
+        // A header with nothing after it: the Cluster starts right where
+        // its body would.
+        let bare = file(&[tracks(), unknown_size(id), cluster(0, b"a")]);
+        cases.check(&format!("{name} header alone, resilient"), bare, true, Ok(b"a"));
         let (packets, _, _) = measure(file(&[tracks(), cluster(0, b"a"), master, cluster(1000, b"b")]), all);
         if packets != Ok(vec![b"a".to_vec(), b"b".to_vec()]) {
             cases.0.push(format!("{name} between Clusters: {packets:?}"));
@@ -293,6 +297,79 @@ fn info_fields_keep_their_sizes() {
     cases.check("70,000 SegmentFamilies, resilient", families, true, Ok(b"a"));
     // A Void is stepped over unread.
     cases.check("48 MiB Void", with(info(void(BIG))), false, Ok(b"a"));
+    assert!(cases.0.is_empty(), "{:#?}", cases.0);
+}
+
+/// A Chapters master holding one chapter titled `title`.
+fn chapters_titled(title: &[u8]) -> Vec<u8> {
+    elem(ids::CHAPTERS, &elem(ids::EDITION_ENTRY, &chapter_atom(1, title)))
+}
+
+/// A ChapterAtom with UID `uid`, starting at 0, titled `title`.
+fn chapter_atom(uid: u64, title: &[u8]) -> Vec<u8> {
+    elem(ids::CHAPTER_ATOM, &[
+        uint(ids::CHAPTER_UID, uid), uint(ids::CHAPTER_TIME_START, 0),
+        elem(ids::CHAPTER_DISPLAY, &elem(ids::CHAP_STRING, title)),
+    ].concat())
+}
+
+/// An AttachedFile with UID `uid`, named `name`, with `data` as its payload.
+fn attached_file(uid: u64, name: &[u8], data: &[u8]) -> Vec<u8> {
+    elem(ids::ATTACHED_FILE, &[
+        elem(ids::FILE_NAME, name), elem(ids::FILE_MIME_TYPE, b"font/ttf"),
+        uint(ids::FILE_UID, uid), elem(ids::FILE_DATA, data),
+    ].concat())
+}
+
+fn attachments_named(name: &[u8]) -> Vec<u8> {
+    elem(ids::ATTACHMENTS, &attached_file(1, name, b"d"))
+}
+
+#[test]
+fn chapter_and_attachment_text_fields_hold_64_kib() {
+    let _serial = serial();
+    let mut cases = Cases::default();
+    let with = |master: Vec<u8>| file(&[tracks(), master, cluster(0, b"a")]);
+    for (field, master) in [("ChapString", chapters_titled as fn(&[u8]) -> Vec<u8>), ("FileName", attachments_named)] {
+        cases.check(&format!("64 KiB {field}"), with(master(&vec![b'x'; 64 << 10])), false, Ok(b"a"));
+        let over = with(master(&vec![b'x'; (64 << 10) + 1]));
+        cases.check(&format!("64 KiB + 1 {field}"), over.clone(), false, Err("InvalidData"));
+        cases.check(&format!("64 KiB + 1 {field}, resilient"), over, true, Ok(b"a"));
+        cases.check(&format!("48 MiB {field}"), with(master(&vec![b'x'; BIG])), false, Err("InvalidData"));
+    }
+    // A 48 MiB payload stays on disk at open and is read on request.
+    let payload = with(elem(ids::ATTACHMENTS, &attached_file(1, b"font.ttf", &vec![7; BIG])));
+    cases.check("48 MiB FileData", payload.clone(), false, Ok(b"a"));
+    let fetched = demux::open_typed(Box::new(Cursor::new(payload)), &NullCodecResolver)
+        .and_then(|mut d| d.attachment_data(1))
+        .map(|data| data.len());
+    if fetched.as_ref().ok() != Some(&BIG) {
+        cases.0.push(format!("48 MiB FileData on request: {fetched:?}"));
+    }
+    assert!(cases.0.is_empty(), "{:#?}", cases.0);
+}
+
+/// Chapters and Attachments each keep at most 1 MiB of records: twenty
+/// thousand small chapters or attached files are over it, a hundred of
+/// either are not.
+#[test]
+fn chapters_and_attachments_keep_at_most_1_mib() {
+    let _serial = serial();
+    let mut cases = Cases::default();
+    let with = |master: Vec<u8>| file(&[tracks(), master, cluster(0, b"a")]);
+    let chapters = |n: u64| elem(ids::CHAPTERS, &elem(ids::EDITION_ENTRY, &(1..=n).flat_map(|i| chapter_atom(i, b"c")).collect::<Vec<u8>>()));
+    let attachments = |n: u64| elem(ids::ATTACHMENTS, &(1..=n).flat_map(|i| attached_file(i, b"f", b"d")).collect::<Vec<u8>>());
+    for (name, master) in [("chapters", &chapters as &dyn Fn(u64) -> Vec<u8>), ("attached files", &attachments)] {
+        cases.check(&format!("100 {name}"), with(master(100)), false, Ok(b"a"));
+        let over = with(master(20_000));
+        cases.check(&format!("20,000 {name}"), over.clone(), false, Err("InvalidData"));
+        cases.check(&format!("20,000 {name}, resilient"), over, true, Ok(b"a"));
+    }
+    let d = demux::open_typed(Box::new(Cursor::new(with(chapters(100)))), &NullCodecResolver).unwrap();
+    let kept = d.chapters().iter().map(|e| e.chapters.len()).sum::<usize>();
+    if kept != 100 {
+        cases.0.push(format!("100 chapters kept {kept}"));
+    }
     assert!(cases.0.is_empty(), "{:#?}", cases.0);
 }
 
