@@ -25,6 +25,10 @@ oxideav-core = "0.1"
 [dependencies.oxideav-mkv]
 path = ".."
 
+# Dependency-level patches are ignored by this standalone workspace.
+[patch.crates-io]
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "a6ccbf96af9e8aad594becbfd5a9ae08435ecd35" }
+
 # Prevent this from interfering with the umbrella workspace.
 [workspace]
 members = ["."]

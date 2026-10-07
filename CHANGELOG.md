@@ -50,7 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flags. Metadata stays associated with queued and virtual-track packets
   and clears before every read/seek, including errors and EOF. This needs
   the core `a6ccbf96` API and a consumer that snapshots each packet's metadata;
-  audio trimming is not yet implemented.
+  audio trimming is not yet implemented. The standalone fuzz workspace pins
+  the same core API because Cargo does not inherit dependency-level patches.
 - Open follows nested SeekHeads for trailing Info and Tracks, including
   tracks after an unknown-size Cluster. Cycles and excessive index chains
   are bounded. Empty frames without BlockAdditions no longer emit packets.
