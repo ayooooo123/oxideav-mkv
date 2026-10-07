@@ -80,9 +80,12 @@ Block needing more than 1024 packets is InvalidData and queues nothing;
 normal damage recovery seeks the next Cluster. Retained Block payload
 capacity, side data and packet slots share the 32 MiB budget; a BlockGroup's
 children must fit their parents, and its stored children and records are
-charged to that budget before they are read or held. The 512 KiB startup
-byte threshold also counts this state; the bounded current/deferred Block
-and temporary expansion remain additional working memory. Source I/O
+charged to that budget before they are read or held, each buffer at its
+exact size. A Block waiting for room holds its stored bytes and side data
+within the same budget, and duplicate `BlockAddID`s are dropped in linear
+time. The 512 KiB startup byte threshold also counts this state; the
+bounded current/deferred Block and temporary expansion remain additional
+working memory. Source I/O
 failures propagate, including source-generated UnexpectedEof and failures
 met reading trailing Tags, Cluster `CRC-32`s or seek landings; only parser
 damage and physical truncation are recovered.
@@ -765,7 +768,13 @@ SeekPreRoll consumption remain shared AudioTrim integration work.
   valid status. Elements with no `CRC-32` child produce no status
   (omission is spec-legal) and are not read for one: only the first
   child's header is inspected, and a present `CRC-32` is checked over the
-  rest of the body in 16 KiB chunks. A third `SeekHead` is skipped unread.
+  rest of the body in 16 KiB chunks. A third `SeekHead` is skipped unread,
+  as is any `SeekHead`, `Tracks` or `Tags` master declaring more than its
+  budget: a `SeekHead` can hold 4096 entries plus its `CRC-32` (about
+  184 KiB), `Tracks` the 16 MiB CodecPrivate budget plus 64 KiB per track
+  (32 MiB), and `Tags` the same 32 MiB. In line, an oversized `Tracks` or
+  `Tags` is InvalidData like contents over their budgets; a followed or
+  trailing `Tags` is passed over like a damaged one.
 - **`TrackOperation` typed decode** (RFC 9559 §5.1.4.1.30): a *virtual*
   track assembled from other tracks. `MkvDemuxer::track_operation(stream_index)`
   (and the per-stream `track_operations()` slice) returns a typed

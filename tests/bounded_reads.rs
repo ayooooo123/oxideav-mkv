@@ -1,9 +1,11 @@
 //! Input that physically carries oversized data: what the demuxer reads
 //! and holds stays bounded. A Top-Level master is read for its checksum
 //! only when its first child is a `CRC-32`, and then in fixed chunks; a
-//! `SeekHead` beyond the two RFC 9559 allows is not read at all; a
-//! `BlockGroup` child must fit its parent; and records that occupy more
-//! memory than their on-disk bytes share the Block's retention budget.
+//! `SeekHead` beyond the two RFC 9559 allows, or a master larger than its
+//! budget, is refused before any of it is read; a `BlockGroup` child must
+//! fit its parent; records that occupy more memory than their on-disk
+//! bytes share the Block's retention budget, as does a Block waiting for
+//! queue room; and duplicate `BlockAddID`s cost linear time to drop.
 //!
 //! The heap is measured by a counting global allocator. Every test holds
 //! one lock, so nothing else allocates while one measures.
@@ -12,6 +14,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use oxideav_core::{Demuxer, Error, NullCodecResolver, ReadSeek};
 use oxideav_mkv::demux::{self, CrcStatus, MkvDemuxer};
@@ -298,6 +301,146 @@ fn block_group_records_share_the_block_budget() {
         if !played || peak >= 48 << 20 {
             failures.push(format!("{held} held: played {played}, peaked at {peak} heap bytes"));
         }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A Block within its 32 MiB budget as stored, a 17 MiB two-frame Block
+/// and a 9 MiB CodecState, has to wait behind 1023 held packets. While it
+/// waits it holds no more than that budget, then it plays whole.
+#[test]
+fn a_waiting_block_holds_no_more_than_its_budget() {
+    let _serial = serial();
+    let mut stored = [&[0x82, 0, 0, 0x82, 1, 1][..], b"y"].concat();
+    stored.resize(17 << 20, 0x5a);
+    let group = elem(ids::BLOCK_GROUP, &[
+        elem(ids::BLOCK, &stored), elem(ids::CODEC_STATE, &vec![0x33; 9 << 20]),
+    ].concat());
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(group_file(1023, group, 0)));
+    let base = LIVE.load(Ordering::SeqCst);
+    let mut d = demux::open_typed(input, &NullCodecResolver).unwrap();
+    let mut packets = vec![d.next_packet().unwrap().data];
+    // The held packets now return while the Block waits.
+    let holding = LIVE.load(Ordering::SeqCst).saturating_sub(base);
+    loop {
+        match d.next_packet() {
+            Ok(p) => packets.push(p.data),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+    let mut expected = expected(1023);
+    let next = expected.pop().unwrap();
+    expected.extend([b"y".to_vec(), stored[7..].to_vec(), next]);
+    let played = packets == expected;
+    // The budget, plus the held packets and the demuxer's own state.
+    assert!(
+        played && holding < (32 << 20) + (1 << 20),
+        "held {holding} heap bytes while the Block waited; played whole: {played}"
+    );
+}
+
+/// 100,000 distinct BlockAddIDs, then each again with another payload: the
+/// first of each id is kept in stored order, and finding the duplicates
+/// takes linear time, not a scan of every addition kept so far.
+#[test]
+fn duplicate_block_addition_ids_are_dropped_in_linear_time() {
+    let _serial = serial();
+    let count = 100_000u64;
+    let more = |id: u64, data: &[u8]| {
+        elem(ids::BLOCK_MORE, &[uint(ids::BLOCK_ADD_ID, id), elem(ids::BLOCK_ADDITIONAL, data)].concat())
+    };
+    let additions: Vec<u8> = (1..=count).map(|id| more(id, b"a"))
+        .chain((1..=count).map(|id| more(id, b"b")))
+        .flatten()
+        .collect();
+    let group = elem(ids::BLOCK_GROUP, &[
+        elem(ids::BLOCK, &[0x81, 0, 0, 0, b'x']), elem(ids::BLOCK_ADDITIONS, &additions),
+    ].concat());
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(file(&[subtitle_tracks(), cluster(0, &[group])])));
+    let started = Instant::now();
+    let mut d = demux::open_typed(input, &NullCodecResolver).unwrap();
+    assert_eq!(d.next_packet().unwrap().data, b"x");
+    let took = started.elapsed();
+    let kept = d.block_additions();
+    let first_of_each = kept.len() == count as usize
+        && kept.iter().zip(1..).all(|(a, id)| a.block_add_id() == id && a.data() == b"a");
+    assert!(
+        first_of_each && took < Duration::from_secs(10),
+        "kept {} additions, the first of each id: {first_of_each}; took {took:?}",
+        kept.len()
+    );
+}
+
+/// The first packet of `input`, or `None` when the open is invalid data.
+fn opened(input: Box<dyn ReadSeek>, resilient: bool) -> Option<Vec<u8>> {
+    let opened = if resilient {
+        demux::open_resilient_typed(input, &NullCodecResolver)
+    } else {
+        demux::open_typed(input, &NullCodecResolver)
+    };
+    match opened {
+        Ok(mut d) => Some(d.next_packet().unwrap().data),
+        Err(Error::InvalidData(_)) => None,
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+}
+
+/// A master larger than its budget is refused before it is read, even for
+/// its CRC-32: a SeekHead is skipped like a third one, a Tracks or Tags
+/// master is invalid data like contents over their budgets, and a followed
+/// or trailing one is passed over as a damaged one is. A master within its
+/// budget is still checked.
+#[test]
+fn masters_over_their_budget_are_refused_unread() {
+    let _serial = serial();
+    // `contents`, then BIG bytes of Void behind a CRC-32 (its value is not
+    // the point): more than a SeekHead, Tracks or Tags master may hold.
+    let padded = |id: u32, contents: &[u8]| {
+        let crc = elem(ids::CRC32, &[0; 4]);
+        let void = header(ids::VOID, BIG);
+        let mut out = header(id, crc.len() + contents.len() + void.len() + BIG);
+        out.extend(crc);
+        out.extend_from_slice(contents);
+        out.extend(void);
+        out.resize(out.len() + BIG, 0);
+        out
+    };
+    let first = cluster(0, &[simple(1, 0, b"a")]);
+    let entry = track(1, 0x11, "S_TEXT/UTF8", &[]);
+    let a = Some(b"a".to_vec());
+    let mut failures = Vec::new();
+    let mut check = |case: &str, bytes: Vec<u8>, resilient: bool, expected: Option<Vec<u8>>| {
+        let (outcome, read, _) = measure(bytes, |input| opened(input, resilient));
+        if outcome != expected || read >= SMALL {
+            failures.push(format!("{case}: first packet {outcome:?} after reading {read} bytes"));
+        }
+    };
+    check("SeekHead", file(&[padded(ids::SEEK_HEAD, &[]), subtitle_tracks(), first.clone()]), false, a.clone());
+    for resilient in [false, true] {
+        let tags = file(&[subtitle_tracks(), padded(ids::TAGS, &[]), first.clone()]);
+        check(&format!("Tags, resilient {resilient}"), tags, resilient, if resilient { a.clone() } else { None });
+        let tracks = file(&[padded(ids::TRACKS, &entry), first.clone()]);
+        check(&format!("Tracks, resilient {resilient}"), tracks, resilient, None);
+    }
+    let tracks = subtitle_tracks();
+    let at = (index(ids::TAGS, 0).len() + tracks.len() + first.len()) as u64;
+    let followed = file(&[index(ids::TAGS, at), tracks, first.clone(), padded(ids::TAGS, &[])]);
+    check("Tags followed", followed, false, a.clone());
+    let trailing = file(&[subtitle_tracks(), first.clone(), padded(ids::TAGS, &[])]);
+    let (packets, read, _) = measure(trailing, drain);
+    if packets != [b"a".to_vec()] || read >= SMALL {
+        failures.push(format!("Tags trailing: {} packets after reading {read} bytes", packets.len()));
+    }
+    // Within its budget, a 3 MiB CodecPrivate's Tracks is still checked.
+    let entry = track(1, 0x11, "S_TEXT/UTF8", &elem(ids::CODEC_PRIVATE, &vec![1; 3 << 20]));
+    let crc = crc32_ieee(&entry);
+    let crc_child = elem(ids::CRC32, &crc.to_le_bytes());
+    let tracks = [header(ids::TRACKS, crc_child.len() + entry.len()), crc_child, entry].concat();
+    let ((d, packet), _, _) = measure(file(&[tracks, first]), first_packet);
+    let status = d.crc_status().iter().find(|s| s.element_id == ids::TRACKS).copied();
+    if packet != b"a" || status != Some(CrcStatus { element_id: ids::TRACKS, stored: crc, computed: crc }) {
+        failures.push(format!("Tracks within budget: CRC-32 status {status:?}"));
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }

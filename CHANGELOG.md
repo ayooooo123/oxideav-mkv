@@ -78,10 +78,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a forged SignatureSlot must fit its Cluster; Vorbis recognises 64 modes
   and restores mode 0's window on seek. A Top-Level master is read for its
   `CRC-32` only when its first child is one, then in 16 KiB chunks; a
-  third SeekHead is skipped unread. Every BlockGroup child must fit its
+  third SeekHead, or a SeekHead, Tracks or Tags master declaring more
+  than its budget (about 184 KiB for a SeekHead, 32 MiB for Tracks and
+  Tags), is refused before any of it is read: a SeekHead is skipped, an
+  in-line Tracks or Tags master is InvalidData, and a followed or trailing
+  Tags master is passed over. Every BlockGroup child must fit its
   parent, and stored children and their records are charged to the Block's
-  budget before they are read or held, including before a Block waits for
-  room. A Block emits exactly the frames its lace declares, so a one-frame
+  budget before they are read or held, buffers at their exact size; a Block
+  waiting for room holds its stored bytes and side data within that budget.
+  Duplicate `BlockAddID`s are dropped in linear time. A Block emits exactly
+  the frames its lace declares, so a one-frame
   EBML lace is InvalidData; a Block that fails after waiting recovers from
   its own offset. Source errors while reading trailing Tags, a Cluster's
   `CRC-32`, a seek's Block headers or a Cue landing are returned instead of

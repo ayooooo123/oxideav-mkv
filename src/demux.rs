@@ -311,14 +311,21 @@ fn open_typed_impl(
             input.seek(SeekFrom::Start(body_start - e.header_len as u64))?;
             break;
         }
-        // A SeekHead past the two RFC 9559 §5.1.1 allows is skipped below
-        // unread: not even its CRC-32 is checked.
-        let over_quota = e.id == ids::SEEK_HEAD && seek_heads >= MAX_SEEK_HEADS;
+        // A master larger than its budget (see `master_budget`) is refused
+        // before any of it is read, its CRC-32 included: a SeekHead is
+        // skipped below like one past the two RFC 9559 §5.1.1 allows; a
+        // Tracks or Tags master is invalid data, as contents over their
+        // budgets are.
+        let over_budget = e.size != VINT_UNKNOWN_SIZE && master_budget(e.id).is_some_and(|max| e.size > max);
+        let over_quota = e.id == ids::SEEK_HEAD && (seek_heads >= MAX_SEEK_HEADS || over_budget);
         // Parse the Top-Level master. In resilient mode the whole parse is
         // fallible-but-recoverable: whatever the parser lifted before an
         // error is kept, the rest of the element is skipped, and the walk
         // resumes at the next Top-Level element.
         let parse_result: Result<()> = (|| {
+            if over_budget && e.id != ids::SEEK_HEAD {
+                return Err(Error::invalid(format!("MKV: Top-Level element 0x{:X} exceeds its budget", e.id)));
+            }
             // Validate a leading CRC-32 child against the rest of the
             // element when the element size is known (CRC needs a bounded
             // body). The helper rewinds the reader to `body_start` so the
@@ -378,7 +385,7 @@ fn open_typed_impl(
                         &mut attachments,
                     )?;
                 }
-                ids::SEEK_HEAD if seek_heads < MAX_SEEK_HEADS => {
+                ids::SEEK_HEAD if !over_quota => {
                     seek_heads += 1;
                     let end = body_end_known.unwrap_or(segment_data_end);
                     parse_seek_head(&mut *input, end, &mut seek_entries)?;
@@ -1669,6 +1676,32 @@ const MAX_CODEC_PRIVATE: usize = 4 << 20;
 const MAX_CODEC_PRIVATE_TOTAL: usize = 16 << 20;
 /// `TrackEntry` elements per Segment.
 const MAX_TRACKS: usize = 256;
+/// The largest plain encoding of one `Seek` (RFC 9559 §5.1.1.1): its
+/// 2-octet ID and 8-octet size around a `SeekID` and a `SeekPosition`, each
+/// a 2-octet ID, an 8-octet size and at most 8 octets of value.
+const MAX_SEEK_BYTES: u64 = 2 + 8 + 2 * (2 + 8 + 8);
+/// The largest `CRC-32` element: its ID, an 8-octet size and the value.
+const MAX_CRC32_BYTES: u64 = 1 + 8 + 4;
+/// The most a `Tracks` master may hold: every track's CodecPrivate, and
+/// 64 KiB more per track for its other children. Real ones hold kilobytes.
+const MAX_TRACKS_BYTES: u64 = (MAX_CODEC_PRIVATE_TOTAL + MAX_TRACKS * (64 << 10)) as u64;
+/// The most a `Tags` master may hold. Tags have no budget of their own;
+/// real ones hold kilobytes, so they share the `Tracks` ceiling.
+const MAX_TAGS_BYTES: u64 = MAX_TRACKS_BYTES;
+
+/// The largest body a Top-Level master of `id` may declare. Past it the
+/// master holds more than its budgets keep, so it is refused before any of
+/// it is read, its CRC-32 included. `None` where no budget bounds it.
+fn master_budget(id: u32) -> Option<u64> {
+    match id {
+        // Every retained entry at its largest, and the CRC-32.
+        ids::SEEK_HEAD => Some(MAX_SEEK_ENTRIES as u64 * MAX_SEEK_BYTES + MAX_CRC32_BYTES),
+        ids::TRACKS => Some(MAX_TRACKS_BYTES),
+        ids::TAGS => Some(MAX_TAGS_BYTES),
+        _ => None,
+    }
+}
+
 /// Startup DTS analysis holds packets until the H.264 reorder delay is
 /// known: at most this many packets and bytes (payload capacity, shared
 /// side data and queue slots), plus the bounded Block being read. A Block
@@ -7760,6 +7793,11 @@ fn follow_seek_target(
     if end > segment_data_end {
         return Ok(());
     }
+    // Larger than its budget, the target is ignored unread, like a stale
+    // one.
+    if master_budget(e.id).is_some_and(|max| e.size > max) {
+        return Ok(());
+    }
     // Validate a leading CRC-32 like the in-line walk does, but merge the
     // status only when the parse below succeeds.
     let crc = validate_top_level_crc(r, e.id, body_start, end)?;
@@ -8312,7 +8350,7 @@ fn parse_block_addition_mapping(r: &mut dyn ReadSeek, end: u64) -> Result<BlockA
     })
 }
 
-/// What one Block may still retain while its `BlockGroup` is read — see
+/// What one Block may still retain while it is read — see
 /// [`MAX_BLOCK_BYTES`]. Charged before each read or allocation, so a Block
 /// over its budget fails before it holds the memory.
 struct BlockBudget(usize);
@@ -8332,11 +8370,34 @@ impl BlockBudget {
         }
         Ok(())
     }
+
+    /// A stored child of `size` octets, charged before any of it is held.
+    /// Its buffer grows only as bytes arrive, so a size the input cannot
+    /// back costs no more than the input does, and ends exactly `size`
+    /// octets large: the capacity charged.
+    fn read(&mut self, r: &mut dyn ReadSeek, size: u64) -> Result<Vec<u8>> {
+        let size = usize::try_from(size).map_err(|_| block_over_budget())?;
+        self.charge(size)?;
+        let mut stored = Vec::new();
+        while stored.len() < size {
+            let start = stored.len();
+            let more = (size - start).min(start.max(64 << 10));
+            stored.reserve_exact(more);
+            stored.resize(start + more, 0);
+            r.read_exact(&mut stored[start..])?;
+        }
+        Ok(stored)
+    }
 }
 
 fn block_over_budget() -> Error {
     Error::invalid("MKV: Block exceeds its 32 MiB budget")
 }
+
+/// What the duplicate-`BlockAddID` check holds per kept id, charged
+/// generously: a hash set's 8-octet slot and control octet, in a table up
+/// to about twice as large as it is full.
+const KEPT_ID_BYTES: usize = 24;
 
 /// The end of the element whose header `r` has just read, which must lie
 /// within its parent's.
@@ -8370,6 +8431,8 @@ fn child_end(r: &mut dyn ReadSeek, size: u64, parent_end: u64) -> Result<u64> {
 ///   the Block's budget before they are read or stored.
 fn parse_block_additions(r: &mut dyn ReadSeek, end: u64, budget: &mut BlockBudget) -> Result<Vec<BlockAddition>> {
     let mut out: Vec<BlockAddition> = Vec::new();
+    // The ids kept so far: a later BlockMore repeating one is dropped.
+    let mut kept: std::collections::HashSet<u64> = std::collections::HashSet::new();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let e_end = child_end(r, e.size, end)?;
@@ -8384,15 +8447,16 @@ fn parse_block_additions(r: &mut dyn ReadSeek, end: u64, budget: &mut BlockBudge
                     match c.id {
                         ids::BLOCK_ADD_ID => id = read_uint(r, c.size as usize)?,
                         ids::BLOCK_ADDITIONAL => {
-                            budget.charge(c.size as usize)?;
-                            data = Some(read_bytes(r, c.size as usize)?);
+                            data = Some(budget.read(r, c.size)?);
                         }
                         _ => skip(r, c.size)?,
                     }
                 }
                 if let Some(data) = data {
-                    if id != 0 && !out.iter().any(|a| a.id == id) {
+                    if id != 0 && !kept.contains(&id) {
                         budget.room(&mut out)?;
+                        budget.charge(KEPT_ID_BYTES)?;
+                        kept.insert(id);
                         out.push(BlockAddition { id, data });
                     }
                 }
@@ -11747,6 +11811,12 @@ impl MkvDemuxer {
             skip(&mut *self.input, size)?;
             return Ok(());
         }
+        if master_budget(ids::TAGS).is_some_and(|max| size > max) {
+            // Larger than its budget: skipped whole, unread, as a malformed
+            // one is.
+            skip(&mut *self.input, size)?;
+            return Ok(());
+        }
         let body_start = self.input.stream_position()?;
         let end = body_start.saturating_add(size);
         // Validate a leading CRC-32 child like the open-time walk does
@@ -11928,7 +11998,7 @@ impl MkvDemuxer {
                         self.push_cluster_encrypted_block(body_start, bytes);
                     }
                     ids::SIMPLE_BLOCK => {
-                        let bytes = read_bytes(&mut *self.input, e.size as usize)?;
+                        let bytes = BlockBudget(MAX_BLOCK_BYTES).read(&mut *self.input, e.size)?;
                         self.queue_block_packets(bytes, cluster_timecode, pos)?;
                     }
                     ids::BLOCK_GROUP => {
@@ -11969,8 +12039,7 @@ impl MkvDemuxer {
             let e_end = child_end(&mut *self.input, e.size, end)?;
             match e.id {
                 ids::BLOCK => {
-                    budget.charge(e.size as usize)?;
-                    block_bytes = Some(read_bytes(&mut *self.input, e.size as usize)?);
+                    block_bytes = Some(budget.read(&mut *self.input, e.size)?);
                 }
                 ids::BLOCK_DURATION => {
                     duration = Some(read_uint(&mut *self.input, e.size as usize)? as i64);
@@ -11991,8 +12060,7 @@ impl MkvDemuxer {
                 }
                 ids::CODEC_STATE => {
                     // §5.1.3.5.6 — codec-private state bytes.
-                    budget.charge(e.size as usize)?;
-                    meta.codec_state = Some(read_bytes(&mut *self.input, e.size as usize)?);
+                    meta.codec_state = Some(budget.read(&mut *self.input, e.size)?);
                 }
                 ids::DISCARD_PADDING => {
                     // §5.1.3.5.7 — signed nanoseconds of silent padding.
@@ -12009,8 +12077,7 @@ impl MkvDemuxer {
                 }
                 ids::BLOCK_VIRTUAL => {
                     // RFC 9559 Appendix A.3 — reclaimed data-less Block.
-                    budget.charge(e.size as usize)?;
-                    meta.block_virtual = Some(read_bytes(&mut *self.input, e.size as usize)?);
+                    meta.block_virtual = Some(budget.read(&mut *self.input, e.size)?);
                 }
                 ids::REFERENCE_VIRTUAL => {
                     // RFC 9559 Appendix A.4 — reclaimed Segment Position of
@@ -12114,6 +12181,11 @@ impl MkvDemuxer {
         // analysis cap ends the analysis, then waits, whole, until the
         // packets held so far have been returned.
         if self.out_queue.len() + packets > MAX_PROBE_PACKETS {
+            // While it waits, the Block holds its stored bytes beside its
+            // side data, both within the budget.
+            if bytes.capacity().saturating_add(side_data) > MAX_BLOCK_BYTES {
+                return Err(block_over_budget());
+            }
             if !self.timestamps_primed {
                 self.finish_timestamp_probe();
             }
