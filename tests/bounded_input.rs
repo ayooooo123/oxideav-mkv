@@ -6,7 +6,7 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use oxideav_core::{Demuxer, Error, NullCodecResolver, ReadSeek};
+use oxideav_core::{Demuxer, Error, NullCodecResolver, PacketMetadata, ReadSeek};
 use oxideav_mkv::demux::{self, MkvDemuxer};
 use oxideav_mkv::ebml::{write_element_id, write_vint};
 use oxideav_mkv::ids;
@@ -99,11 +99,14 @@ struct Counters {
 }
 
 /// Counts bytes read and position-changing seeks; optionally fails every
-/// read at or after an offset with a transport error.
+/// read at or after an offset with a transport error, and optionally
+/// rejects a seek past the end with `InvalidInput`, as an HTTP range
+/// source does.
 struct Source {
     inner: Cursor<Vec<u8>>,
     counters: Counters,
     fail_from: Option<(u64, io::ErrorKind)>,
+    reject_past_end: bool,
 }
 
 impl Read for Source {
@@ -125,6 +128,17 @@ impl Read for Source {
 impl Seek for Source {
     fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
         let before = self.inner.position();
+        if self.reject_past_end {
+            let end = self.inner.get_ref().len() as u64;
+            let target = match from {
+                SeekFrom::Start(n) => Some(n),
+                SeekFrom::End(d) => end.checked_add_signed(d),
+                SeekFrom::Current(d) => before.checked_add_signed(d),
+            };
+            if target.map_or(true, |t| t > end) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek past end"));
+            }
+        }
         let after = self.inner.seek(from)?;
         if after != before {
             self.counters.jumps.fetch_add(1, Ordering::Relaxed);
@@ -135,7 +149,13 @@ impl Seek for Source {
 
 fn source(bytes: Vec<u8>, fail_from: Option<(u64, io::ErrorKind)>) -> (Box<dyn ReadSeek>, Counters) {
     let counters = Counters::default();
-    (Box::new(Source { inner: Cursor::new(bytes), counters: counters.clone(), fail_from }), counters)
+    let source = Source { inner: Cursor::new(bytes), counters: counters.clone(), fail_from, reject_past_end: false };
+    (Box::new(source), counters)
+}
+
+/// Like [`source`], over a transport that rejects seeks past its end.
+fn http_source(bytes: Vec<u8>, fail_from: Option<(u64, io::ErrorKind)>) -> Box<dyn ReadSeek> {
+    Box::new(Source { inner: Cursor::new(bytes), counters: Counters::default(), fail_from, reject_past_end: true })
 }
 
 #[test]
@@ -249,9 +269,9 @@ fn unsatisfied_avc_probe_returns_first_packet_after_bounded_queue() {
     assert!(read < len / 2, "first packet after reading {read} of {len} bytes");
 }
 
-fn expect_transport_error(result: oxideav_core::Result<oxideav_core::Packet>) {
+fn expect_transport_error(result: oxideav_core::Result<oxideav_core::Packet>, kind: io::ErrorKind) {
     match result {
-        Err(Error::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
+        Err(Error::Io(e)) => assert_eq!(e.kind(), kind),
         Err(e) => panic!("transport failure became {e}"),
         Ok(p) => panic!("transport failure produced a packet at {:?}", p.pts),
     }
@@ -264,7 +284,77 @@ fn transport_errors_are_returned_instead_of_ending_the_stream() {
     let (input, _) = source(bytes, Some((at, io::ErrorKind::TimedOut)));
     let mut d = demux::open_typed(input, &NullCodecResolver).unwrap();
     assert_eq!(d.next_packet().unwrap().data, b"a");
-    expect_transport_error(d.next_packet());
+    assert!(d.packet_metadata().container_keyframe);
+    expect_transport_error(d.next_packet(), io::ErrorKind::TimedOut);
+    // The failed read exposes nothing from the previous packet.
+    assert_eq!(d.packet_metadata(), PacketMetadata::default());
+}
+
+/// A read error is the source's, whatever its kind: `InvalidInput` from an
+/// ordinary read, or `UnexpectedEof` from an HTTP body that stayed short
+/// after the transport's retries. Neither is a malformed file to resync
+/// past or end as if complete.
+#[test]
+fn source_read_errors_are_returned_whatever_their_kind() {
+    for kind in [io::ErrorKind::InvalidInput, io::ErrorKind::UnexpectedEof] {
+        let bytes = file(&[
+            subtitle_tracks(), cluster(0, &[simple(1, b"a")]),
+            cluster(1000, &[simple(1, b"b")]), cluster(2000, &[simple(1, b"c")]),
+        ]);
+        let at = nth_cluster(&bytes, 1) as u64 + 2;
+        let (input, _) = source(bytes, Some((at, kind)));
+        let mut d = demux::open_typed(input, &NullCodecResolver).unwrap();
+        assert_eq!(d.next_packet().unwrap().data, b"a");
+        expect_transport_error(d.next_packet(), kind);
+    }
+}
+
+fn seek_entry(id: u32, pos: u64) -> Vec<u8> {
+    elem(ids::SEEK, &[elem(ids::SEEK_ID, &write_element_id(id)), uint(ids::SEEK_POSITION, pos)].concat())
+}
+
+/// SeekHead → Cues stored after three Clusters, as FFmpeg muxes.
+fn indexed_file() -> Vec<u8> {
+    let tracks = subtitle_tracks();
+    let clusters = [
+        cluster(0, &[simple(1, b"a")]), cluster(1000, &[simple(1, b"b")]), cluster(2000, &[simple(1, b"c")]),
+    ];
+    let seek_head_len = elem(ids::SEEK_HEAD, &seek_entry(ids::CUES, 0)).len();
+    let first_cluster = (seek_head_len + tracks.len()) as u64;
+    let cues_at = first_cluster + clusters.iter().map(Vec::len).sum::<usize>() as u64;
+    let cues = elem(ids::CUES, &elem(ids::CUE_POINT, &[
+        uint(ids::CUE_TIME, 0),
+        elem(ids::CUE_TRACK_POSITIONS, &[uint(ids::CUE_TRACK, 1), uint(ids::CUE_CLUSTER_POSITION, first_cluster)].concat()),
+    ].concat()));
+    let seek_head = elem(ids::SEEK_HEAD, &seek_entry(ids::CUES, cues_at));
+    file(&[seek_head, tracks, clusters.concat(), cues])
+}
+
+#[test]
+fn open_returns_source_errors_while_following_the_seek_head() {
+    let bytes = indexed_file();
+    let cues_at = bytes.len() as u64 - 3;
+    let (input, _) = source(bytes, Some((cues_at, io::ErrorKind::InvalidInput)));
+    match demux::open_typed(input, &NullCodecResolver) {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+        Err(e) => panic!("source failure became {e}"),
+        Ok(_) => panic!("source failure was ignored as a stale SeekHead entry"),
+    }
+}
+
+/// A download cut inside its last Cluster keeps a SeekHead pointing past
+/// the physical end, which an HTTP source refuses to seek to. That is
+/// truncation: the open succeeds, the packets that exist play, then EOF.
+#[test]
+fn truncated_http_input_treats_seeks_past_its_end_as_truncation() {
+    let mut bytes = indexed_file();
+    bytes.truncate(nth_cluster(&bytes, 2) + 8);
+    let mut d = demux::open_typed(http_source(bytes, None), &NullCodecResolver).unwrap();
+    let expected = [(Some(0), b"a".to_vec()), (Some(1000), b"b".to_vec())];
+    assert_eq!(drain(&mut d), expected);
+    assert!(matches!(d.next_packet(), Err(Error::Eof)));
+    d.seek_to(0, 0).unwrap();
+    assert_eq!(drain(&mut d), expected);
 }
 
 #[test]
@@ -279,7 +369,7 @@ fn transport_errors_during_resync_are_returned() {
     let (input, _) = source(bytes, Some((at, io::ErrorKind::TimedOut)));
     let mut d = demux::open_typed(input, &NullCodecResolver).unwrap();
     assert_eq!(d.next_packet().unwrap().data, b"a");
-    expect_transport_error(d.next_packet());
+    expect_transport_error(d.next_packet(), io::ErrorKind::TimedOut);
 }
 
 #[test]

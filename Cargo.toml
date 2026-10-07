@@ -22,3 +22,9 @@ compcol = { version = "0.6", default-features = false, features = ["zlib", "bzip
 
 [dev-dependencies]
 oxideav-basic = "0.0"
+
+# `Demuxer::packet_metadata` (per-packet container random-access flag and
+# WebVTT cue side data) is in the PearTube oxideav-core fork, not yet on
+# crates.io.
+[patch.crates-io]
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "a6ccbf96af9e8aad594becbfd5a9ae08435ecd35" }

@@ -1,5 +1,5 @@
 use std::io::Cursor;
-use oxideav_core::{Demuxer, Error, MediaType, NullCodecResolver};
+use oxideav_core::{Demuxer, Error, MediaType, NullCodecResolver, PacketMetadata};
 use oxideav_mkv::{demux, ebml::{write_element_id, write_vint}, ids};
 
 fn elem(id: u32, bytes: &[u8]) -> Vec<u8> {
@@ -33,10 +33,13 @@ fn d_webvtt_variants_split_side_data_and_resolve_subtitles() {
         assert_eq!(p.data, b"hello");
         assert_eq!((p.pts, p.dts, p.duration), (Some(10), Some(10), Some(100)));
         assert!(p.flags.keyframe);
-        let side = d.webvtt_metadata().unwrap();
+        let metadata = d.packet_metadata();
+        let side = metadata.webvtt.as_deref().unwrap();
         assert_eq!(side.identifier, b"cue");
         assert_eq!(side.settings, b"align:start");
         assert!(matches!(d.next_packet(), Err(Error::Eof)));
+        // End of stream exposes nothing from the last cue.
+        assert_eq!(d.packet_metadata(), PacketMetadata::default());
     }
 }
 
@@ -45,7 +48,7 @@ fn s_text_webvtt_stays_raw() {
     let raw = b"line one\nline two\r\n";
     let mut d = demux::open_typed(Box::new(Cursor::new(file("S_TEXT/WEBVTT", 0x11, raw))), &NullCodecResolver).unwrap();
     assert_eq!(d.next_packet().unwrap().data, raw);
-    assert!(d.webvtt_metadata().is_none());
+    assert!(d.packet_metadata().webvtt.is_none());
 }
 
 #[test]
@@ -74,20 +77,25 @@ fn laced_cues_keep_metadata_association_across_seek() {
         let packet = d.next_packet().unwrap();
         assert_eq!(packet.data, b"one");
         assert_eq!(packet.pts, Some(10));
-        let metadata = d.webvtt_metadata().unwrap();
-        assert_eq!(metadata.identifier, b"first");
-        assert_eq!(metadata.settings, b"align:start");
-        assert_eq!(d.next_packet().unwrap().data, b"two");
-        let metadata = d.webvtt_metadata().unwrap();
-        assert_eq!(metadata.identifier, b"second");
-        assert_eq!(metadata.settings, b"align:end");
+        let metadata = d.packet_metadata();
+        let cue = metadata.webvtt.as_deref().unwrap();
+        assert_eq!(cue.identifier, b"first");
+        assert_eq!(cue.settings, b"align:start");
+        // Both laces share a timestamp; the snapshot, not the PTS, carries
+        // each cue's own settings.
+        let packet = d.next_packet().unwrap();
+        assert_eq!(packet.data, b"two");
+        let metadata = d.packet_metadata();
+        let cue = metadata.webvtt.as_deref().unwrap();
+        assert_eq!(cue.identifier, b"second");
+        assert_eq!(cue.settings, b"align:end");
         // The first keyframe lands on its Cluster; the next packet still
         // carries the cue's own timestamp (10), not the Cluster's zero.
         assert_eq!(d.seek_to(0, 10).unwrap(), 0);
-        assert!(d.webvtt_metadata().is_none());
+        assert_eq!(d.packet_metadata(), PacketMetadata::default());
     }
     d.next_packet().unwrap();
     d.next_packet().unwrap();
     assert_eq!(d.next_packet().unwrap().data, b"plain");
-    assert!(d.webvtt_metadata().is_none());
+    assert!(d.packet_metadata().webvtt.is_none());
 }

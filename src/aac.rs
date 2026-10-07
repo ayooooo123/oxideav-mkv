@@ -203,6 +203,23 @@ pub(crate) fn asc_rates(asc: &[u8]) -> Option<AscRates> {
     Some(out)
 }
 
+/// The frame FFmpeg's AAC decoder reports for an `AudioSpecificConfig`,
+/// as `(samples, rate)`: 1024 samples at the core rate for AAC Main, LC
+/// and LTP, also under SBR or PS, whose doubled output frame and rate last
+/// as long. `None` for other object types and 960-sample frames
+/// (`frameLengthFlag`, GASpecificConfig §4.4.1), which are not timed.
+pub(crate) fn decoder_frame(asc: &[u8]) -> Option<(u32, u32)> {
+    let mut b = Bits { data: asc, pos: 0 };
+    let mut aot = b.aot()?;
+    let core = b.rate()?;
+    b.read(4)?; // channelConfiguration
+    if aot == 5 || aot == 29 {
+        b.rate()?; // extensionSamplingFrequency
+        aot = b.aot()?;
+    }
+    (matches!(aot, 1 | 2 | 4) && b.read(1)? == 0 && core > 0).then_some((1024, core))
+}
+
 /// The Matroska `A_AAC` legacy CodecID → `audioObjectType` (and SBR)
 /// mapping (Matroska codec mappings: `A_AAC/MPEG2/MAIN`, `.../LC`,
 /// `.../LC/SBR`, `.../SSR`, `A_AAC/MPEG4/MAIN`, `.../LC`, `.../LC/SBR`,

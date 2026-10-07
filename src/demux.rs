@@ -14,13 +14,11 @@ mod timing;
 mod video_config;
 mod webvtt;
 
-pub use webvtt::WebVttMetadata;
-
 use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_core::{
-    CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, ProbeContext, Result,
-    SampleFormat, StreamInfo, TimeBase,
+    CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, PacketMetadata,
+    ProbeContext, Result, SampleFormat, StreamInfo, TimeBase, WebVttMetadata,
 };
 use oxideav_core::{Demuxer, ReadSeek};
 
@@ -87,10 +85,12 @@ pub fn open_resilient_typed(
 }
 
 fn open_typed_impl(
-    mut input: Box<dyn ReadSeek>,
+    mut source: Box<dyn ReadSeek>,
     codecs: &dyn CodecResolver,
     resilient: bool,
 ) -> Result<MkvDemuxer> {
+    let pos = source.stream_position()?;
+    let mut input = Box::new(ClusterReader::new(source, pos));
     // Validate EBML header.
     let hdr = read_element_header(&mut *input)?;
     if hdr.id != ids::EBML_HEADER {
@@ -264,7 +264,7 @@ fn open_typed_impl(
         let e = match read_element_header(&mut *input) {
             Ok(e) => e,
             Err(err) => {
-                if !resilient {
+                if !resilient || !is_damage(&err) {
                     return Err(err);
                 }
                 // Garbage where a Top-Level element header should be —
@@ -392,7 +392,7 @@ fn open_typed_impl(
                     if let Some(end) = body_end_known {
                         input.seek(SeekFrom::Start(end))?;
                     } else {
-                        return Err(Error::unsupported(
+                        return Err(Error::invalid(
                             "MKV: unknown-size element other than Cluster",
                         ));
                     }
@@ -401,7 +401,7 @@ fn open_typed_impl(
                     if let Some(end) = body_end_known {
                         input.seek(SeekFrom::Start(end))?;
                     } else {
-                        return Err(Error::unsupported(
+                        return Err(Error::invalid(
                             "MKV: unknown-size element other than Cluster",
                         ));
                     }
@@ -410,7 +410,7 @@ fn open_typed_impl(
             Ok(())
         })();
         if let Err(err) = parse_result {
-            if !resilient {
+            if !resilient || !is_damage(&err) {
                 return Err(err);
             }
             // The master is damaged. Keep whatever was lifted before the
@@ -1149,7 +1149,7 @@ fn open_typed_impl(
     // is legal: open succeeds, `next_packet` reports a clean `Error::Eof`
     // (the reader is parked at the Segment end), and `seek_to` fails
     // with `Error::Unsupported` since there is nothing to land on.
-    let input_pos = input.seek(SeekFrom::Start(
+    input.seek(SeekFrom::Start(
         first_cluster_offset.unwrap_or(segment_data_end),
     ))?;
 
@@ -1168,7 +1168,7 @@ fn open_typed_impl(
     }
 
     Ok(MkvDemuxer {
-        input: Box::new(ClusterReader::new(input, input_pos)),
+        input,
         ebml_header,
         streams,
         track_index_by_number,
@@ -1201,8 +1201,9 @@ fn open_typed_impl(
         decode_orders,
         timestamps_primed: false,
         timestamp_probe_bytes: 0,
+        deferred_block: None,
         webvtt_tracks: tracks.iter().map(|t| t.codec_id_string.starts_with("D_WEBVTT/")).collect(),
-        last_webvtt_metadata: None,
+        last_metadata: PacketMetadata::default(),
         video_interlacings,
         video_geometries,
         video_colours,
@@ -1665,24 +1666,47 @@ const MAX_CODEC_PRIVATE_TOTAL: usize = 16 << 20;
 /// `TrackEntry` elements per Segment.
 const MAX_TRACKS: usize = 256;
 /// Startup DTS analysis holds packets until the H.264 reorder delay is
-/// known: at most this many packets and bytes (payload, side data and
-/// per-packet overhead), plus the Block being read.
+/// known: at most this many packets and bytes (payload capacity, shared
+/// side data and queue slots), plus the bounded Block being read. A Block
+/// that cannot fit by itself is rejected; a compliant one waits for room.
 const MAX_PROBE_PACKETS: usize = 1024;
 const MAX_PROBE_BYTES: usize = 512 << 10;
+/// Strong and weak reference counts in a shared side-data allocation.
+const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
 
-/// Whether `e` reports malformed or physically truncated input, which the
-/// Cluster walk recovers from. Transport, permission and other I/O failures
-/// reach the caller instead of ending the stream as if the file were
-/// complete. A seek outside the input (`InvalidInput`) is a truncated
-/// file's size field, not a transport failure.
+/// Only parser damage or a short read at the physical end is recoverable.
+/// Errors returned by the source itself retain their kind but are tagged
+/// by `ClusterReader`, including a transport's own `UnexpectedEof`.
 fn is_damage(e: &Error) -> bool {
     match e {
-        Error::InvalidData(_) | Error::Unsupported(_) => true,
-        Error::Io(io) => matches!(
-            io.kind(),
-            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidInput
-        ),
+        Error::InvalidData(_) => true,
+        Error::Io(io) => io.kind() == std::io::ErrorKind::UnexpectedEof
+            && !io.get_ref().is_some_and(|e| e.is::<SourceError>()),
         _ => false,
+    }
+}
+
+#[derive(Debug)]
+struct SourceError(std::io::Error);
+
+impl std::fmt::Display for SourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for SourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn source_error(error: std::io::Error) -> std::io::Error {
+    // Preserve read_exact's retry semantics without allocating.
+    if error.kind() == std::io::ErrorKind::Interrupted {
+        error
+    } else {
+        std::io::Error::new(error.kind(), SourceError(error))
     }
 }
 
@@ -3907,10 +3931,10 @@ pub struct BlockGroupMeta {
 impl BlockGroupMeta {
     /// Heap bytes this side data retains.
     fn retained_bytes(&self) -> usize {
-        self.reference_blocks.len() * std::mem::size_of::<i64>()
-            + self.codec_state.as_ref().map_or(0, Vec::len)
-            + self.block_virtual.as_ref().map_or(0, Vec::len)
-            + self.slices.len() * std::mem::size_of::<TimeSlice>()
+        self.reference_blocks.capacity() * std::mem::size_of::<i64>()
+            + self.codec_state.as_ref().map_or(0, Vec::capacity)
+            + self.block_virtual.as_ref().map_or(0, Vec::capacity)
+            + self.slices.capacity() * std::mem::size_of::<TimeSlice>()
     }
 }
 
@@ -8731,6 +8755,9 @@ enum ClusterState {
 struct ClusterReader {
     inner: Box<dyn ReadSeek>,
     pos: u64,
+    /// File-like virtual position after an HTTP source rejects a seek
+    /// beyond its confirmed physical end. Reads return zero until a seek.
+    past_end: bool,
     /// The `CRC-32` of the Cluster being walked, while it is computed.
     crc: Option<RunningCrc>,
 }
@@ -8756,6 +8783,7 @@ impl ClusterReader {
         Self {
             inner,
             pos,
+            past_end: false,
             crc: None,
         }
     }
@@ -8763,7 +8791,10 @@ impl ClusterReader {
 
 impl Read for ClusterReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
+        if self.past_end {
+            return Ok(0);
+        }
+        let n = self.inner.read(buf).map_err(source_error)?;
         if let Some(c) = &mut self.crc {
             let stop = self.pos.saturating_add(n as u64).min(c.end);
             if self.pos <= c.next && c.next < stop {
@@ -8780,6 +8811,13 @@ impl Read for ClusterReader {
 
 impl Seek for ClusterReader {
     fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let to = match to {
+            SeekFrom::Current(delta) => SeekFrom::Start(self.pos.checked_add_signed(delta)
+                .ok_or_else(|| source_error(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput, "seek outside position range",
+                )))?),
+            other => other,
+        };
         // A forward skip over Cluster bytes the CRC still needs (a Void,
         // an unknown child, the Blocks before a Cue target) is read rather
         // than seeked, so the CRC sees every byte. A read that ends early
@@ -8801,8 +8839,33 @@ impl Seek for ClusterReader {
                 }
             }
         }
-        self.pos = self.inner.seek(to)?;
-        Ok(self.pos)
+        match self.inner.seek(to) {
+            Ok(pos) => {
+                self.pos = pos;
+                self.past_end = false;
+                Ok(pos)
+            }
+            Err(error) => {
+                if let SeekFrom::Start(target) = to {
+                    if error.kind() == std::io::ErrorKind::InvalidInput {
+                        // Query the physical end only on a failed seek.
+                        // A routine source failure within that end is not
+                        // truncation. File permits a position beyond EOF;
+                        // give bounded HTTP sources the same semantics.
+                        if let Ok(end) = self.inner.seek(SeekFrom::End(0)) {
+                            if target > end {
+                                self.pos = target;
+                                self.past_end = true;
+                                return Ok(target);
+                            }
+                            self.inner.seek(SeekFrom::Start(self.pos.min(end)))
+                                .map_err(source_error)?;
+                        }
+                    }
+                }
+                Err(source_error(error))
+            }
+        }
     }
 
     fn stream_position(&mut self) -> std::io::Result<u64> {
@@ -8845,15 +8908,31 @@ struct ScanKeyframe {
 /// * `meta` — the non-`Block` `BlockGroup` children (`ReferenceBlock` /
 ///   `ReferencePriority` / `CodecState` / `DiscardPadding` plus the
 ///   reclaimed Appendix-A children). Same sharing rule.
+/// * `webvtt` and `container_keyframe` — the packet's own
+///   [`PacketMetadata`]: a D_WEBVTT cue's identifier and settings, and the
+///   Block's random-access indication (SimpleBlock keyframe bit, or a
+///   BlockGroup without ReferenceBlock) on its first lace.
 struct QueuedPacket {
     packet: Packet,
     additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
     meta: Option<std::sync::Arc<BlockGroupMeta>>,
     webvtt: Option<std::sync::Arc<WebVttMetadata>>,
+    container_keyframe: bool,
     /// `Some` when the packet was synthesised by TrackOperation
     /// application (RFC 9559 §18.8) rather than read from its own track's
     /// Block — see [`MkvDemuxer::virtual_packet_origin`].
     origin: Option<VirtualPacketOrigin>,
+}
+
+/// A Block read when the queue had no room for its packets within
+/// [`MAX_PROBE_PACKETS`]; queued whole once the queue has been returned.
+struct DeferredBlock {
+    bytes: Vec<u8>,
+    cluster_timecode: i64,
+    group_keyframe: Option<bool>,
+    explicit_duration: Option<i64>,
+    additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
+    meta: Option<std::sync::Arc<BlockGroupMeta>>,
 }
 
 /// Matroska / WebM demuxer.
@@ -8982,8 +9061,12 @@ pub struct MkvDemuxer {
     decode_orders: Vec<Option<timing::DecodeOrder>>,
     timestamps_primed: bool,
     timestamp_probe_bytes: usize,
+    /// The Block waiting for queue room — see [`DeferredBlock`].
+    deferred_block: Option<DeferredBlock>,
     webvtt_tracks: Vec<bool>,
-    last_webvtt_metadata: Option<std::sync::Arc<WebVttMetadata>>,
+    /// [`Demuxer::packet_metadata`] of the packet `next_packet` last
+    /// returned; cleared before every read and seek.
+    last_metadata: PacketMetadata,
     /// Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 +
     /// §5.1.4.1.28.2), indexed by stream index. `None` for non-video tracks
     /// and for video tracks whose `TrackEntry` carried no `Video` master —
@@ -9156,6 +9239,7 @@ impl Demuxer for MkvDemuxer {
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
+        self.last_metadata = PacketMetadata::default();
         loop {
             if !self.timestamps_primed
                 && (self.timestamp_probe_bytes >= MAX_PROBE_BYTES
@@ -9172,12 +9256,21 @@ impl Demuxer for MkvDemuxer {
                     self.last_block_additions = q.additions;
                     self.last_block_group_meta = q.meta;
                     self.last_virtual_origin = q.origin;
-                    self.last_webvtt_metadata = q.webvtt;
+                    self.last_metadata.webvtt = q.webvtt;
+                    self.last_metadata.container_keyframe = q.container_keyframe;
                     return Ok(q.packet);
                 }
             }
             let before = self.input.stream_position()?;
-            let step = match self.advance() {
+            let step = if let Some(block) = self.deferred_block.take() {
+                self.queue_block_packets_with(
+                    block.bytes, block.cluster_timecode, block.group_keyframe,
+                    block.explicit_duration, block.additions, block.meta,
+                )
+            } else {
+                self.advance()
+            };
+            let step = match step {
                 Ok(()) => Ok(()),
                 Err(Error::Eof) => Err(Error::Eof),
                 // Damaged Cluster stream — seek the next Top-Level element
@@ -9197,6 +9290,10 @@ impl Demuxer for MkvDemuxer {
         }
     }
 
+    fn packet_metadata(&self) -> PacketMetadata {
+        self.last_metadata.clone()
+    }
+
     fn metadata(&self) -> &[(String, String)] {
         &self.metadata
     }
@@ -9210,6 +9307,7 @@ impl Demuxer for MkvDemuxer {
     }
 
     fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        self.clear_packet_metadata();
         if stream_index as usize >= self.streams.len() {
             return Err(Error::invalid(format!(
                 "MKV: stream index {stream_index} out of range"
@@ -9319,14 +9417,7 @@ impl Demuxer for MkvDemuxer {
         // The "most recently returned packet" the block-additions
         // surface refers to is invalidated by the jump too.
         self.cluster_state = ClusterState::Idle;
-        self.out_queue.clear();
-        self.last_block_additions = None;
-        self.last_block_group_meta = None;
-        self.last_virtual_origin = None;
-        self.last_webvtt_metadata = None;
-        self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
-        self.decode_orders.iter_mut().flatten().for_each(timing::DecodeOrder::reset);
-        self.resync_floor = 0;
+        self.reset_packet_queue();
 
         // RFC 9559 §5.1.5.1.2.3: when the Cues entry carries a
         // `CueRelativePosition`, the referenced SimpleBlock / BlockGroup
@@ -9374,12 +9465,21 @@ impl MkvDemuxer {
         self.timestamp_probe_bytes = 0;
     }
 
-    /// Identifier and settings split off the last D_WEBVTT packet.
-    /// S_TEXT/WEBVTT packets remain raw and have no such side data.
-    /// Like `block_additions`, this typed side channel lasts until the next
-    /// returned packet or seek; oxideav-core's Packet has no side-data field.
-    pub fn webvtt_metadata(&self) -> Option<&WebVttMetadata> {
-        self.last_webvtt_metadata.as_deref()
+    fn clear_packet_metadata(&mut self) {
+        self.last_metadata = PacketMetadata::default();
+        self.last_block_additions = None;
+        self.last_block_group_meta = None;
+        self.last_virtual_origin = None;
+    }
+
+    fn reset_packet_queue(&mut self) {
+        self.out_queue.clear();
+        self.deferred_block = None;
+        self.clear_packet_metadata();
+        self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
+        self.decode_orders.iter_mut().flatten().for_each(timing::DecodeOrder::reset);
+        self.timestamp_probe_bytes = 0;
+        self.resync_floor = 0;
     }
 
     /// Typed `Tags\Tag` collection (RFC 9559 §5.1.8.1) parsed from the
@@ -11364,14 +11464,7 @@ impl MkvDemuxer {
             .ok_or_else(|| Error::unsupported("MKV: no parseable Cluster Timestamp to seek by"))?;
         self.input.seek(SeekFrom::Start(cluster_off))?;
         self.cluster_state = ClusterState::Idle;
-        self.out_queue.clear();
-        self.last_block_additions = None;
-        self.last_block_group_meta = None;
-        self.last_virtual_origin = None;
-        self.last_webvtt_metadata = None;
-        self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
-        self.decode_orders.iter_mut().flatten().for_each(timing::DecodeOrder::reset);
-        self.resync_floor = 0;
+        self.reset_packet_queue();
         Ok(self.ticks_to_stream_pts(stream_index, landed_ticks))
     }
 
@@ -11555,14 +11648,7 @@ impl MkvDemuxer {
     /// the keyframe's Block inside the Cluster the way
     /// `apply_cue_relative_position` lands on a Cue's Block.
     fn land_on_keyframe(&mut self, stream_index: u32, kf: ScanKeyframe) -> Result<i64> {
-        self.out_queue.clear();
-        self.last_block_additions = None;
-        self.last_block_group_meta = None;
-        self.last_virtual_origin = None;
-        self.last_webvtt_metadata = None;
-        self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
-        self.decode_orders.iter_mut().flatten().for_each(timing::DecodeOrder::reset);
-        self.resync_floor = 0;
+        self.reset_packet_queue();
         if kf.at_cluster_start {
             self.input.seek(SeekFrom::Start(kf.cluster))?;
             self.cluster_state = ClusterState::Idle;
@@ -11784,7 +11870,7 @@ impl MkvDemuxer {
                     }
                     ids::SIMPLE_BLOCK => {
                         let bytes = read_bytes(&mut *self.input, e.size as usize)?;
-                        self.queue_block_packets(&bytes, cluster_timecode, false)?;
+                        self.queue_block_packets(bytes, cluster_timecode, false)?;
                     }
                     ids::BLOCK_GROUP => {
                         let bg_end = self.input.stream_position()?.saturating_add(e.size);
@@ -11885,24 +11971,12 @@ impl MkvDemuxer {
             } else {
                 Some(std::sync::Arc::new(meta))
             };
-            self.queue_block_packets_with(
-                &b,
-                cluster_timecode,
-                Some(is_keyframe),
-                duration,
-                additions,
-                meta,
-            )?;
+            self.queue_block_packets_with(b, cluster_timecode, Some(is_keyframe), duration, additions, meta)?;
         }
         Ok(())
     }
 
-    fn queue_block_packets(
-        &mut self,
-        bytes: &[u8],
-        cluster_timecode: i64,
-        _hint: bool,
-    ) -> Result<()> {
+    fn queue_block_packets(&mut self, bytes: Vec<u8>, cluster_timecode: i64, _hint: bool) -> Result<()> {
         // A SimpleBlock's keyframe bit is bit 7 of its flags byte. A
         // SimpleBlock can never carry BlockAdditions (the element lives
         // only on BlockGroup, RFC 9559 §5.1.3.5.2) nor the BlockGroup meta
@@ -11916,14 +11990,14 @@ impl MkvDemuxer {
     /// `None` for a SimpleBlock, whose flags byte carries it.
     fn queue_block_packets_with(
         &mut self,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         cluster_timecode: i64,
         group_keyframe: Option<bool>,
         explicit_duration: Option<i64>,
         additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
         meta: Option<std::sync::Arc<BlockGroupMeta>>,
     ) -> Result<()> {
-        let mut cur = std::io::Cursor::new(bytes);
+        let mut cur = std::io::Cursor::new(bytes.as_slice());
         let (track_number, _) = crate::ebml::read_vint(&mut cur, false)?;
         let mut tc_buf = [0u8; 2];
         cur.read_exact(&mut tc_buf)?;
@@ -11941,6 +12015,36 @@ impl MkvDemuxer {
 
         // Frame data starts at current cur position.
         let body_start = cur.position() as usize;
+        let si = stream_idx as usize;
+        let copies = 1 + if self.apply_track_operations {
+            self.virtual_consumers.get(si).map_or(0, Vec::len)
+        } else {
+            0
+        };
+        // A Block whose packets would take the queue past the startup
+        // analysis cap ends the analysis, then waits, whole, until the
+        // packets held so far have been returned.
+        let laces = match lacing {
+            0 => 1,
+            _ => bytes.get(body_start).map_or(1, |&n| usize::from(n) + 1),
+        };
+        let packets = laces.checked_mul(copies)
+            .filter(|&n| n <= MAX_PROBE_PACKETS)
+            .ok_or_else(|| Error::invalid("MKV: Block exceeds its 1024-packet budget"))?;
+        if self.out_queue.len() + packets > MAX_PROBE_PACKETS {
+            if !self.timestamps_primed {
+                self.finish_timestamp_probe();
+            }
+            self.deferred_block = Some(DeferredBlock {
+                bytes,
+                cluster_timecode,
+                group_keyframe,
+                explicit_duration,
+                additions,
+                meta,
+            });
+            return Ok(());
+        }
         let body = &bytes[body_start..];
 
         let frames = match lacing {
@@ -11951,20 +12055,19 @@ impl MkvDemuxer {
             _ => unreachable!(),
         };
 
-        let si = stream_idx as usize;
-        // Everything this Block retains shares one budget; an over-budget
-        // Block queues nothing.
-        let copies = 1 + if self.apply_track_operations {
-            self.virtual_consumers.get(si).map_or(0, Vec::len)
-        } else {
-            0
-        };
-        let side_data = additions.as_ref().map_or(0, |a| a.iter().map(|a| a.data.len()).sum::<usize>())
-            + meta.as_ref().map_or(0, |m| m.retained_bytes());
+        // Everything this Block retains shares one budget: payload
+        // capacity, every TrackOperation copy, side data and each queued
+        // packet's own size. An over-budget Block queues nothing.
+        let side_data = additions.as_ref().map_or(0, |a| {
+            ARC_HEADER + std::mem::size_of::<Vec<BlockAddition>>()
+                + a.capacity() * std::mem::size_of::<BlockAddition>()
+                + a.iter().map(|a| a.data.capacity()).sum::<usize>()
+        }) + meta.as_ref().map_or(0, |m| ARC_HEADER + std::mem::size_of::<BlockGroupMeta>() + m.retained_bytes());
         let over_budget = || Error::invalid("MKV: Block exceeds its 32 MiB budget");
-        let mut budget = MAX_BLOCK_BYTES.checked_sub(side_data).ok_or_else(over_budget)?;
-        let mut probe_charge = side_data;
-        let mut queued = Vec::new();
+        let retained = side_data + packets * std::mem::size_of::<QueuedPacket>();
+        let mut budget = MAX_BLOCK_BYTES.checked_sub(retained).ok_or_else(over_budget)?;
+        let mut probe_charge = retained;
+        let mut queued = Vec::with_capacity(packets);
         let time_base = self.streams[si].time_base;
         let track_scale = self.track_timing[si].track_timestamp_scale();
         let mut block_pts = if cluster_timecode >= 0
@@ -11986,8 +12089,8 @@ impl MkvDemuxer {
             .or_else(|| self.track_timing[si].default_duration.map(|ns| {
                 ns as i128 * n_frames / self.timecode_scale_ns as i128
             })).unwrap_or(0);
-        for (i, f) in frames.into_iter().enumerate() {
-            let i = i as i128;
+        for (lace, f) in frames.into_iter().enumerate() {
+            let i = lace as i128;
             let lace_duration = (block_duration * (i + 1) / n_frames
                 - block_duration * i / n_frames).min(i64::MAX as i128) as i64;
             let source_pts = block_pts;
@@ -12008,13 +12111,9 @@ impl MkvDemuxer {
             if frame_bytes.is_empty() && additions.is_none() {
                 continue;
             }
-            // FFmpeg flags a packet a keyframe from what its codec parser
-            // reads in the frame where it runs one, and every packet of an
-            // intra-only codec or a non-audio-video track; the Block's
-            // keyframe signal otherwise.
-            let parsed_duration = self.packet_clocks[si].frame_duration(&frame_bytes, time_base);
-            let duration = (lace_duration > 0).then_some(lace_duration).or(parsed_duration);
-            let pts = self.packet_clocks[si].timestamp(source_pts, duration);
+            let span = self.packet_clocks[si].frame_span(&frame_bytes, time_base);
+            let span = if lace_duration > 0 { Some(timing::Span::Ticks(lace_duration)) } else { span };
+            let (pts, duration) = self.packet_clocks[si].timestamp(source_pts, span, time_base);
             match self.streams[si].params.codec_id.as_str() {
                 "prores" => framing::prores(&mut frame_bytes)?,
                 "wavpack" => {
@@ -12029,15 +12128,26 @@ impl MkvDemuxer {
             } else {
                 None
             };
-            let retained = frame_bytes.len()
-                + webvtt.as_ref().map_or(0, |w| w.identifier.len() + w.settings.len());
-            budget = budget.checked_sub(retained.saturating_mul(copies)).ok_or_else(over_budget)?;
-            probe_charge += (retained + std::mem::size_of::<QueuedPacket>()) * copies;
+            // The packet's own capacity, each copy's exact clone, and the
+            // cue's shared side data. Queue slots were charged up front.
+            let retained = frame_bytes.capacity()
+                + (copies - 1) * frame_bytes.len()
+                + webvtt.as_ref().map_or(0, |w| {
+                    ARC_HEADER + std::mem::size_of::<WebVttMetadata>() + w.identifier.capacity() + w.settings.capacity()
+                });
+            budget = budget.checked_sub(retained).ok_or_else(over_budget)?;
+            probe_charge += retained;
+            // FFmpeg flags a packet a keyframe from what its codec parser
+            // reads in the frame where it runs one, and every packet of an
+            // intra-only codec or a non-audio-video track; the Block's
+            // keyframe signal otherwise. The Block's own random-access
+            // indication travels separately, on its first lace only.
             let keyframe = match self.frame_parsers.get_mut(si).and_then(Option::as_mut) {
                 _ if self.track_codecs.get(si).is_some_and(|c| c.intra_only()) => true,
                 Some(parser) => parser.keyframe(&frame_bytes, container_key),
                 None => container_key,
             };
+            let container_keyframe = lace == 0 && container_key;
             let mut pkt = Packet::new(stream_idx, time_base, frame_bytes);
             pkt.pts = pts;
             pkt.dts = match &mut self.decode_orders[si] {
@@ -12062,38 +12172,38 @@ impl MkvDemuxer {
             // references SHOULD be stored in 'coding order'"), which a
             // PTS re-sort would break. The Block's side channels attach to
             // the Block itself, so each copy shares them.
-            let synth: Vec<QueuedPacket> = if self.apply_track_operations {
-                self.virtual_consumers
-                    .get(stream_idx as usize)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|&origin| {
-                        let mut vp = pkt.clone();
-                        vp.stream_index = origin.virtual_stream;
-                        QueuedPacket {
-                            packet: vp,
-                            additions: additions.clone(),
-                            meta: meta.clone(),
-                            origin: Some(origin),
-                            webvtt: webvtt.clone(),
-                        }
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
             queued.push(QueuedPacket {
                 packet: pkt,
                 additions: additions.clone(),
                 meta: meta.clone(),
                 origin: None,
-                webvtt,
+                webvtt: webvtt.clone(),
+                container_keyframe,
             });
-            queued.extend(synth);
+            if self.apply_track_operations {
+                let source = queued.len() - 1;
+                for &origin in &self.virtual_consumers[si] {
+                    let mut packet = queued[source].packet.clone();
+                    packet.stream_index = origin.virtual_stream;
+                    queued.push(QueuedPacket {
+                        packet,
+                        additions: additions.clone(),
+                        meta: meta.clone(),
+                        origin: Some(origin),
+                        webvtt: webvtt.clone(),
+                        container_keyframe,
+                    });
+                }
+            }
         }
         if !self.timestamps_primed {
             self.timestamp_probe_bytes = self.timestamp_probe_bytes.saturating_add(probe_charge);
+        }
+        // Grow geometrically without taking spare queue slots past the cap.
+        let needed = self.out_queue.len() + queued.len();
+        if needed > self.out_queue.capacity() {
+            let capacity = needed.max(self.out_queue.capacity() * 2).min(MAX_PROBE_PACKETS);
+            self.out_queue.reserve_exact(capacity - self.out_queue.len());
         }
         self.out_queue.extend(queued);
         Ok(())

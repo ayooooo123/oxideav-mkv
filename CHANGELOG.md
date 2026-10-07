@@ -43,7 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and codecs without such a reading keep the Block's signal.
 - `D_WEBVTT/*` streams resolve to the `webvtt` subtitle decoder. Packets
   contain FFmpeg's cue text; identifier and settings are retained separately
-  by `MkvDemuxer::webvtt_metadata()`. `S_TEXT/WEBVTT` stays raw.
+  by `Demuxer::packet_metadata().webvtt`. `S_TEXT/WEBVTT` stays raw. The old
+  typed-only accessor/type are removed in favor of the shared core API.
+- Common packet metadata also preserves the Block's random-access signal
+  (`container_keyframe`) on lace 0 only, independently of parser keyframe
+  flags. Metadata stays associated with queued and virtual-track packets
+  and clears before every read/seek, including errors and EOF. This needs
+  the core `a6ccbf96` API and a consumer that snapshots each packet's metadata;
+  audio trimming is not yet implemented.
 - Open follows nested SeekHeads for trailing Info and Tracks, including
   tracks after an unknown-size Cluster. Cycles and excessive index chains
   are bounded. Empty frames without BlockAdditions no longer emit packets.
@@ -58,17 +65,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Untrusted input is bounded: at most two SeekHeads with 4096 distinct
   retained entries and one followed target per other master; 256 tracks;
   4 MiB per `CodecPrivate` and 16 MiB in total, stored or decompressed;
-  32 MiB retained per Block across laces, header stripping, virtual-track
-  copies and side data (an over-budget Block queues nothing); and startup
-  DTS analysis holds at most 1024 packets / 512 KiB including overhead.
-  Budget overruns are `InvalidData`. Transport and permission errors are
-  returned instead of being resynchronised into a clean end of stream;
-  seeking resets the resync floor; a forged `SignatureSlot` must fit its
-  Cluster; Vorbis recognises 64 modes and restores mode 0's window on seek.
+  32 MiB retained per Block across payload capacities, header stripping,
+  virtual-track copies, shared side data and queue slots. The 1024-packet
+  ceiling counts all laces and emitted copies: an oversized Block is
+  InvalidData and queues nothing; a compliant one waits until held packets
+  drain. Startup DTS analysis stops at 512 KiB including overhead, plus
+  the bounded current Block. Source I/O errors retain their kind and
+  propagate, including InvalidInput reads and source-generated UnexpectedEof.
+  A failed seek is treated as physical truncation only when its target
+  exceeds a confirmed physical end. Seeking resets the resync floor;
+  a forged SignatureSlot must fit its Cluster; Vorbis recognises 64 modes
+  and restores mode 0's window on seek.
 - Laces advance by their per-frame durations rather than repeating the
   first timestamp. BlockDuration and DefaultDuration use FFmpeg 9's integer
-  remainder distribution; duration-less Vorbis, Opus, FLAC and WavPack
-  frames advance by durations parsed from their codec headers.
+  remainder distribution; duration-less Vorbis, Opus, FLAC, WavPack, MP3,
+  AC-3/E-AC-3 and 16-bit DTS core frames use codec header durations.
+  AAC/HE-AAC use the core frame size/rate with stable rational accumulation,
+  including FFmpeg 9's absent first duration and repeated second-lace PTS.
+  AAC 960-sample/LD/ELD/USAC and 14-bit/substream-only DTS timing are not inferred.
 - TrackTimestampScale changes each stream's reduced timebase and the
   Cluster timestamp's conversion to track ticks. Negative absolute Block
   timestamps are unspecified and interpolate from zero, matching FFmpeg.
@@ -78,9 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - H.264 / HEVC packets infer DTS through a bounded PTS reorder window,
   preserving unknown DTS at the beginning instead of copying PTS.
   Delay comes from H.264 VUI / HEVC SPS reorder counts and H.264 B slices.
-  A bounded H.264 prefix (at most 512 KiB of queued payload, plus the
-  current Block) is replayed once the delay is established; an incomplete
-  restricted-SPS sequence retains unknown DTS. Seeking clears the window.
+  A bounded H.264 prefix (1024 packets and a 512 KiB retained-byte threshold,
+  plus the bounded current Block) is replayed once the delay is established;
+  an incomplete restricted-SPS sequence retains unknown DTS. Seeking clears
+  the window.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.10...v0.0.11) - 2026-10-04
 

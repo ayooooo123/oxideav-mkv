@@ -13,8 +13,15 @@ framework but usable standalone.
 ```toml
 [dependencies]
 oxideav-core = "0.1"
-oxideav-mkv = "0.0"
+oxideav-mkv = { git = "https://github.com/ayooooo123/oxideav-mkv" }
+
+[patch.crates-io]
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "a6ccbf96af9e8aad594becbfd5a9ae08435ecd35" }
 ```
+
+This fork uses the shared `PacketMetadata` API from the core revision above.
+Apply the patch in the consuming workspace: Cargo ignores dependency-level
+patches. Pin the desired MKV commit in production.
 
 ## Quick use
 
@@ -51,6 +58,36 @@ The demuxer returns raw `Packet` bytes — pair it with a decoder crate
 [`oxideav-vp9`](https://crates.io/crates/oxideav-vp9)) registered into
 the same `RuntimeContext`, or call `oxideav_meta::register_all(&mut ctx)`
 to register every codec the build enables.
+
+### Packet metadata and bounded streaming
+
+Immediately after each successful `next_packet()`, snapshot
+`dmx.packet_metadata()` and retain it with that packet. The owned snapshot
+contains the Block's `container_keyframe` signal only on lace 0: the
+SimpleBlock keyframe bit, or a BlockGroup without ReferenceBlock. This does
+not change codec-parser `Packet::flags.keyframe`. `D_WEBVTT/*` packets expose
+cue text in `Packet::data` and an `Arc<WebVttMetadata>` containing identifier
+and settings in `PacketMetadata::webvtt`; `S_TEXT/WEBVTT` remains raw.
+The old typed WebVTT accessor/type are replaced by this common API.
+Common metadata clears before every read or seek, including errors and EOF.
+
+Startup DTS analysis holds at most 1024 packets, counting virtual-track
+copies. A compliant Block waits whole if its laces and copies cannot fit
+alongside held packets. A single Block needing more than 1024 packets is
+InvalidData and queues nothing; normal damage recovery seeks the next
+Cluster. Retained Block payload capacity, side data and packet slots share
+the 32 MiB budget. The 512 KiB startup byte threshold also counts this state;
+the bounded current/deferred Block and temporary expansion remain additional
+working memory. Source I/O failures propagate, including source-generated
+UnexpectedEof; only parser damage and physical truncation are recovered.
+
+Duration-less laces use codec frame timing, including AAC/HE-AAC, MP3,
+AC-3/E-AC-3 and 16-bit DTS core headers. AAC preserves FFmpeg 9's untimed
+first packet and stable rational timestamp accumulation. AAC 960-sample,
+LD/ELD/USAC and 14-bit or substream-only DTS frame durations are not inferred.
+`audio_trim` is not yet produced: CodecDelay, DiscardPadding application and
+SeekPreRoll consumption remain shared AudioTrim integration work.
+
 
 ## What's implemented
 

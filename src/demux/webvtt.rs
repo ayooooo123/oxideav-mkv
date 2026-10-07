@@ -1,14 +1,8 @@
 //! WebM's D_WEBVTT carriage: identifier line, settings line, then cue text.
+//! The packet keeps only the cue text, as in FFmpeg; the identifier and
+//! settings travel as the packet's [`WebVttMetadata`].
 
-use oxideav_core::{Error, Result};
-
-/// WebVTT side data for the most recently returned packet. The packet itself
-/// contains only cue text, as in FFmpeg. Empty fields mean absent side data.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WebVttMetadata {
-    pub identifier: Vec<u8>,
-    pub settings: Vec<u8>,
-}
+use oxideav_core::{Error, Result, WebVttMetadata};
 
 pub(super) fn split(data: &mut Vec<u8>) -> Result<WebVttMetadata> {
     fn line(data: &[u8], start: usize) -> Result<(usize, usize)> {
