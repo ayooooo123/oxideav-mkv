@@ -105,15 +105,26 @@ essential: damage there fails a strict open, as before. Damage in any other
 Top-Level master (`Chapters`, `Attachments`, `Tags`, `Cues`, a `SeekHead` or
 an unassigned one) is stepped over by either open: the master is dropped,
 or cut to the records before the damage, and one `DamagedMaster` event is
-recorded. Without Cues, a seek scans the Clusters. Every element in a
-`Tracks`, `Tags`, `Chapters`, `Cues` or `SeekHead` tree must fit its parent,
-as in `Info`; in `Attachments`, an `AttachedFile` ends with its parent at
-the latest and its fields must fit it. RFC 9559 allows the unknown size on
-a Segment and a Cluster alone, so any other Top-Level element of unknown
-size is damage. Between Clusters it is damage in the Cluster stream, so the
-walk resumes at the next Cluster; a SeekHead target of unknown size is
-ignored unread, and a target whose parse finds damage is noted as a
-damaged master. In `Info`, `SegmentUUID`, `PrevUUID` and `NextUUID` must be
+recorded. Without Cues, a seek scans the Clusters. Junk where a Top-Level
+element should start, before the first Cluster, is skipped by either open:
+the walk scans forward from the next octet for the next Top-Level element
+and resumes there, as FFmpeg's `matroska_resync` does for
+`matroska_read_header` (libavformat/matroskadec.c), noting one
+`GarbageData` event per run. Unlike FFmpeg's, the scan is bounded: all the
+open's scans together read at most 1 MiB, the candidates they vet
+included. A strict open fails when a scan ends without a Top-Level
+element, its budget spent or the Segment over; a resilient one drops the
+rest of the Segment. Every element in a `Tracks`, `Tags`, `Chapters`,
+`Cues` or `SeekHead` tree must fit its parent, as in `Info`; in
+`Attachments`, an `AttachedFile` ends with its parent at the latest and
+its fields must fit it. RFC 9559 allows the unknown size on a Segment and a
+Cluster alone, so any other Top-Level element of unknown size is damage,
+and so is one whose declared end runs past its Segment: the walk rescans
+from the end of its header, within the same budget. Between Clusters such
+an element is damage in the Cluster stream, so the walk resumes at the
+next Cluster; a SeekHead target of unknown size is ignored unread, and a
+target whose parse finds damage is noted as a damaged master. In `Info`,
+`SegmentUUID`, `PrevUUID` and `NextUUID` must be
 16 octets, each text field holds at most 64 KiB, and the `Info` masters
 keep at most 1 MiB together. `Chapters` and `Attachments` text fields hold
 at most 64 KiB too, and each of the two keeps at most 1 MiB: editions,
@@ -628,9 +639,9 @@ SeekPreRoll consumption remain shared AudioTrim integration work.
   past the input end is clamped (truncated-file recovery); a damaged
   `Info` or `Tracks` master before the first Cluster is skipped like the
   optional masters both opens skip, keeping whatever parsed before the
-  error; garbage
-  between Top-Level elements is stepped over by scanning for the next
-  well-formed 4-byte Top-Level element ID; and a corrupt element inside
+  error; junk before the first Cluster that the bounded scan both opens
+  run (see above) cannot get past drops the rest of the Segment instead of
+  failing the open; and a corrupt element inside
   the Cluster stream makes `next_packet` resynchronise on the next
   plausible Cluster — the §5.1.3.2 damaged-stream resynchronisation
   unit — instead of ending the stream (a candidate must header-parse and
@@ -646,8 +657,9 @@ SeekPreRoll consumption remain shared AudioTrim integration work.
   recovery, so strict-minded callers can reject after the fact. The first
   4096 events are kept and `dropped_damage_events()` counts the rest. The
   strict `open` / `open_typed` fails on damage in the EBML header, the
-  Segment, `Info` or `Tracks`, or garbage between Top-Level elements, and
-  records its own `DamageEvent`s for the optional masters it steps over.
+  Segment, `Info` or `Tracks`, or on junk the bounded scan cannot get past,
+  and records its own `DamageEvent`s for the optional masters and junk
+  runs it steps over.
 - **Cues-less seek**: `seek_to` on a file with no usable `Cues` (absent —
   RFC 9559 §22.1 only RECOMMENDS the element; live recordings and files
   written to a pipe have none — or damaged and skipped), or past the last

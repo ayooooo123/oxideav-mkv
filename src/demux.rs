@@ -35,7 +35,11 @@ use crate::ids;
 /// `Tags`, `Cues`, `SeekHead` or other Top-Level master is dropped, or cut
 /// to the records before the damage, and noted as one [`DamageEvent`]
 /// (see [`MkvDemuxer::damage_events`]); without Cues, a seek scans the
-/// Clusters. [`open_resilient`] recovers from more.
+/// Clusters. Junk where a Top-Level element should start, before the first
+/// `Cluster`, is skipped by scanning for the next one, as FFmpeg's
+/// `matroska_resync` does, with one event per run skipped; the open fails
+/// when the scan ends without one, its 1 MiB budget spent or the Segment
+/// over. [`open_resilient`] recovers from more.
 pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     open_typed(input, codecs).map(|d| Box::new(d) as Box<dyn Demuxer>)
 }
@@ -52,16 +56,17 @@ pub fn open_typed(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Resul
 /// Damage-tolerant variant of [`open`]. RFC 9559 §26 leaves error handling
 /// to the Reader ("Matroska Readers decide how to handle the errors whether
 /// or not they are recoverable in their code"). Both paths step over
-/// damaged optional masters and recover Cluster-stream damage; this one
-/// also recovers the rest:
+/// damaged optional masters and junk before the first `Cluster`, and
+/// recover Cluster-stream damage; this one also recovers the rest:
 ///
 /// * a known-size Segment whose declared size runs past the end of the
 ///   input is clamped to the actual input length;
 /// * a damaged `Info` or `Tracks` master before the first `Cluster` is
 ///   skipped like an optional one — whatever the parser lifted before the
 ///   error is kept;
-/// * garbage between Top-Level elements is skipped by scanning for the
-///   next well-formed Top-Level element ID;
+/// * when the scan past junk finds no Top-Level element, within its budget
+///   or before the Segment ends, the rest of the Segment is dropped instead
+///   of failing the open;
 /// * a corrupt element inside the Cluster stream makes `next_packet`
 ///   resynchronise on the next `Cluster` (RFC 9559 §5.1.3.2 explicitly
 ///   anticipates resynchronising the offset on damaged streams at the
@@ -283,24 +288,32 @@ fn open_typed_impl(
     let mut cues_cut = false;
 
     let mut seek_heads = 0usize;
+    // What the scans past junk below may still read; see `MAX_RESYNC_BYTES`.
+    let mut resync_left = MAX_RESYNC_BYTES;
     while input.stream_position()? < segment_data_end {
         let walk_pos = input.stream_position()?;
         let e = match read_element_header(&mut *input) {
             Ok(e) => e,
             Err(err) => {
-                if !resilient || !is_damage(&err) {
+                if !is_damage(&err) {
                     return Err(err);
                 }
-                // Garbage where a Top-Level element header should be —
-                // scan forward for the next recognisable Top-Level element
-                // ID and resume the walk there (RFC 9559 §26 leaves the
-                // recovery strategy to the Reader).
-                match scan_top_level_element(
+                // Junk where a Top-Level element header should be. Either
+                // open scans forward from the next octet for the next
+                // recognisable Top-Level element and resumes the walk
+                // there, as FFmpeg's `matroska_resync` does for
+                // `matroska_read_header` (libavformat/matroskadec.c); RFC
+                // 9559 §26 leaves the recovery strategy to the Reader.
+                // Unlike FFmpeg's, the scan is bounded: a strict open fails
+                // when it ends without a Top-Level element, and a resilient
+                // one drops the rest of the Segment.
+                match scan_top_level_within(
                     &mut *input,
                     walk_pos.saturating_add(1),
                     segment_data_end,
+                    &mut resync_left,
                 )? {
-                    Some(off) => {
+                    Resync::At(off) => {
                         damage_events.push(DamageEvent {
                             kind: DamageKind::GarbageData,
                             offset: walk_pos,
@@ -310,7 +323,9 @@ fn open_typed_impl(
                         input.seek(SeekFrom::Start(off))?;
                         continue;
                     }
-                    None => {
+                    Resync::Spent if !resilient => return Err(resync_spent()),
+                    Resync::Nothing if !resilient => return Err(err),
+                    Resync::Nothing | Resync::Spent => {
                         damage_events.push(DamageEvent {
                             kind: DamageKind::UnrecoverableTail,
                             offset: walk_pos,
@@ -353,8 +368,13 @@ fn open_typed_impl(
             }
             // RFC 9559 allows the unknown size on a Segment and a Cluster
             // alone: any other element without a declared end has no bound
-            // to parse within.
+            // to parse within. One whose end runs past its Segment would
+            // hide what follows it, so it is damage too, and the walk
+            // rescans from the end of its header.
             let end = body_end_known.ok_or_else(unknown_size_master)?;
+            if end > segment_data_end {
+                return Err(Error::invalid(format!("MKV: Top-Level element 0x{:X} runs past its Segment", e.id)));
+            }
             // Validate a leading CRC-32 child against the rest of the
             // element. The helper rewinds the reader to `body_start` so the
             // parse below is unaffected.
@@ -446,13 +466,15 @@ fn open_typed_impl(
             // error, then resume the walk: at the element's declared end
             // when it is sane, otherwise at the next Top-Level element ID
             // the scanner can find from the end of its header, where an
-            // element of unknown size with no body has its successor.
+            // element of unknown size with no body has its successor. That
+            // scan shares the junk scans' budget, and a strict open fails
+            // when it runs out.
             let resume = match body_end_known {
-                Some(end) if end <= segment_data_end => Some(end),
-                _ => scan_top_level_element(&mut *input, body_start, segment_data_end)?,
+                Some(end) if end <= segment_data_end => Resync::At(end),
+                _ => scan_top_level_within(&mut *input, body_start, segment_data_end, &mut resync_left)?,
             };
             match resume {
-                Some(off) => {
+                Resync::At(off) => {
                     damage_events.push(DamageEvent {
                         kind: DamageKind::DamagedMaster(e.id),
                         offset: walk_pos,
@@ -461,7 +483,8 @@ fn open_typed_impl(
                     });
                     input.seek(SeekFrom::Start(off))?;
                 }
-                None => {
+                Resync::Spent if !resilient => return Err(resync_spent()),
+                Resync::Nothing | Resync::Spent => {
                     damage_events.push(DamageEvent {
                         kind: DamageKind::UnrecoverableTail,
                         offset: walk_pos,
@@ -1861,6 +1884,12 @@ fn unknown_size_master() -> Error {
     Error::invalid("MKV: unknown-size element other than Cluster")
 }
 
+/// The open's scans past junk found no Top-Level element within their
+/// budget, [`MAX_RESYNC_BYTES`].
+fn resync_spent() -> Error {
+    Error::invalid("MKV: no Top-Level element within the 1 MiB resync budget")
+}
+
 /// Only parser damage or a short read at the physical end is recoverable.
 /// Errors returned by the source itself retain their kind but are tagged
 /// by `ClusterReader`, including a transport's own `UnexpectedEof`.
@@ -1956,16 +1985,47 @@ const CLUSTER_FIRST_CHILD_IDS: [u32; 8] = [
 ///
 /// The reader position on return is unspecified; the caller seeks.
 fn scan_top_level_element(r: &mut dyn ReadSeek, from: u64, end: u64) -> Result<Option<u64>> {
+    let mut unbounded = u64::MAX;
+    Ok(match scan_top_level_within(r, from, end, &mut unbounded)? {
+        Resync::At(offset) => Some(offset),
+        Resync::Nothing | Resync::Spent => None,
+    })
+}
+
+/// What the open walk may read scanning past junk for the next Top-Level
+/// element before the first Cluster, all its scans together.
+const MAX_RESYNC_BYTES: u64 = 1 << 20;
+/// What vetting one scanned candidate may read: two element headers.
+const RESYNC_VET_BYTES: u64 = 24;
+
+/// What a resync scan found.
+enum Resync {
+    /// The next plausible Top-Level element starts here.
+    At(u64),
+    /// The range holds none.
+    Nothing,
+    /// The scan's budget ran out first.
+    Spent,
+}
+
+/// [`scan_top_level_element`] taking what it reads, the candidates it vets
+/// included, from `budget`, and stopping when that runs out.
+fn scan_top_level_within(r: &mut dyn ReadSeek, from: u64, end: u64, budget: &mut u64) -> Result<Resync> {
     const CHUNK: usize = 64 * 1024;
     if from >= end {
-        return Ok(None);
+        return Ok(Resync::Nothing);
     }
     let mut base = from;
     let mut buf = vec![0u8; CHUNK];
     // 3-byte carry so a candidate ID straddling two chunks is still seen.
     let mut carry: Vec<u8> = Vec::new();
     while base < end {
-        let want = ((end - base) as usize).min(CHUNK - carry.len());
+        if *budget == 0 {
+            return Ok(Resync::Spent);
+        }
+        let want = ((end - base) as usize)
+            .min(CHUNK - carry.len())
+            .min(usize::try_from(*budget).unwrap_or(usize::MAX));
         r.seek(SeekFrom::Start(base))?;
         let mut filled = 0usize;
         while filled < want {
@@ -1977,8 +2037,9 @@ fn scan_top_level_element(r: &mut dyn ReadSeek, from: u64, end: u64) -> Result<O
             }
         }
         if filled == 0 {
-            return Ok(None);
+            return Ok(Resync::Nothing);
         }
+        *budget -= filled as u64;
         // The chunk was read into `buf[carry.len()..]`; lay the carry from
         // the previous chunk in front of it so a 4-byte ID straddling the
         // boundary is still matched.
@@ -1992,9 +2053,13 @@ fn scan_top_level_element(r: &mut dyn ReadSeek, from: u64, end: u64) -> Result<O
             if !TOP_LEVEL_IDS.contains(&id) {
                 continue;
             }
+            match budget.checked_sub(RESYNC_VET_BYTES) {
+                Some(left) => *budget = left,
+                None => return Ok(Resync::Spent),
+            }
             let candidate = window_start + i as u64;
             if let Some(hit) = vet_top_level_candidate(r, candidate, end)? {
-                return Ok(Some(hit));
+                return Ok(Resync::At(hit));
             }
         }
         // Next chunk; keep the last 3 bytes as carry.
@@ -2002,7 +2067,7 @@ fn scan_top_level_element(r: &mut dyn ReadSeek, from: u64, end: u64) -> Result<O
         carry = buf[window_len - keep..window_len].to_vec();
         base = window_start + window_len as u64;
     }
-    Ok(None)
+    Ok(Resync::Nothing)
 }
 
 /// Vet one scanned Top-Level candidate at `candidate` (see

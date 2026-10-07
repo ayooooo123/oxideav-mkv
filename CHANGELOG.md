@@ -104,12 +104,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Tracks` — `Chapters`, `Attachments`, `Tags`, `Cues`, a `SeekHead` —
   drops the master, or cuts it to the records before the damage, with one
   `DamagedMaster` event, in a strict open too; damage in the EBML header,
-  the Segment, `Info` or `Tracks` still fails a strict open. Every element
-  in a Tracks, Tags, Chapters, Cues or SeekHead tree must fit its parent.
-  Any Top-Level element but a Cluster with the unknown size is damage, and
-  between Clusters it is Cluster-stream damage; a resilient open rescans
-  from the end of its header, so a Cluster right after an empty one is
-  found. `SegmentUUID`, `PrevUUID` and `NextUUID` must be 16 octets.
+  the Segment, `Info` or `Tracks` still fails a strict open. Junk where a
+  Top-Level element should start, before the first Cluster, is skipped by
+  either open, as FFmpeg's `matroska_resync` does, with one `GarbageData`
+  event per run; the scans read at most 1 MiB in total, and a strict open
+  fails when one ends without a Top-Level element. Every element in a
+  Tracks, Tags, Chapters, Cues or SeekHead tree must fit its parent. Any
+  Top-Level element but a Cluster with the unknown size, or with an end
+  past its Segment, is damage, rescanned from the end of its header, so a
+  Cluster behind it is still found; between Clusters it is Cluster-stream
+  damage. `SegmentUUID`, `PrevUUID` and `NextUUID` must be 16 octets.
   Text fields of `Info`, `Chapters` and `Attachments` hold at most 64 KiB,
   checked before a read, and each of the three keeps at most 1 MiB. Past
   it, `Chapters` and `Attachments` keep the records that fit, in order.

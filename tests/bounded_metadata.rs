@@ -822,3 +822,79 @@ fn a_source_failure_fetching_an_attachment_is_returned_as_itself() {
         fetched.map(|data| data.len()),
     );
 }
+
+/// How far the open's resync scan reads past junk before it gives up.
+const RESYNC: usize = 1 << 20;
+
+/// Junk where a Top-Level element should start, before the first Cluster,
+/// is skipped by either open: the walk scans for the next Top-Level
+/// element, as FFmpeg's `matroska_resync` does for `matroska_read_header`,
+/// notes each skipped run as one damage event, and every packet plays.
+#[test]
+fn junk_before_the_first_cluster_is_skipped_by_either_open() {
+    let _serial = serial();
+    let mut failures = Vec::new();
+    let junk = vec![0u8; 1000];
+    let clusters = vec![cluster(0, b"a"), cluster(1000, b"b")];
+    let layouts = [
+        ("before Tracks", vec![junk.clone(), tracks()], 1),
+        ("before the first Cluster", vec![tracks(), junk.clone()], 1),
+        ("before both", vec![junk.clone(), tracks(), junk.clone()], 2),
+    ];
+    for (layout, head, runs) in layouts {
+        let bytes = file(&[head, clusters.clone()].concat());
+        for resilient in [false, true] {
+            let got = played(bytes.clone(), resilient).map(|got| (got.packets, got.damage));
+            let expected = (vec![b"a".to_vec(), b"b".to_vec()], vec![DamageKind::GarbageData; runs]);
+            if got.as_ref() != Ok(&expected) {
+                failures.push(format!("{layout}, resilient {resilient}: {got:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A run of junk longer than the resync scan's budget fails a strict open
+/// once the budget is spent, and neither open reads much past it.
+#[test]
+fn junk_past_the_resync_budget_fails_a_strict_open_after_a_bounded_read() {
+    let _serial = serial();
+    let bytes = file(&[tracks(), vec![0; 4 << 20], cluster(0, b"a")]);
+    let (strict, strict_read, _) = measure(bytes.clone(), |input| first(input, false));
+    let (resilient, resilient_read, _) = measure(bytes, |input| {
+        demux::open_resilient_typed(input, &NullCodecResolver).map(|_| ()).map_err(kind)
+    });
+    let bound = RESYNC + (128 << 10);
+    assert!(
+        strict == Err("InvalidData".to_string()) && strict_read < bound && resilient.is_ok() && resilient_read < bound,
+        "strict {strict:?} after reading {strict_read} bytes; resilient open {resilient:?} after reading {resilient_read} bytes",
+    );
+}
+
+/// An optional master whose declared size runs past its Segment does not
+/// hide the Clusters behind it: it is damage, and the walk rescans from the
+/// end of its header.
+#[test]
+fn an_optional_master_past_its_segment_does_not_hide_the_clusters() {
+    let _serial = serial();
+    let mut failures = Vec::new();
+    for (name, id, child) in [
+        ("Cues", ids::CUES, ids::CUE_POINT),
+        ("Chapters", ids::CHAPTERS, ids::EDITION_ENTRY),
+        ("Attachments", ids::ATTACHMENTS, ids::ATTACHED_FILE),
+        ("Tags", ids::TAGS, ids::TAG),
+    ] {
+        // 4096 octets declared, a child declaring 8192, then the Cluster:
+        // the Segment ends right after it.
+        let master = [header(id, 4096), header(child, 8192)].concat();
+        let bytes = file(&[tracks(), master, cluster(0, b"a")]);
+        for resilient in [false, true] {
+            let got = played(bytes.clone(), resilient).map(|got| (got.packets, got.damage));
+            let expected = (vec![b"a".to_vec()], vec![DamageKind::DamagedMaster(id)]);
+            if got.as_ref() != Ok(&expected) {
+                failures.push(format!("{name}, resilient {resilient}: {got:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
