@@ -5,7 +5,8 @@
 //! budget, is refused before any of it is read; a `BlockGroup` child must
 //! fit its parent; records that occupy more memory than their on-disk
 //! bytes share the Block's retention budget, as does a Block waiting for
-//! queue room; and duplicate `BlockAddID`s cost linear time to drop.
+//! queue room; duplicate `BlockAddID`s cost linear time to drop; and the
+//! `EncryptedBlock`s kept on Cluster records share one fixed budget.
 //!
 //! The heap is measured by a counting global allocator. Every test holds
 //! one lock, so nothing else allocates while one measures.
@@ -443,4 +444,41 @@ fn masters_over_their_budget_are_refused_unread() {
         failures.push(format!("Tracks within budget: CRC-32 status {status:?}"));
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Ten Clusters, each a packet and then a 5 MiB EncryptedBlock: 50 MiB that
+/// the Cluster records would keep for as long as the file is open. They keep
+/// the blocks that fit the 32 MiB budget, in order. A block past it is
+/// damage, recovered from as any is and recorded once, so every Cluster's
+/// packet still plays.
+#[test]
+fn encrypted_blocks_share_one_retention_budget() {
+    let _serial = serial();
+    const BLOCK: usize = 5 << 20;
+    let mut segment = vec![subtitle_tracks()];
+    for i in 0..10u8 {
+        let mut body = vec![i; BLOCK];
+        body[..4].copy_from_slice(&[0x81, 0, 0, 0x80]);
+        segment.push(cluster(u64::from(i) * 1000, &[simple(1, 0, &[b'p', i]), elem(ids::ENCRYPTED_BLOCK, &body)]));
+    }
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(file(&segment)));
+    let base = LIVE.load(Ordering::SeqCst);
+    let mut d = demux::open_typed(input, &NullCodecResolver).unwrap();
+    let mut packets = Vec::new();
+    loop {
+        match d.next_packet() {
+            Ok(p) => packets.push(p.data),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+    let retained = LIVE.load(Ordering::SeqCst).saturating_sub(base);
+    let kept: Vec<u8> = d.cluster_records().iter().flat_map(|r| &r.encrypted_blocks).map(|b| b[BLOCK - 1]).collect();
+    let damaged = d.damage_events().len();
+    let played = packets == (0..10u8).map(|i| vec![b'p', i]).collect::<Vec<_>>();
+    // Six 5 MiB blocks fit the 32 MiB budget; the other four are damage.
+    assert!(
+        played && kept == [0, 1, 2, 3, 4, 5] && damaged == 4 && retained < (32 << 20) + (1 << 20),
+        "played {played}, kept blocks {kept:?}, {damaged} damage events, retained {retained} heap bytes"
+    );
 }

@@ -1236,6 +1236,8 @@ fn open_typed_impl(
         track_identity,
         cluster_records: Vec::new(),
         cluster_record_by_offset: std::collections::HashMap::new(),
+        encrypted_bytes: 0,
+        encrypted_block_offsets: std::collections::HashSet::new(),
         resilient,
         damage_events,
         resync_floor: 0,
@@ -1710,6 +1712,13 @@ const MAX_PROBE_PACKETS: usize = 1024;
 const MAX_PROBE_BYTES: usize = 512 << 10;
 /// Strong and weak reference counts in a shared side-data allocation.
 const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
+/// `EncryptedBlock` bytes the Cluster records keep, all together; each
+/// block is also charged [`ENCRYPTED_ENTRY_BYTES`].
+const MAX_ENCRYPTED_BYTES: usize = 32 << 20;
+/// What one kept `EncryptedBlock` holds besides its bytes, charged
+/// generously: its buffer's handle and slot in the record's list, and its
+/// offset in the set of blocks already recorded.
+const ENCRYPTED_ENTRY_BYTES: usize = 64;
 
 /// Only parser damage or a short read at the physical end is recoverable.
 /// Errors returned by the source itself retain their kind but are tagged
@@ -1971,15 +1980,23 @@ pub struct ClusterRecord {
     /// again in a later Cluster (A.2).
     pub silent_track_numbers: Vec<u64>,
     /// `EncryptedBlock` payloads (RFC 9559 Appendix A.15, id `0xAF`) carried
-    /// directly by this Cluster, in on-disk order. Each entry is the raw,
-    /// still-Transformed (encrypted and/or signed) block body — structurally
-    /// like a `SimpleBlock` but with its contents opaque to the container.
+    /// directly by this Cluster, in the order the walk first read them (on-
+    /// disk order unless a seek entered the Cluster past some of them). Each
+    /// entry is the raw, still-Transformed (encrypted and/or signed) block
+    /// body — structurally like a `SimpleBlock` but with its contents opaque
+    /// to the container.
     /// Empty for the overwhelmingly common case (the element is reclaimed
     /// and effectively never written by modern Writers); surfaced verbatim
     /// so a reader handling its own decryption, or a re-muxer copying a
     /// legacy stream, can recover the bytes. The container performs no
     /// decryption and exposes no track binding — `EncryptedBlock` carries no
     /// usable track-number header once Transformed.
+    ///
+    /// Every record's blocks together stay within a fixed 32 MiB budget, and
+    /// a block revisited by a seek is not recorded again. A block that would
+    /// exceed the budget is invalid data, recovered from like any damaged
+    /// Cluster child: the walk resumes at the next Cluster and the recovery
+    /// is a [`DamageEvent`].
     pub encrypted_blocks: Vec<Vec<u8>>,
 }
 
@@ -9320,6 +9337,12 @@ pub struct MkvDemuxer {
     /// open finds the record already present and reuses it instead of
     /// pushing a duplicate row).
     cluster_record_by_offset: std::collections::HashMap<u64, usize>,
+    /// Bytes charged for every kept `EncryptedBlock` — see
+    /// [`MAX_ENCRYPTED_BYTES`].
+    encrypted_bytes: usize,
+    /// Element offsets of the `EncryptedBlock`s already on a record, so a
+    /// revisit does not record one twice.
+    encrypted_block_offsets: std::collections::HashSet<u64>,
     /// `true` when constructed via [`open_resilient`] /
     /// [`open_resilient_typed`] — metadata-open errors are recoverable.
     /// Cluster-stream errors recover on either path.
@@ -10212,14 +10235,29 @@ impl MkvDemuxer {
         }
     }
 
-    /// Append an `EncryptedBlock` payload (RFC 9559 Appendix A.15) to the
-    /// Cluster record keyed by `body_start`. No-op when the record is
-    /// missing — see [`Self::set_cluster_position`] for the why. The bytes
-    /// are recorded verbatim; the container never decrypts them.
-    fn push_cluster_encrypted_block(&mut self, body_start: u64, bytes: Vec<u8>) {
-        if let Some(&idx) = self.cluster_record_by_offset.get(&body_start) {
-            self.cluster_records[idx].encrypted_blocks.push(bytes);
+    /// Record the `EncryptedBlock` (RFC 9559 Appendix A.15) stored at
+    /// `offset`, with a body of `size` octets at the reader, on the Cluster
+    /// record keyed by `body_start`. The bytes are recorded verbatim; the
+    /// container never decrypts them. It is stepped over when the record is
+    /// missing — see [`Self::set_cluster_position`] for the why — or already
+    /// holds it. Kept blocks share [`MAX_ENCRYPTED_BYTES`], charged before
+    /// the bytes are read; one that does not fit is invalid data.
+    fn record_cluster_encrypted_block(&mut self, body_start: u64, offset: u64, size: u64) -> Result<()> {
+        let Some(&idx) = self.cluster_record_by_offset.get(&body_start) else {
+            return skip(&mut *self.input, size);
+        };
+        if self.encrypted_block_offsets.contains(&offset) {
+            return skip(&mut *self.input, size);
         }
+        let cost = usize::try_from(size).map_or(usize::MAX, |s| s.saturating_add(ENCRYPTED_ENTRY_BYTES));
+        if cost > MAX_ENCRYPTED_BYTES - self.encrypted_bytes {
+            return Err(Error::invalid("MKV: EncryptedBlocks exceed their 32 MiB budget"));
+        }
+        let bytes = BlockBudget(cost).read(&mut *self.input, size)?;
+        self.encrypted_bytes += cost;
+        self.encrypted_block_offsets.insert(offset);
+        self.cluster_records[idx].encrypted_blocks.push(bytes);
+        Ok(())
     }
 
     /// Typed `Chapters\EditionEntry` tree (RFC 9559 §5.1.7) parsed from
@@ -11994,8 +12032,7 @@ impl MkvDemuxer {
                         // Transformed region), so it surfaces the raw bytes
                         // on the Cluster record for faithful re-mux / caller
                         // decryption rather than skipping them silently.
-                        let bytes = read_bytes(&mut *self.input, e.size as usize)?;
-                        self.push_cluster_encrypted_block(body_start, bytes);
+                        self.record_cluster_encrypted_block(body_start, pos, e.size)?;
                     }
                     ids::SIMPLE_BLOCK => {
                         let bytes = BlockBudget(MAX_BLOCK_BYTES).read(&mut *self.input, e.size)?;

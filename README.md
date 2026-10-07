@@ -85,10 +85,19 @@ exact size. A Block waiting for room holds its stored bytes and side data
 within the same budget, and duplicate `BlockAddID`s are dropped in linear
 time. The 512 KiB startup byte threshold also counts this state; the
 bounded current/deferred Block and temporary expansion remain additional
-working memory. Source I/O
+working memory. The `EncryptedBlock`s kept on Cluster records share one
+32 MiB budget for the life of the demuxer, and one revisited by a seek is
+not recorded again; a block past the budget is InvalidData, and the walk
+resumes at the next Cluster. Source I/O
 failures propagate, including source-generated UnexpectedEof and failures
 met reading trailing Tags, Cluster `CRC-32`s or seek landings; only parser
 damage and physical truncation are recovered.
+
+Known network cost: an `Info`, `Cues`, `Chapters` or `Attachments` master
+whose first child is a `CRC-32` is read in full to check it, in 16 KiB
+chunks with small heap. These masters have no size budget, so a large one
+costs its whole size in reads before the first packet when it precedes the
+Clusters, or at open when the SeekHead leads to it.
 
 Duration-less laces use codec frame timing, including AAC/HE-AAC, MP3,
 AC-3/E-AC-3 and 16-bit DTS core headers. AAC preserves FFmpeg 9's untimed

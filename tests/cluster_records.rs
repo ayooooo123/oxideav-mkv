@@ -380,3 +380,26 @@ fn cluster_records_no_encrypted_blocks_when_absent() {
     assert_eq!(recs.len(), 1);
     assert!(recs[0].encrypted_blocks.is_empty());
 }
+
+#[test]
+fn revisiting_a_cluster_records_its_encrypted_blocks_once() {
+    // Seeking back to the start walks the Cluster again. Its EncryptedBlocks
+    // are already on its record, so they are not appended a second time.
+    let mut cluster = Vec::new();
+    cluster.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
+    cluster.extend_from_slice(&simple_block(1, 0, true, 0xAA));
+    cluster.extend_from_slice(&encrypted_block(b"\x81\x00\x00\x80enc-one"));
+    cluster.extend_from_slice(&encrypted_block(b"\x81\x00\x10\x80enc-two"));
+    let mut dmx = open(build_segment(&[cluster]));
+    for _ in 0..3 {
+        while dmx.next_packet().is_ok() {}
+        dmx.seek_to(0, 0).expect("seek to the start");
+    }
+    let recs = dmx.cluster_records();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(
+        recs[0].encrypted_blocks,
+        vec![b"\x81\x00\x00\x80enc-one".to_vec(), b"\x81\x00\x10\x80enc-two".to_vec()],
+        "a revisited Cluster's EncryptedBlocks must be recorded once"
+    );
+}
