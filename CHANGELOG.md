@@ -118,8 +118,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   EBML string. Any Top-Level element but a Cluster with the unknown size,
   or with an end past its Segment, is damage, rescanned from the end of
   its header, so a Cluster behind it is still found; between Clusters it
-  is Cluster-stream damage. An AttachedFile or FileData of unknown size is
-  damage too, and the Attachments keep what came before it. `SegmentUUID`, `PrevUUID` and
+  is Cluster-stream damage, and a seek scanning the Clusters steps past it
+  the same way. An AttachedFile or FileData of unknown size is damage too,
+  and the Attachments keep what came before it, UIDs included: a UID names
+  its attachment only once the attachment is kept. `SegmentUUID`, `PrevUUID` and
   `NextUUID` must be 16 octets. Text fields of `Info`, `Chapters` and
   `Attachments` hold at most 64 KiB, checked before a read, and each of
   the three keeps at most 1 MiB. Past it, `Chapters` and `Attachments`
@@ -133,8 +135,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   charged to the master's 32 MiB limit before it is allocated, and the
   per-stream views and extradata take the parsed data instead of copying
   it. A compressed CodecPrivate, LZO included, is decompressed only as far
-  as its budget allows, and its stored form gives its room back once the
-  decoded form replaces it. A mid-stream `Tags` replaces the previous
+  as its budget allows, using the room kept for parsing a codec
+  configuration as working room, and its stored form's charge passes to
+  the decoded form. A mid-stream `Tags` replaces the previous
   flat entries in one cut, freeing their room first. H.264 Annex B NAL
   units are split without buffering their offsets, and an AV1 temporal
   unit is read for its key frame without listing its OBUs. The Cues index

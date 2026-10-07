@@ -608,11 +608,13 @@ fn open_typed_impl(
     // A `CodecPrivate` compressed by the track's ContentEncodings (scope
     // bit 0x2, RFC 9559 §5.1.4.1.31.3) is decompressed before anything
     // reads it; one that fails to decompress is dropped, as FFmpeg does.
-    // Output past the CodecPrivate budget, or past half of what the Tracks
-    // records may still keep (an output buffer can double as it grows), is
-    // invalid data instead. The stored form, charged at its length when it
-    // was read and freed once decoded, gives its room back after the
-    // decoded form is charged.
+    // While it decodes, the stored form stays charged and the output may
+    // use what the Tracks records may still keep together with the room
+    // reserved for parsing a codec configuration, which runs only later:
+    // output past the CodecPrivate budget, or past half of that room (an
+    // output buffer can double as it grows), is invalid data instead. Once
+    // decoded, the stored form is gone, and its charge passes to the
+    // decoded form.
     let mut private_total: usize = tracks.iter().map(|t| t.codec_private.len()).sum();
     for t in &mut tracks {
         let chain = t
@@ -626,7 +628,7 @@ fn open_typed_impl(
                 private_total -= stored_len;
                 let budget = MAX_CODEC_PRIVATE
                     .min(MAX_CODEC_PRIVATE_TOTAL.saturating_sub(private_total))
-                    .min(track_budget.left() / 2);
+                    .min(track_budget.working_room() / 2);
                 t.codec_private = match content::decompress(&chain, stored, budget) {
                     Ok(data) => data,
                     Err(content::Undo::Corrupt(_)) => Vec::new(),
@@ -634,8 +636,8 @@ fn open_typed_impl(
                         return Err(Error::invalid("MKV: CodecPrivate exceeds its budget"));
                     }
                 };
-                track_budget.charge(t.codec_private.capacity())?;
                 track_budget.release(stored_len);
+                track_budget.charge(t.codec_private.capacity())?;
                 track_budget.reserve_scratch(t.codec_private.len())?;
                 private_total += t.codec_private.len();
             }
@@ -7855,7 +7857,9 @@ fn parse_chap_process_command(r: &mut dyn ReadSeek, end: u64, budget: &mut Budge
 /// the latest, and every other element must fit its parent. When the
 /// budget runs out or the data is damaged, the AttachedFile being read is
 /// dropped with every one after it, the reader is left at `end`, and the
-/// offset of that first dropped element is returned.
+/// offset of that first dropped element is returned. A UID names its
+/// attachment in the index only once the attachment is kept, so a dropped
+/// one leaves the index as it was.
 fn parse_attachments(
     r: &mut dyn ReadSeek,
     end: u64,
@@ -7870,7 +7874,7 @@ fn parse_attachments(
         if at >= end {
             return Ok(None);
         }
-        let kept = (metadata.len(), idx);
+        let kept = metadata.len();
         let parsed = read_element_header(r).and_then(|e| match e.id {
             ids::ATTACHED_FILE => {
                 // Only a Segment or a Cluster may leave its size open; a
@@ -7891,11 +7895,8 @@ fn parse_attachments(
         });
         if let Err(err) = parsed {
             cut_short(err, budget)?;
-            // Drop what an AttachedFile that did not fit lifted.
-            metadata.truncate(kept.0);
-            if idx != kept.1 {
-                attachment_uid_to_index.retain(|_, i| *i != idx);
-            }
+            // Drop the flat entries an AttachedFile that did not fit lifted.
+            metadata.truncate(kept);
             r.seek(SeekFrom::Start(end))?;
             return Ok(Some(at));
         }
@@ -7946,8 +7947,6 @@ fn parse_attached_file(
                 let v = read_uint(r, e.size as usize)?;
                 if v != 0 {
                     uid = v;
-                    budget.map_room(attachment_uid_to_index)?;
-                    attachment_uid_to_index.insert(v, index);
                 }
             }
             ids::FILE_REFERRAL => {
@@ -7995,6 +7994,11 @@ fn parse_attached_file(
             keep_entry(metadata, format!("attachment:{index}:description"), d, budget)?;
         }
     }
+    // The UID names this attachment only once it is kept: one dropped here
+    // or by the caller leaves the index as it was, its room charged first.
+    if uid != 0 {
+        budget.map_room(attachment_uid_to_index)?;
+    }
     budget.room(attachments)?;
     attachments.push(Attachment {
         index,
@@ -8009,6 +8013,9 @@ fn parse_attached_file(
         used_start_time,
         used_end_time,
     });
+    if uid != 0 {
+        attachment_uid_to_index.insert(uid, index);
+    }
     Ok(())
 }
 
@@ -9160,6 +9167,13 @@ impl Budget {
     /// What the budget may still charge.
     fn left(&self) -> usize {
         self.left
+    }
+
+    /// What a buffer made while no working buffer is held may use: what
+    /// the budget may still charge and the room reserved for working
+    /// buffers — see [`Self::reserve_scratch`].
+    fn working_room(&self) -> usize {
+        self.left.saturating_add(self.scratch)
     }
 
     /// Give back `bytes` charged for a buffer that has since been freed.
@@ -12361,10 +12375,12 @@ impl MkvDemuxer {
     /// case.
     ///
     /// Damage-tolerant like the rest of the resilient stream walk: an
-    /// unparseable stretch is stepped over with the same Top-Level scan
-    /// `next_packet` resynchronisation uses (no [`DamageEvent`] is
-    /// recorded — the scan is navigation, not packet loss). The source's
-    /// own failure is returned, not stepped over.
+    /// unparseable stretch, or an element other than a Cluster with no end
+    /// inside the Segment, is stepped over with the same Top-Level scan
+    /// `next_packet` resynchronisation uses, from the end of its header for
+    /// the latter (no [`DamageEvent`] is recorded — the scan is navigation,
+    /// not packet loss). The source's own failure is returned, not stepped
+    /// over.
     fn seek_by_cluster_scan(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
         let target_ticks = self.stream_pts_to_ticks(stream_index, pts);
         // A zero-Cluster Segment has nothing to scan — same signal the
@@ -12405,10 +12421,20 @@ impl MkvDemuxer {
                 }
             };
             let body_start = self.input.stream_position()?;
+            // The element's end inside the Segment. A Cluster's end is
+            // clamped to the Segment, as the walk clamps it. Any other
+            // element of unknown size, or whose end runs past the Segment,
+            // is damage the walk rescans past from the end of its header
+            // (see `advance`): it gets no end, so the scan below does too.
             let bounded_end = if e.size == VINT_UNKNOWN_SIZE {
                 None
             } else {
-                Some(body_start.saturating_add(e.size).min(self.segment_data_end))
+                let end = body_start.saturating_add(e.size);
+                if e.id == ids::CLUSTER {
+                    Some(end.min(self.segment_data_end))
+                } else {
+                    (end <= self.segment_data_end).then_some(end)
+                }
             };
             if e.id == ids::CLUSTER {
                 // Pull the Cluster's Timestamp from its leading children.
@@ -12457,7 +12483,8 @@ impl MkvDemuxer {
             // Advance to the next Top-Level element: directly for a
             // bounded element, over the children of an unknown-size
             // Cluster (its end is only defined by the next sibling —
-            // §6.2), by scanning for anything else.
+            // §6.2), by scanning from the end of its header for anything
+            // else.
             let next = match bounded_end {
                 Some(end) => Some(end),
                 None if e.id == ids::CLUSTER => self.unknown_size_cluster_end(body_start)?,
@@ -12540,10 +12567,17 @@ impl MkvDemuxer {
                 body_start.saturating_add(e.size).min(self.segment_data_end)
             };
             if e.id != ids::CLUSTER {
-                if unknown_size {
-                    break;
+                // An element of unknown size, or whose end runs past the
+                // Segment, is damage the walk rescans past from the end of
+                // its header (see `advance`); so does the search.
+                if unknown_size || body_start.saturating_add(e.size) > self.segment_data_end {
+                    match scan_top_level_element(&mut *self.input, body_start, end)? {
+                        Some(next) => pos = next,
+                        None => break,
+                    }
+                } else {
+                    pos = walk_end;
                 }
-                pos = walk_end;
                 continue;
             }
             // The body end the Cluster walk uses — see `advance`.

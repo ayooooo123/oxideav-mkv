@@ -122,15 +122,18 @@ rest of the Segment. Every element in a `Tracks`, `Tags`, `Chapters`,
 `Cues` or `SeekHead` tree must fit its parent, as in `Info`; in
 `Attachments`, an `AttachedFile` ends with its parent at the latest, its
 fields must fit it, and neither it nor its `FileData` may have the unknown
-size. In the EBML header, every child must fit the header, and its
+size; its UID names it only once it is kept, so one dropped as damage
+leaves the UIDs of those kept before it. In the EBML header, every child
+must fit its parent, and its
 `DocType` and `DocTypeExtension` records keep at most 16 MiB together,
 FFmpeg's limit for one EBML string; past either, both opens fail. RFC 9559
 allows the unknown size on a Segment and a Cluster alone, so any other
 Top-Level element of unknown size is damage, and so is one whose declared
 end runs past its Segment: the walk rescans from the end of its header,
 within the same budget. Between Clusters such an element is damage in the
-Cluster stream, so the walk resumes at the next Cluster; a SeekHead target
-of unknown size is ignored unread. A target whose parse finds damage, or a
+Cluster stream, so the walk resumes at the next Cluster, and a seek
+scanning the Clusters steps past it the same way; a SeekHead target of
+unknown size is ignored unread. A target whose parse finds damage, or a
 master larger than its budget, in line or found through the SeekHead, is
 noted as a damaged master; a `Tags` or `SeekHead` found through the
 SeekHead keeps its complete records before the damage, as one in line
@@ -153,8 +156,9 @@ per-stream views, tag resolution with its flat entries, and working room
 for parsing a codec configuration. The per-stream views take the parsed
 data instead of copying it, and a stream's extradata takes its
 CodecPrivate bytes; a compressed CodecPrivate is decompressed only as far
-as its budget allows, and its stored form gives its room back once the
-decoded form replaces it. An `Info` or `Tracks` master past its budget is
+as its budget allows, using the room kept for parsing a codec
+configuration as working room, and its stored form's charge passes to the
+decoded form. An `Info` or `Tracks` master past its budget is
 InvalidData: a strict open fails and a resilient open skips it. A `Tags`
 master past its budget is dropped, or cut to the Tags that fit. A
 mid-stream `Tags` may use what the current tag state leaves of the 32 MiB;

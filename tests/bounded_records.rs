@@ -276,10 +276,11 @@ fn an_lzo_codec_private_stays_within_the_tracks_limit() {
 }
 
 /// Four CodecPrivates of 4 MiB less one octet, each restored to 4 MiB by
-/// header stripping, make up the 16 MiB CodecPrivate total exactly: a
-/// stored buffer gives its room back once its decoded form replaces it, so
-/// all four open, byte for byte, in either open. Two octets more are past
-/// the total.
+/// header stripping, make up the 16 MiB CodecPrivate total exactly. Their
+/// decoding may use the working room kept for parsing a codec
+/// configuration, and a stored buffer's charge passes to its decoded form,
+/// so all four open byte for byte in either open, as the only tracks or
+/// among 256, every stream kept. Two octets more are past the total.
 #[test]
 fn codec_privates_restored_to_their_16_mib_total_open() {
     let _serial = serial();
@@ -295,14 +296,21 @@ fn codec_privates_restored_to_their_16_mib_total_open() {
     };
     let stored: Vec<u8> = (0..(4u32 << 20) - 1).map(|i| (i % 251) as u8).collect();
     let four: Vec<u8> = (1..=4u64).flat_map(|n| entry(n, &stored)).collect();
+    let many = [four.clone(), (5..=256u64).flat_map(|n| elem(ids::TRACK_ENTRY, &track_fields(n))).collect()].concat();
     let mut failures = Vec::new();
-    for resilient in [false, true] {
-        let (d, _, _) = opened(file(&[elem(ids::TRACKS, &four), cluster()]), resilient);
-        let exact = d.as_ref().map(|d| {
-            d.streams().iter().zip(1u8..).all(|(s, n)| s.params.extradata.first() == Some(&n) && s.params.extradata.get(1..) == Some(&stored[..]))
-        });
-        if exact != Ok(true) {
-            failures.push(format!("four restored CodecPrivates, resilient {resilient}: {exact:?}"));
+    for (case, entries, count) in [("four tracks", &four, 4), ("256 tracks", &many, 256)] {
+        for resilient in [false, true] {
+            let (d, _, _) = opened(file(&[elem(ids::TRACKS, entries), cluster()]), resilient);
+            let got = d.map(|mut d| {
+                let streams = d.streams();
+                let restored = streams.iter().take(4).zip(1u8..).all(|(s, n)| {
+                    s.params.extradata.first() == Some(&n) && s.params.extradata.get(1..) == Some(&stored[..])
+                });
+                (streams.len(), restored, d.next_packet().map(|p| p.data).ok())
+            });
+            if got != Ok((count, true, Some(b"a".to_vec()))) {
+                failures.push(format!("{case}, resilient {resilient}: (streams, first four restored, first packet) {got:?}"));
+            }
         }
     }
     let five = [four, entry(5, &[5])].concat();
