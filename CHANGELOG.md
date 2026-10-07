@@ -49,9 +49,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`container_keyframe`) on lace 0 only, independently of parser keyframe
   flags. Metadata stays associated with queued and virtual-track packets
   and clears before every read/seek, including errors and EOF. This needs
-  the core `a6ccbf96` API and a consumer that snapshots each packet's metadata;
-  audio trimming is not yet implemented. The standalone fuzz workspace pins
-  the same core API because Cargo does not inherit dependency-level patches.
+  the core `a6ccbf96` API and a consumer that snapshots each packet's metadata.
+  The standalone fuzz workspace pins the same core API because Cargo does
+  not inherit dependency-level patches.
+- Audio packets carry `PacketMetadata::audio_trim`, as FFmpeg's matroska
+  demuxer attaches `AV_PKT_DATA_SKIP_SAMPLES`: a track's first packet skips
+  its `CodecDelay`, whose length every timestamp of the track now moves
+  back by, rounded to the nearest tick; each packet of a Block with
+  `DiscardPadding` drops it from its end, or from its start when negative;
+  after a seek the track's first packet skips its `SeekPreRoll`, or its
+  `CodecDelay` when the seek lands on the track's start. Counts are at
+  48 kHz for Opus and at the stream's rate otherwise, and saturate; an
+  Opus track's start skips leave out the `OpusHead` pre-skip a new Opus
+  decoder drops itself. Seek targets stay in the Blocks' own timeline, as
+  FFmpeg's Cue index does.
 - Open follows nested SeekHeads for trailing Info and Tracks, including
   tracks after an unknown-size Cluster. Cycles and excessive index chains
   are bounded. Empty frames without BlockAdditions no longer emit packets.

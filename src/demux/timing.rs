@@ -225,7 +225,7 @@ fn floor_ticks(samples: u32, rate: u32, tb: TimeBase) -> Option<i64> {
 
 /// `a * b / c`, rounded to nearest with halves away from zero; `None` on
 /// overflow or a zero divisor.
-fn rescale_near(a: i128, b: i128, c: i128) -> Option<i128> {
+pub(super) fn rescale_near(a: i128, b: i128, c: i128) -> Option<i128> {
     if c <= 0 {
         return None;
     }

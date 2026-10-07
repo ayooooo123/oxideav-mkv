@@ -7,6 +7,7 @@
 //! one at a time, extracting frames from `SimpleBlock` and `BlockGroup →
 //! Block` elements (lacing-aware) as the reader reaches them.
 
+mod audio_trim;
 mod content;
 mod framing;
 mod parser;
@@ -17,7 +18,7 @@ mod webvtt;
 use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_core::{
-    CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, PacketMetadata,
+    AudioTrim, CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, PacketMetadata,
     ProbeContext, Result, SampleFormat, StreamInfo, TimeBase, WebVttMetadata,
 };
 use oxideav_core::{Demuxer, ReadSeek};
@@ -1038,6 +1039,27 @@ fn open_typed_impl(
         })
         .collect();
 
+    // Per stream, the `CodecDelay` every timestamp moves back by, and the
+    // trims an audio stream's packets carry with where the next packet
+    // takes its start trim from — see `audio_trim`.
+    let codec_delay_ticks: Vec<i64> = streams
+        .iter()
+        .zip(&track_codec_timing)
+        .map(|(s, t)| audio_trim::delay_ticks(t.codec_delay(), s.time_base))
+        .collect();
+    let track_trims: Vec<Option<audio_trim::TrackTrims>> = streams
+        .iter()
+        .zip(&track_codec_timing)
+        .map(|(s, t)| {
+            let rate = s.params.sample_rate.unwrap_or(0);
+            let opus = (s.params.codec_id.as_str() == "opus").then(|| audio_trim::opus_pre_skip(&s.params.extradata));
+            (s.params.media_type == MediaType::Audio)
+                .then(|| audio_trim::TrackTrims::new(t.codec_delay(), t.seek_pre_roll(), rate, opus))
+                .flatten()
+        })
+        .collect();
+    let start_trims = track_trims.iter().map(|t| t.map_or(audio_trim::Pending::None, |t| t.at_open())).collect();
+
     // Per-stream `TrackIdentity` (RFC 9559 §5.1.4.1.18 / .19 / .20 / .23 / .4 /
     // .5 / .12 / .24), indexed by stream index. A record surfaces for every
     // track (every element sits on `TrackEntry` directly, no gating master).
@@ -1289,6 +1311,9 @@ fn open_typed_impl(
         frame_parsers,
         packet_clocks,
         decode_orders,
+        codec_delay_ticks,
+        track_trims,
+        start_trims,
         timestamps_primed: false,
         timestamp_probe_bytes: 0,
         deferred_block: None,
@@ -9850,16 +9875,18 @@ struct ScanKeyframe {
 /// * `meta` — the non-`Block` `BlockGroup` children (`ReferenceBlock` /
 ///   `ReferencePriority` / `CodecState` / `DiscardPadding` plus the
 ///   reclaimed Appendix-A children). Same sharing rule.
-/// * `webvtt` and `container_keyframe` — the packet's own
-///   [`PacketMetadata`]: a D_WEBVTT cue's identifier and settings, and the
+/// * `webvtt`, `container_keyframe` and `audio_trim` — the packet's own
+///   [`PacketMetadata`]: a D_WEBVTT cue's identifier and settings, the
 ///   Block's random-access indication (SimpleBlock keyframe bit, or a
-///   BlockGroup without ReferenceBlock) on its first lace.
+///   BlockGroup without ReferenceBlock) on its first lace, and the samples
+///   to drop from its decoded audio (see `audio_trim`).
 struct QueuedPacket {
     packet: Packet,
     additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
     meta: Option<std::sync::Arc<BlockGroupMeta>>,
     webvtt: Option<std::sync::Arc<WebVttMetadata>>,
     container_keyframe: bool,
+    audio_trim: Option<AudioTrim>,
     /// `Some` when the packet was synthesised by TrackOperation
     /// application (RFC 9559 §18.8) rather than read from its own track's
     /// Block — see [`MkvDemuxer::virtual_packet_origin`].
@@ -10003,6 +10030,14 @@ pub struct MkvDemuxer {
     frame_parsers: Vec<Option<parser::FrameParser>>,
     packet_clocks: Vec<timing::PacketClock>,
     decode_orders: Vec<Option<timing::DecodeOrder>>,
+    /// Per stream, the ticks its `CodecDelay` moves every timestamp back
+    /// by — see `audio_trim`.
+    codec_delay_ticks: Vec<i64>,
+    /// Per stream, the trims an audio stream's packets carry.
+    track_trims: Vec<Option<audio_trim::TrackTrims>>,
+    /// Per stream, where the next packet takes its start trim from: the
+    /// open, a seek or nowhere.
+    start_trims: Vec<audio_trim::Pending>,
     timestamps_primed: bool,
     timestamp_probe_bytes: usize,
     /// The Block waiting for queue room — see [`DeferredBlock`].
@@ -10214,6 +10249,7 @@ impl Demuxer for MkvDemuxer {
                     self.last_virtual_origin = q.origin;
                     self.last_metadata.webvtt = q.webvtt;
                     self.last_metadata.container_keyframe = q.container_keyframe;
+                    self.last_metadata.audio_trim = q.audio_trim;
                     return Ok(q.packet);
                 }
             }
@@ -10452,6 +10488,13 @@ impl MkvDemuxer {
         self.clear_packet_metadata();
         self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
         self.decode_orders.iter_mut().flatten().for_each(timing::DecodeOrder::reset);
+        // The decoder starts over: each audio stream's next packet says what
+        // the new position needs — see `audio_trim`.
+        for (pending, trims) in self.start_trims.iter_mut().zip(&self.track_trims) {
+            if trims.is_some() {
+                *pending = audio_trim::Pending::Seek;
+            }
+        }
         self.timestamp_probe_bytes = 0;
         self.resync_floor = 0;
     }
@@ -13142,7 +13185,7 @@ impl MkvDemuxer {
         let mut queued = Vec::with_capacity(packets);
         let time_base = self.streams[si].time_base;
         let track_scale = self.track_timing[si].track_timestamp_scale();
-        let mut block_pts = if cluster_timecode >= 0
+        let block_pts = if cluster_timecode >= 0
             && (timecode_offset >= 0 || cluster_timecode >= -timecode_offset)
         {
             Some(((cluster_timecode as f64 / track_scale) as u64)
@@ -13153,6 +13196,13 @@ impl MkvDemuxer {
             // negative PTS. Duration interpolation starts relative to zero.
             None
         };
+        // A track's CodecDelay moves its timestamps back, and a Block at or
+        // before its time 0 is the track's start — see `audio_trim`.
+        let at_start = block_pts.map_or(true, |pts| pts <= 0);
+        let mut block_pts = block_pts.map(|pts| pts.saturating_sub(self.codec_delay_ticks[si]));
+        let trims = self.track_trims[si];
+        let own_trim = trims.and_then(|t| t.padding(meta.as_ref().and_then(|m| m.discard_padding())));
+        let mut pending = self.start_trims[si];
         let n_frames = sizes.len().max(1) as i128;
         // FFmpeg 9 computes the whole Block duration in segment ticks first,
         // then distributes the integer remainder between laces.
@@ -13246,7 +13296,17 @@ impl MkvDemuxer {
             // storage order is coding order per §10 ("Frames using
             // references SHOULD be stored in 'coding order'"), which a
             // PTS re-sort would break. The Block's side channels attach to
-            // the Block itself, so each copy shares them.
+            // the Block itself, so each copy shares them, the audio trim
+            // included. The stream's first packet since the open or a seek
+            // takes its start trim.
+            let audio_trim = match trims {
+                Some(t) if pending != audio_trim::Pending::None => {
+                    let start = t.start(pending, at_start, own_trim);
+                    pending = audio_trim::Pending::None;
+                    start
+                }
+                _ => own_trim,
+            };
             queued.push(QueuedPacket {
                 packet: pkt,
                 additions: additions.clone(),
@@ -13254,6 +13314,7 @@ impl MkvDemuxer {
                 origin: None,
                 webvtt: webvtt.clone(),
                 container_keyframe,
+                audio_trim,
             });
             if self.apply_track_operations {
                 let source = queued.len() - 1;
@@ -13267,10 +13328,13 @@ impl MkvDemuxer {
                         origin: Some(origin),
                         webvtt: webvtt.clone(),
                         container_keyframe,
+                        audio_trim,
                     });
                 }
             }
         }
+        // The packets are queued: the start trim is spent.
+        self.start_trims[si] = pending;
         if !self.timestamps_primed {
             self.timestamp_probe_bytes = self.timestamp_probe_bytes.saturating_add(probe_charge);
         }
