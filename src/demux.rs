@@ -1052,7 +1052,7 @@ fn open_typed_impl(
         .zip(&track_codec_timing)
         .map(|(s, t)| {
             let rate = s.params.sample_rate.unwrap_or(0);
-            let opus = (s.params.codec_id.as_str() == "opus").then(|| audio_trim::opus_pre_skip(&s.params.extradata));
+            let opus = s.params.codec_id.as_str() == "opus";
             (s.params.media_type == MediaType::Audio)
                 .then(|| audio_trim::TrackTrims::new(t.codec_delay(), t.seek_pre_roll(), rate, opus))
                 .flatten()

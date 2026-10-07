@@ -4,8 +4,7 @@
 //! with every timestamp of the track moved back by it; a Block's
 //! `DiscardPadding` on each of its packets; and after a seek, the track's
 //! `SeekPreRoll` on the first packet that follows, or its `CodecDelay`
-//! where the seek lands on the track's start. An Opus track's start skips
-//! leave out the `OpusHead` pre-skip a new Opus decoder drops itself.
+//! where the seek lands on the track's start.
 
 use std::io::Cursor;
 
@@ -47,9 +46,9 @@ fn audio_track(codec: &str, rate: f64, private: &[u8], timing: &[u8]) -> Vec<u8>
     ].concat()))
 }
 
-/// An `OpusHead` for two channels with `pre_skip` samples of pre-skip.
-fn opus_head(pre_skip: u16) -> Vec<u8> {
-    [&b"OpusHead"[..], &[1, 2], &pre_skip.to_le_bytes(), &48_000u32.to_le_bytes(), &[0, 0, 0]].concat()
+/// An `OpusHead` for two channels with a 312-sample pre-skip.
+fn opus_head() -> Vec<u8> {
+    [&b"OpusHead"[..], &[1, 2], &312u16.to_le_bytes(), &48_000u32.to_le_bytes(), &[0, 0, 0]].concat()
 }
 
 /// `CodecDelay` of 6.5 ms (312 samples) and `SeekPreRoll` of 80 ms (3840
@@ -77,11 +76,10 @@ fn cluster(tc: u64, blocks: &[Vec<u8>]) -> Vec<u8> {
     elem(ids::CLUSTER, &[uint(ids::TIMECODE, tc), blocks.concat()].concat())
 }
 
-/// Three Clusters a second apart, each of fifty 20 ms Opus packets, with
-/// an `OpusHead` pre-skip of `pre_skip`. The last packet's Block carries a
-/// `DiscardPadding` of 13.5 ms: 648 samples.
-fn opus_file(pre_skip: u16, timing: &[u8]) -> Vec<u8> {
-    let mut segment = vec![audio_track("A_OPUS", 48_000.0, &opus_head(pre_skip), timing)];
+/// Three Clusters a second apart, each of fifty 20 ms Opus packets. The
+/// last one's Block carries a `DiscardPadding` of 13.5 ms: 648 samples.
+fn opus_file(timing: &[u8]) -> Vec<u8> {
+    let mut segment = vec![audio_track("A_OPUS", 48_000.0, &opus_head(), timing)];
     for c in 0..3u64 {
         let mut blocks: Vec<Vec<u8>> = (0..50).map(|i| simple(i * 20, &OPUS)).collect();
         if c == 2 {
@@ -125,28 +123,22 @@ fn seek(d: &mut MkvDemuxer, target: i64) -> (i64, Option<AudioTrim>, Option<i64>
 /// The track's first packet skips its `CodecDelay`, counted at 48 kHz for
 /// Opus and at the track's rate otherwise, and every timestamp of the track
 /// moves back by it, rounded to the nearest tick: 7 ms for Opus, 21 ms for
-/// AAC. An Opus decoder drops its `OpusHead` pre-skip itself, so the skip
-/// is what that leaves of the delay. The last packet discards its Block's
-/// padding.
+/// AAC. The last packet discards its Block's padding.
 #[test]
 fn codec_delay_trims_the_first_packet_and_moves_every_timestamp_back() {
-    // The usual pre-skip, equal to the delay: the decoder drops all of it.
-    let opus = drained(&mut open(opus_file(312, &opus_timing())));
+    let opus = drained(&mut open(opus_file(&opus_timing())));
     assert_eq!(opus.len(), 150);
-    assert_eq!(opus[0], (Some(-7), None));
+    assert_eq!(opus[0], (Some(-7), trim(312, 0, 48_000)));
     assert_eq!(opus[1], (Some(13), None));
     assert!(opus[1..149].iter().all(|(_, t)| t.is_none()), "{opus:?}");
     assert_eq!(opus[149], (Some(2973), trim(0, 648, 48_000)));
-    // Less pre-skip than delay: the trim takes the rest.
-    assert_eq!(drained(&mut open(opus_file(0, &opus_timing())))[0], (Some(-7), trim(312, 0, 48_000)));
-    assert_eq!(drained(&mut open(opus_file(100, &opus_timing())))[0], (Some(-7), trim(212, 0, 48_000)));
     let aac = drained(&mut open(aac_file()));
     let pts: Vec<Option<i64>> = aac.iter().map(|(pts, _)| *pts).collect();
     assert_eq!(pts, [-21, 0, 21, 979, 1000, 1021].map(Some));
     assert_eq!(aac[0].1, trim(1024, 0, 48_000));
     assert!(aac[1..].iter().all(|(_, t)| t.is_none()), "{aac:?}");
     // Without a CodecDelay nothing moves and nothing is skipped.
-    let plain = drained(&mut open(opus_file(0, &[])));
+    let plain = drained(&mut open(opus_file(&[])));
     assert_eq!(plain[0], (Some(0), None));
     assert_eq!(plain[149], (Some(2980), trim(0, 648, 48_000)));
 }
@@ -170,8 +162,8 @@ fn discard_padding_trims_each_packet_of_its_block() {
         drained(&mut open(file(&[track, cluster(0, &blocks)]))).into_iter().map(|(_, t)| t).collect()
     };
     let opus = [None, trim(120, 0, 48_000), trim(0, 240, 48_000), trim(0, 240, 48_000), None];
-    assert_eq!(trims(audio_track("A_OPUS", 48_000.0, &opus_head(312), &[])), opus);
-    assert_eq!(trims(audio_track("A_OPUS", 44_100.0, &opus_head(312), &[])), opus);
+    assert_eq!(trims(audio_track("A_OPUS", 48_000.0, &opus_head(), &[])), opus);
+    assert_eq!(trims(audio_track("A_OPUS", 44_100.0, &opus_head(), &[])), opus);
     // 2.5 ms and 5 ms at 44.1 kHz: 110.25 and 220.5 samples, to the nearest.
     let aac = trims(audio_track("A_AAC", 44_100.0, &[0x12, 0x10], &[]));
     assert_eq!(aac, [None, trim(110, 0, 44_100), trim(0, 221, 44_100), trim(0, 221, 44_100), None]);
@@ -179,18 +171,14 @@ fn discard_padding_trims_each_packet_of_its_block() {
 
 /// After a seek the first packet skips the track's `SeekPreRoll`, decoded
 /// and dropped while the decoder settles, or, where the seek lands on the
-/// track's start, its `CodecDelay` as at the open, less the pre-skip the
-/// new Opus decoder drops itself. The metadata is empty until that packet
-/// is read, and the packets after it trim nothing.
+/// track's start, its `CodecDelay` as at the open. The metadata is empty
+/// until that packet is read, and the packets after it trim nothing.
 #[test]
 fn a_seek_skips_the_seek_pre_roll_or_the_codec_delay_at_the_start() {
-    let mut d = open(opus_file(312, &opus_timing()));
-    assert_eq!(seek(&mut d, 1000), (1000, None, Some(993), trim(3528, 0, 48_000)));
+    let mut d = open(opus_file(&opus_timing()));
+    assert_eq!(seek(&mut d, 1000), (1000, None, Some(993), trim(3840, 0, 48_000)));
     assert_eq!(drained(&mut d)[0], (Some(1013), None));
-    assert_eq!(seek(&mut d, 0), (0, None, Some(-7), None));
-    let mut d = open(opus_file(0, &opus_timing()));
-    assert_eq!(seek(&mut d, 1000).3, trim(3840, 0, 48_000));
-    assert_eq!(seek(&mut d, 0).3, trim(312, 0, 48_000));
+    assert_eq!(seek(&mut d, 0), (0, None, Some(-7), trim(312, 0, 48_000)));
     // Without a SeekPreRoll a seek inside the stream skips nothing.
     let mut d = open(aac_file());
     assert_eq!(seek(&mut d, 1000), (1000, None, Some(979), None));
@@ -203,7 +191,7 @@ fn a_seek_skips_the_seek_pre_roll_or_the_codec_delay_at_the_start() {
 fn trims_past_their_range_saturate() {
     let timing = [uint(ids::CODEC_DELAY, u64::MAX), uint(ids::SEEK_PRE_ROLL, u64::MAX)].concat();
     let blocks = [simple(0, &OPUS), padded(20, 0, &OPUS, i64::MAX), padded(40, 0, &OPUS, i64::MIN), simple(60, &OPUS)];
-    let bytes = file(&[audio_track("A_OPUS", 48_000.0, &opus_head(0), &timing), cluster(0, &blocks), cluster(1000, &blocks)]);
+    let bytes = file(&[audio_track("A_OPUS", 48_000.0, &opus_head(), &timing), cluster(0, &blocks), cluster(1000, &blocks)]);
     let mut d = open(bytes);
     let trims: Vec<Option<AudioTrim>> = drained(&mut d).into_iter().map(|(_, t)| t).collect();
     let max = u32::MAX;

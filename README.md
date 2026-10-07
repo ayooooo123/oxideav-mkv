@@ -78,14 +78,12 @@ track moves back by it, rounded to the nearest tick, as FFmpeg does. Each
 packet of a Block with `DiscardPadding` drops it from its end, or skips it
 from its start when negative. After a seek, the track's first packet skips
 its `SeekPreRoll`, or its `CodecDelay` when the seek lands on the track's
-start. Counts are at 48 kHz for Opus and at the stream's rate otherwise;
-counts too large for a trim saturate. A new Opus decoder drops its
-`OpusHead` pre-skip itself, and the player starts one at the open and after
-each seek, so an Opus track's start skips leave that pre-skip out: FFmpeg's
-total is the `CodecDelay` alone. Seek targets and landings stay in the
-Blocks' own timeline, as FFmpeg's Cue index does. On the FATE and generated
-corpora every packet's timestamp equals ffprobe's, and so does every trim
-but those Opus start skips.
+start. Counts are FFmpeg's, at 48 kHz for Opus and at the stream's rate
+otherwise; counts too large for a trim saturate. An Opus decoder's own
+`OpusHead` pre-skip is a default a consumer replaces with the container's
+skip, as libavcodec does. Seek targets and landings stay in the Blocks' own
+timeline, as FFmpeg's Cue index does. On the FATE and generated corpora
+every packet's timestamp and trim equal ffprobe's.
 
 Startup DTS analysis holds at most 1024 packets, counting virtual-track
 copies. A Block emits exactly the frames its lace declares, counted before

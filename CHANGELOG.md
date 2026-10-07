@@ -58,11 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   back by, rounded to the nearest tick; each packet of a Block with
   `DiscardPadding` drops it from its end, or from its start when negative;
   after a seek the track's first packet skips its `SeekPreRoll`, or its
-  `CodecDelay` when the seek lands on the track's start. Counts are at
-  48 kHz for Opus and at the stream's rate otherwise, and saturate; an
-  Opus track's start skips leave out the `OpusHead` pre-skip a new Opus
-  decoder drops itself. Seek targets stay in the Blocks' own timeline, as
-  FFmpeg's Cue index does.
+  `CodecDelay` when the seek lands on the track's start. Counts are
+  FFmpeg's, at 48 kHz for Opus and at the stream's rate otherwise, and
+  saturate. Seek targets stay in the Blocks' own timeline, as FFmpeg's Cue
+  index does.
 - Open follows nested SeekHeads for trailing Info and Tracks, including
   tracks after an unknown-size Cluster. Cycles and excessive index chains
   are bounded. Empty frames without BlockAdditions no longer emit packets.

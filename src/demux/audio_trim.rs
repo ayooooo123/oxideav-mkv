@@ -25,13 +25,11 @@
 //! Counts are in the track's rate: 48 kHz for Opus, the rate FFmpeg's Opus
 //! decoder sets for the stream whatever its `SamplingFrequency` says, else
 //! the rate the stream reports, FFmpeg's `sample_rate` for the files
-//! FFmpeg writes. A new Opus decoder drops its `OpusHead` pre-skip from its
-//! first output itself, and the player starts a new decoder at the open and
-//! after every seek, so an Opus track's start skips count only what the
-//! pre-skip leaves: none for a `CodecDelay` equal to it, as FFmpeg's total
-//! is the `CodecDelay` alone (the Ogg demuxer emits no start skip for the
-//! same reason). Counts too large for a trim saturate. A track without a
-//! rate gets no trims; its timestamps still move back by its `CodecDelay`.
+//! FFmpeg writes. They are FFmpeg's whole counts: an Opus decoder's own
+//! `OpusHead` pre-skip is a default a consumer replaces with a container's
+//! skip, as libavcodec does. Counts too large for a trim saturate. A track
+//! without a rate gets no trims; its timestamps still move back by its
+//! `CodecDelay`.
 
 use oxideav_core::{AudioTrim, TimeBase};
 
@@ -55,23 +53,22 @@ pub(super) enum Pending {
 pub(super) struct TrackTrims {
     /// The rate every count is in.
     rate: u32,
-    /// `CodecDelay` in samples, less what the decoder drops itself.
+    /// `CodecDelay` in samples.
     delay: u32,
-    /// `SeekPreRoll` in samples, less what the decoder drops itself.
+    /// `SeekPreRoll` in samples.
     pre_roll: u32,
 }
 
 impl TrackTrims {
-    /// The trims of a track at `rate` Hz whose `CodecDelay` and
-    /// `SeekPreRoll` are `codec_delay` and `seek_pre_roll` ns. An Opus
-    /// track, with the `pre_skip` of its `OpusHead`, counts at 48 kHz less
-    /// that pre-skip. `None` without a rate.
-    pub(super) fn new(codec_delay: u64, seek_pre_roll: u64, rate: u32, opus: Option<u32>) -> Option<Self> {
-        let (rate, pre_skip) = opus.map_or((rate, 0), |pre_skip| (48_000, pre_skip));
+    /// The trims of a track at `rate` Hz, or of an Opus track, whose
+    /// `CodecDelay` and `SeekPreRoll` are `codec_delay` and `seek_pre_roll`
+    /// ns. `None` without a rate.
+    pub(super) fn new(codec_delay: u64, seek_pre_roll: u64, rate: u32, opus: bool) -> Option<Self> {
+        let rate = if opus { 48_000 } else { rate };
         (rate > 0).then(|| Self {
             rate,
-            delay: samples(codec_delay.into(), rate).saturating_sub(pre_skip),
-            pre_roll: samples(seek_pre_roll.into(), rate).saturating_sub(pre_skip),
+            delay: samples(codec_delay.into(), rate),
+            pre_roll: samples(seek_pre_roll.into(), rate),
         })
     }
 
@@ -107,15 +104,6 @@ impl TrackTrims {
         } else {
             own
         }
-    }
-}
-
-/// The pre-skip an `OpusHead` (RFC 7845 §5.1) gives the decoder, which
-/// drops it itself; 0 without one, as the decoder then drops none.
-pub(super) fn opus_pre_skip(extradata: &[u8]) -> u32 {
-    match extradata {
-        [b'O', b'p', b'u', b's', b'H', b'e', b'a', b'd', _, _, low, high, ..] => u16::from_le_bytes([*low, *high]).into(),
-        _ => 0,
     }
 }
 
