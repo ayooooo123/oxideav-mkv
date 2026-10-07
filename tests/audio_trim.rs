@@ -34,16 +34,26 @@ fn file(segment: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
+/// An Audio master at `rate` Hz, stereo, with an OutputSamplingFrequency
+/// of `output` when given.
+fn audio(rate: f64, output: Option<f64>) -> Vec<u8> {
+    let output = output.map_or(Vec::new(), |o| elem(ids::OUTPUT_SAMPLING_FREQUENCY, &o.to_be_bytes()));
+    elem(ids::AUDIO, &[elem(ids::SAMPLING_FREQUENCY, &rate.to_be_bytes()), uint(ids::CHANNELS, 2), output].concat())
+}
+
+/// TrackEntry `number` of type `kind` with `codec`, its `private` data and
+/// the `extra` children.
+fn entry(number: u64, kind: u64, codec: &str, private: &[u8], extra: &[u8]) -> Vec<u8> {
+    elem(ids::TRACK_ENTRY, &[
+        uint(ids::TRACK_NUMBER, number), uint(ids::TRACK_UID, number), uint(ids::TRACK_TYPE, kind),
+        elem(ids::CODEC_ID, codec.as_bytes()), elem(ids::CODEC_PRIVATE, private), extra.to_vec(),
+    ].concat())
+}
+
 /// Audio track 1 at `rate` Hz, stereo, with `codec`, its `private` data and
 /// the `timing` children (`CodecDelay`, `SeekPreRoll`).
 fn audio_track(codec: &str, rate: f64, private: &[u8], timing: &[u8]) -> Vec<u8> {
-    let audio = elem(ids::AUDIO, &[
-        elem(ids::SAMPLING_FREQUENCY, &rate.to_be_bytes()), uint(ids::CHANNELS, 2),
-    ].concat());
-    elem(ids::TRACKS, &elem(ids::TRACK_ENTRY, &[
-        uint(ids::TRACK_NUMBER, 1), uint(ids::TRACK_UID, 1), uint(ids::TRACK_TYPE, ids::TRACK_TYPE_AUDIO),
-        elem(ids::CODEC_ID, codec.as_bytes()), elem(ids::CODEC_PRIVATE, private), audio, timing.to_vec(),
-    ].concat()))
+    elem(ids::TRACKS, &entry(1, ids::TRACK_TYPE_AUDIO, codec, private, &[audio(rate, None), timing.to_vec()].concat()))
 }
 
 /// An `OpusHead` for two channels with a 312-sample pre-skip.
@@ -187,17 +197,137 @@ fn a_seek_skips_the_seek_pre_roll_or_the_codec_delay_at_the_start() {
 
 /// Counts too large for a trim saturate; they never wrap or panic: the
 /// largest `CodecDelay`, `SeekPreRoll` and `DiscardPadding` either way.
+/// At 1 ms ticks the largest `CodecDelay` moves every timestamp back by
+/// 18,446,744,073,710 ticks.
 #[test]
 fn trims_past_their_range_saturate() {
     let timing = [uint(ids::CODEC_DELAY, u64::MAX), uint(ids::SEEK_PRE_ROLL, u64::MAX)].concat();
     let blocks = [simple(0, &OPUS), padded(20, 0, &OPUS, i64::MAX), padded(40, 0, &OPUS, i64::MIN), simple(60, &OPUS)];
     let bytes = file(&[audio_track("A_OPUS", 48_000.0, &opus_head(), &timing), cluster(0, &blocks), cluster(1000, &blocks)]);
     let mut d = open(bytes);
-    let trims: Vec<Option<AudioTrim>> = drained(&mut d).into_iter().map(|(_, t)| t).collect();
+    let (pts, trims): (Vec<Option<i64>>, Vec<Option<AudioTrim>>) = drained(&mut d).into_iter().unzip();
+    assert_eq!(pts, [0, 20, 40, 60, 1000, 1020, 1040, 1060].map(|t| Some(t - 18_446_744_073_710)));
     let max = u32::MAX;
     assert_eq!(trims, [
         trim(max, 0, 48_000), trim(0, max, 48_000), trim(max, 0, 48_000), None,
         None, trim(0, max, 48_000), trim(max, 0, 48_000), None,
     ]);
     assert_eq!(seek(&mut d, 1000).3, trim(max, 0, 48_000));
+}
+
+/// An Opus track with `extra` children, after an Info with a TimestampScale
+/// of `scale` ns.
+fn scaled_opus(scale: u64, extra: &[u8]) -> [Vec<u8>; 2] {
+    let track = entry(1, ids::TRACK_TYPE_AUDIO, "A_OPUS", &opus_head(), &[audio(48_000.0, None), extra.to_vec()].concat());
+    [elem(ids::INFO, &uint(ids::TIMECODE_SCALE, scale)), elem(ids::TRACKS, &track)]
+}
+
+/// Timestamps past the range of the time base saturate instead of
+/// wrapping. With 1 ns ticks the largest `CodecDelay` is more ticks than a
+/// timestamp holds: it moves the track back by `i64::MAX`, a packet at the
+/// largest Cluster Timestamp back to 0, and one that a TrackTimestampScale
+/// of 1.5 starts before zero to `i64::MIN`. With 4 s ticks, half a tick of
+/// `CodecDelay` rounds to one.
+#[test]
+fn timestamps_at_the_bounds_of_the_time_base_saturate() {
+    let delay = |ns: u64| uint(ids::CODEC_DELAY, ns);
+    let one_ns = [
+        scaled_opus(1, &delay(u64::MAX)).to_vec(),
+        vec![cluster(0, &[simple(0, &OPUS)]), cluster(i64::MAX as u64, &[simple(0, &OPUS)])],
+    ].concat();
+    let max = trim(u32::MAX, 0, 48_000);
+    assert_eq!(drained(&mut open(file(&one_ns))), [(Some(-i64::MAX), max), (Some(0), None)]);
+    // Cluster 60 scaled by 1.5 is tick 40; the Block is 50 before it.
+    let scale = elem(ids::TRACK_TIMESTAMP_SCALE, &1.5f64.to_be_bytes());
+    let before_zero = [scaled_opus(1, &[delay(u64::MAX), scale].concat()).to_vec(), vec![cluster(60, &[simple(-50, &OPUS)])]].concat();
+    assert_eq!(drained(&mut open(file(&before_zero))), [(Some(i64::MIN), max)]);
+    let four_s = [
+        scaled_opus(4_000_000_000, &delay(2_000_000_000)).to_vec(),
+        vec![cluster(0, &[simple(0, &OPUS)]), cluster(1, &[simple(0, &OPUS)])],
+    ].concat();
+    assert_eq!(drained(&mut open(file(&four_s))), [(Some(-1), trim(96_000, 0, 48_000)), (Some(0), None)]);
+}
+
+/// Opus track 1 starting at 100 ms: forty-five 20 ms packets from there in
+/// the first Cluster, then fifty in a Cluster at 1000 ms.
+fn late_opus_file() -> Vec<u8> {
+    let first: Vec<Vec<u8>> = (0..45).map(|i| simple(100 + i * 20, &OPUS)).collect();
+    let second: Vec<Vec<u8>> = (0..50).map(|i| simple(i * 20, &OPUS)).collect();
+    file(&[audio_track("A_OPUS", 48_000.0, &opus_head(), &opus_timing()), cluster(0, &first), cluster(1000, &second)])
+}
+
+/// The start of a track is its first packet, whatever its timestamp: a
+/// seek back to a track that starts at 100 ms skips its `CodecDelay`, not
+/// its `SeekPreRoll`, whether the track's first packet was read before the
+/// seek or not. So does a seek to the start of a file whose audio starts
+/// in its second Cluster, behind a subtitle. A seek into the track skips
+/// its `SeekPreRoll`.
+#[test]
+fn a_seek_to_a_tracks_first_packet_skips_its_codec_delay() {
+    let mut d = open(late_opus_file());
+    assert_eq!(drained(&mut d)[0], (Some(93), trim(312, 0, 48_000)));
+    assert_eq!(seek(&mut d, 0), (0, None, Some(93), trim(312, 0, 48_000)));
+    assert_eq!(seek(&mut d, 1000), (1000, None, Some(993), trim(3840, 0, 48_000)));
+    let mut d = open(late_opus_file());
+    assert_eq!(seek(&mut d, 0), (0, None, Some(93), trim(312, 0, 48_000)));
+    // Opus track 1 in the second Cluster; subtitle track 2 in the first.
+    let tracks = elem(ids::TRACKS, &[
+        entry(1, ids::TRACK_TYPE_AUDIO, "A_OPUS", &opus_head(), &[audio(48_000.0, None), opus_timing()].concat()),
+        entry(2, ids::TRACK_TYPE_SUBTITLE, "S_TEXT/UTF8", &[], &[]),
+    ].concat());
+    let subtitle = elem(ids::SIMPLE_BLOCK, &[0x82, 0, 0, 0x80, b's']);
+    let audio_packets: Vec<Vec<u8>> = (0..50).map(|i| simple(i * 20, &OPUS)).collect();
+    let mut d = open(file(&[tracks, cluster(0, &[subtitle]), cluster(1000, &audio_packets)]));
+    let landed = d.seek_to(0, 0).unwrap();
+    let first_audio = std::iter::from_fn(|| d.next_packet().ok().map(|p| (p.stream_index, p.pts, d.packet_metadata().audio_trim)))
+        .find(|(stream, _, _)| *stream == 0);
+    assert_eq!((landed, first_audio), (0, Some((0, Some(993), trim(312, 0, 48_000)))));
+}
+
+/// After a seek into the track, a Block's own leading skip (a negative
+/// `DiscardPadding`) still applies when it is longer than the
+/// `SeekPreRoll`: the larger skip wins, and the Block's end padding stays.
+#[test]
+fn a_seek_keeps_the_larger_of_its_pre_roll_and_the_blocks_own_skip() {
+    // The Cluster at 1000 ms starts with a Block padded by `padding` ns.
+    let padded_at_1000 = |padding: i64| {
+        let mut segment = vec![audio_track("A_OPUS", 48_000.0, &opus_head(), &opus_timing())];
+        for c in 0..3u64 {
+            let mut blocks: Vec<Vec<u8>> = (0..50).map(|i| simple(i * 20, &OPUS)).collect();
+            if c == 1 {
+                blocks[0] = padded(0, 0, &OPUS, padding);
+            }
+            segment.push(cluster(c * 1000, &blocks));
+        }
+        file(&segment)
+    };
+    for (padding, expected) in [
+        (-100_000_000, trim(4800, 0, 48_000)),
+        (-20_000_000, trim(3840, 0, 48_000)),
+        (5_000_000, trim(3840, 240, 48_000)),
+    ] {
+        let mut d = open(padded_at_1000(padding));
+        assert_eq!(seek(&mut d, 1000).3, expected, "DiscardPadding {padding} ns");
+    }
+}
+
+/// A track's OutputSamplingFrequency is the rate of its counts, as FFmpeg's
+/// `out_samplerate`: 10 µs is one sample at 96 kHz but none at the 48 kHz
+/// SamplingFrequency. Opus counts stay at 48 kHz.
+#[test]
+fn the_output_sampling_frequency_is_the_rate_of_the_counts() {
+    let pcm = |output: Option<f64>| {
+        let timing = [uint(ids::CODEC_DELAY, 10_000), uint(ids::SEEK_PRE_ROLL, 10_000)].concat();
+        let track = entry(1, ids::TRACK_TYPE_AUDIO, "A_PCM/INT/LIT", &[], &[audio(48_000.0, output), timing].concat());
+        let blocks = [simple(0, &[0; 4]), padded(20, 0, &[0; 4], 10_000), simple(40, &[0; 4])];
+        file(&[elem(ids::TRACKS, &track), cluster(0, &blocks), cluster(1000, &blocks)])
+    };
+    let mut d = open(pcm(Some(96_000.0)));
+    let trims: Vec<Option<AudioTrim>> = drained(&mut d).into_iter().map(|(_, t)| t).collect();
+    assert_eq!(trims, [trim(1, 0, 96_000), trim(0, 1, 96_000), None, None, trim(0, 1, 96_000), None]);
+    assert_eq!(seek(&mut d, 1000).3, trim(1, 0, 96_000));
+    assert!(drained(&mut open(pcm(None))).iter().all(|(_, t)| t.is_none()));
+    let opus = entry(1, ids::TRACK_TYPE_AUDIO, "A_OPUS", &opus_head(), &[audio(44_100.0, Some(96_000.0)), opus_timing()].concat());
+    let bytes = file(&[elem(ids::TRACKS, &opus), cluster(0, &[simple(0, &OPUS)])]);
+    assert_eq!(drained(&mut open(bytes)), [(Some(-7), trim(312, 0, 48_000))]);
 }

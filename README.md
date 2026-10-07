@@ -77,9 +77,15 @@ track's first packet skips its `CodecDelay`, and every timestamp of the
 track moves back by it, rounded to the nearest tick, as FFmpeg does. Each
 packet of a Block with `DiscardPadding` drops it from its end, or skips it
 from its start when negative. After a seek, the track's first packet skips
-its `SeekPreRoll`, or its `CodecDelay` when the seek lands on the track's
-start. Counts are FFmpeg's, at 48 kHz for Opus and at the stream's rate
-otherwise; counts too large for a trim saturate. An Opus decoder's own
+its `SeekPreRoll`, or the Block's own leading skip when that is longer; a
+seek that lands on the track's first packet skips its `CodecDelay` instead.
+The track's first packet is the first Block of the track the demuxer reads
+walking from the first Cluster, after the open or after a seek that lands
+there; a seek that lands further on before that Block was ever read counts
+its next packet as one inside the track. Counts are FFmpeg's: at 48 kHz for
+Opus, otherwise at the track's `OutputSamplingFrequency`, or its
+`SamplingFrequency` without one (FFmpeg's `out_samplerate`); counts too
+large for a trim saturate, and so do timestamps. An Opus decoder's own
 `OpusHead` pre-skip is a default a consumer replaces with the container's
 skip, as libavcodec does. Seek targets and landings stay in the Blocks' own
 timeline, as FFmpeg's Cue index does. On the FATE and generated corpora

@@ -17,19 +17,23 @@
 //!   nothing.
 //! - `SeekPreRoll` (§5.1.4.1.26): FFmpeg only reports it; RFC 9559 says the
 //!   decoded output is not valid until that much has been dropped after a
-//!   seek. After a seek the track's first packet skips it, with that
-//!   packet's own end padding. A seek that lands on the track's start (a
-//!   Block at or before time 0) needs no pre-roll: that packet skips the
-//!   `CodecDelay` instead, as after the open.
+//!   seek. After a seek the track's first packet skips it, or the Block's
+//!   own leading skip when that is longer, and keeps the Block's end
+//!   padding. A seek that lands on the track's first packet needs no
+//!   pre-roll: that packet skips the `CodecDelay` instead, as after the
+//!   open. The track's first packet is the first Block of the track the
+//!   demuxer reads walking from the first Cluster: after the open, or after
+//!   a seek that lands on the first Cluster's start. A seek that lands
+//!   further on before that Block was ever read counts its next packet as
+//!   one inside the track.
 //!
 //! Counts are in the track's rate: 48 kHz for Opus, the rate FFmpeg's Opus
 //! decoder sets for the stream whatever its `SamplingFrequency` says, else
-//! the rate the stream reports, FFmpeg's `sample_rate` for the files
-//! FFmpeg writes. They are FFmpeg's whole counts: an Opus decoder's own
-//! `OpusHead` pre-skip is a default a consumer replaces with a container's
-//! skip, as libavcodec does. Counts too large for a trim saturate. A track
-//! without a rate gets no trims; its timestamps still move back by its
-//! `CodecDelay`.
+//! FFmpeg's `out_samplerate` (see [`track_rate`]). They are FFmpeg's whole
+//! counts: an Opus decoder's own `OpusHead` pre-skip is a default a
+//! consumer replaces with a container's skip, as libavcodec does. Counts
+//! too large for a trim saturate. A track without a rate gets no trims;
+//! its timestamps still move back by its `CodecDelay`.
 
 use oxideav_core::{AudioTrim, TimeBase};
 
@@ -44,7 +48,8 @@ pub(super) enum Pending {
     None,
     /// The open: the track's `CodecDelay`.
     Open,
-    /// A seek: the track's `SeekPreRoll`, or its `CodecDelay` at its start.
+    /// A seek: the track's `SeekPreRoll`, or its `CodecDelay` on its first
+    /// packet.
     Seek,
 }
 
@@ -72,11 +77,6 @@ impl TrackTrims {
         })
     }
 
-    /// Where the track's first packet after the open takes its start trim.
-    pub(super) fn at_open(&self) -> Pending {
-        if self.delay > 0 { Pending::Open } else { Pending::None }
-    }
-
     /// The trim of each packet of a Block whose `DiscardPadding` is
     /// `padding` ns.
     pub(super) fn padding(&self, padding: Option<i64>) -> Option<AudioTrim> {
@@ -90,14 +90,14 @@ impl TrackTrims {
     }
 
     /// The trim of the first packet after the open or a seek (`pending`),
-    /// of a Block `at_start` of the track or not, whose own trim is `own`.
-    pub(super) fn start(&self, pending: Pending, at_start: bool, own: Option<AudioTrim>) -> Option<AudioTrim> {
-        let delay = pending == Pending::Open || (pending == Pending::Seek && at_start);
+    /// the track's `first` or not, whose own trim is `own`.
+    pub(super) fn start(&self, pending: Pending, first: bool, own: Option<AudioTrim>) -> Option<AudioTrim> {
+        let delay = pending == Pending::Open || (pending == Pending::Seek && first);
         if delay && self.delay > 0 {
             Some(AudioTrim { skip_samples: self.delay, discard_padding: 0, sample_rate: self.rate })
-        } else if pending == Pending::Seek && !at_start && self.pre_roll > 0 {
+        } else if pending == Pending::Seek && !first && self.pre_roll > 0 {
             Some(AudioTrim {
-                skip_samples: self.pre_roll,
+                skip_samples: self.pre_roll.max(own.map_or(0, |t| t.skip_samples)),
                 discard_padding: own.map_or(0, |t| t.discard_padding),
                 sample_rate: self.rate,
             })
@@ -105,6 +105,17 @@ impl TrackTrims {
             own
         }
     }
+}
+
+/// The rate FFmpeg counts a track's trims in (`par->sample_rate`), its
+/// `out_samplerate` narrowed to an integer: the `OutputSamplingFrequency`
+/// when present and nonzero, else the `SamplingFrequency`, which is 8000
+/// when absent, negative, past `i32::MAX` or NaN. An
+/// `OutputSamplingFrequency` out of that range counts as absent.
+pub(super) fn track_rate(sampling: Option<f64>, output: Option<f64>) -> u32 {
+    let valid = |rate: f64| (0.0..=f64::from(i32::MAX)).contains(&rate);
+    let sampling = sampling.filter(|&rate| valid(rate)).unwrap_or(8000.0);
+    output.filter(|&rate| rate != 0.0 && valid(rate)).unwrap_or(sampling) as u32
 }
 
 /// `ns` nanoseconds in samples at `rate` Hz, rounded to the nearest with

@@ -1040,8 +1040,10 @@ fn open_typed_impl(
         .collect();
 
     // Per stream, the `CodecDelay` every timestamp moves back by, and the
-    // trims an audio stream's packets carry with where the next packet
-    // takes its start trim from — see `audio_trim`.
+    // trims an audio stream's packets carry, counted at FFmpeg's rate for
+    // the track, with where the next packet takes its start trim from: the
+    // open, for the first packet of every stream with trims — see
+    // `audio_trim`.
     let codec_delay_ticks: Vec<i64> = streams
         .iter()
         .zip(&track_codec_timing)
@@ -1049,16 +1051,20 @@ fn open_typed_impl(
         .collect();
     let track_trims: Vec<Option<audio_trim::TrackTrims>> = streams
         .iter()
+        .zip(&tracks)
         .zip(&track_codec_timing)
-        .map(|(s, t)| {
-            let rate = s.params.sample_rate.unwrap_or(0);
+        .map(|((s, t), timing)| {
+            let raw = t.audio_raw.unwrap_or_default();
+            let rate = audio_trim::track_rate(raw.sampling_frequency, raw.output_sampling_frequency);
             let opus = s.params.codec_id.as_str() == "opus";
             (s.params.media_type == MediaType::Audio)
-                .then(|| audio_trim::TrackTrims::new(t.codec_delay(), t.seek_pre_roll(), rate, opus))
+                .then(|| audio_trim::TrackTrims::new(timing.codec_delay(), timing.seek_pre_roll(), rate, opus))
                 .flatten()
         })
         .collect();
-    let start_trims = track_trims.iter().map(|t| t.map_or(audio_trim::Pending::None, |t| t.at_open())).collect();
+    let start_trims =
+        track_trims.iter().map(|t| if t.is_some() { audio_trim::Pending::Open } else { audio_trim::Pending::None }).collect();
+    let first_blocks = vec![None; track_trims.len()];
 
     // Per-stream `TrackIdentity` (RFC 9559 §5.1.4.1.18 / .19 / .20 / .23 / .4 /
     // .5 / .12 / .24), indexed by stream index. A record surfaces for every
@@ -1314,6 +1320,8 @@ fn open_typed_impl(
         codec_delay_ticks,
         track_trims,
         start_trims,
+        first_blocks,
+        walk_from_start: Some(true),
         timestamps_primed: false,
         timestamp_probe_bytes: 0,
         deferred_block: None,
@@ -10038,6 +10046,14 @@ pub struct MkvDemuxer {
     /// Per stream, where the next packet takes its start trim from: the
     /// open, a seek or nowhere.
     start_trims: Vec<audio_trim::Pending>,
+    /// Per stream, the offset of the Block holding the track's first packet
+    /// once the demuxer has read it, walking from the first Cluster — see
+    /// `audio_trim`.
+    first_blocks: Vec<Option<u64>>,
+    /// Whether the walk since the open or the last seek started at or
+    /// before the first Cluster, so a track's first packet in it is the
+    /// track's first; `None` until the walk after a seek starts.
+    walk_from_start: Option<bool>,
     timestamps_primed: bool,
     timestamp_probe_bytes: usize,
     /// The Block waiting for queue room — see [`DeferredBlock`].
@@ -10262,6 +10278,12 @@ impl Demuxer for MkvDemuxer {
                 (step, at)
             } else {
                 let before = self.input.stream_position()?;
+                // The first read since a seek: whether the walk starts at the
+                // first Cluster, before every track's first packet.
+                if self.walk_from_start.is_none() {
+                    let idle = matches!(self.cluster_state, ClusterState::Idle);
+                    self.walk_from_start = Some(idle && self.first_cluster_offset.is_some_and(|first| before <= first));
+                }
                 (self.advance(), before)
             };
             let step = match step {
@@ -10495,6 +10517,7 @@ impl MkvDemuxer {
                 *pending = audio_trim::Pending::Seek;
             }
         }
+        self.walk_from_start = None;
         self.timestamp_probe_bytes = 0;
         self.resync_floor = 0;
     }
@@ -13196,9 +13219,7 @@ impl MkvDemuxer {
             // negative PTS. Duration interpolation starts relative to zero.
             None
         };
-        // A track's CodecDelay moves its timestamps back, and a Block at or
-        // before its time 0 is the track's start — see `audio_trim`.
-        let at_start = block_pts.map_or(true, |pts| pts <= 0);
+        // A track's CodecDelay moves its timestamps back — see `audio_trim`.
         let mut block_pts = block_pts.map(|pts| pts.saturating_sub(self.codec_delay_ticks[si]));
         let trims = self.track_trims[si];
         let own_trim = trims.and_then(|t| t.padding(meta.as_ref().and_then(|m| m.discard_padding())));
@@ -13301,7 +13322,17 @@ impl MkvDemuxer {
             // takes its start trim.
             let audio_trim = match trims {
                 Some(t) if pending != audio_trim::Pending::None => {
-                    let start = t.start(pending, at_start, own_trim);
+                    // This Block holds the track's first packet when it is
+                    // the one read first, or, before that is known, when
+                    // the walk began at the first Cluster.
+                    let first = match self.first_blocks[si] {
+                        Some(at) => at == offset,
+                        None => self.walk_from_start == Some(true),
+                    };
+                    if first {
+                        self.first_blocks[si] = Some(offset);
+                    }
+                    let start = t.start(pending, first, own_trim);
                     pending = audio_trim::Pending::None;
                     start
                 }
