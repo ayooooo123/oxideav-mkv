@@ -111,23 +111,31 @@ keep at most 1 MiB together. `Chapters` and `Attachments` text fields hold
 at most 64 KiB too, and each of the two keeps at most 1 MiB: editions,
 chapters, displays, processes, UID indexes and flat entries, or attachment
 records with their names, MIME types, descriptions, referrals, UID index
-and flat entries. Attachment payloads are never read at open;
-`attachment_data()` reads one on request and keeps nothing. Sizes are
-checked before a read, and a `Void` is stepped over unread. Everything the
-open keeps from `Tracks` and from `Tags` is charged to the master's 32 MiB
-limit before it is allocated: records, strings, byte strings and lists,
-the per-stream views, tag resolution with its flat entries, and working
-room for parsing a codec configuration. The per-stream views take the
-parsed data instead of copying it, and a stream's extradata takes its
-CodecPrivate bytes. A master past one of these budgets is InvalidData: a
-strict open fails and a resilient open skips it. A mid-stream `Tags` may
-use what the current tag state leaves of the 32 MiB. The Cues index keeps
-at most 32 MiB of CuePoints, positions, references and seek entries. Past
-that, the CuePoints that fit are kept and a `DamagedMaster(Cues)` event is
-recorded on either open. A seek past the last `CueTime` kept for its track,
-or on a track with no kept cue, scans the Clusters as a Cues-less seek
-does. Known limit: that scan starts at the first Cluster, so on a large
-remote file it costs reads up to the target.
+and flat entries. Attachment payloads are never read at open.
+`attachment_data()` reads one on request into a buffer that grows only as
+bytes arrive, and keeps nothing; a payload reaching past its `AttachedFile`
+or the Segment is refused unread, and the open does not follow it there.
+Sizes are checked before a read, and a `Void` is stepped over unread.
+Everything the open keeps from `Tracks` and from `Tags` is charged to the
+master's 32 MiB limit before it is allocated: records, strings, byte
+strings and lists, the per-stream views, tag resolution with its flat
+entries, and working room for parsing a codec configuration. The
+per-stream views take the parsed data instead of copying it, and a
+stream's extradata takes its CodecPrivate bytes; a compressed CodecPrivate
+is decompressed only as far as its budget allows. An `Info`, `Tracks` or
+`Tags` master past its budget is InvalidData: a strict open fails and a
+resilient open skips it. A mid-stream `Tags` may use what the current tag
+state leaves of the 32 MiB. `Chapters` and `Attachments` past theirs keep
+the chapters or attachments that fit, in order and with their flat entries,
+and either open records one `DamagedMaster` event and goes on: a long list
+never stops playback. A chapter cut short is kept only when it holds kept
+chapters of its own. The Cues index keeps at most 32 MiB of CuePoints,
+positions, references and seek entries. Past that, the CuePoints that fit
+are kept and a `DamagedMaster(Cues)` event is recorded on either open. A
+seek past the last `CueTime` kept for its track, or on a track with no
+kept cue, scans the Clusters as a Cues-less seek does. Known limit: that
+scan starts at the first Cluster, so on a large remote file it costs reads
+up to the target.
 
 Known network cost: an `Info`, `Cues`, `Chapters` or `Attachments` master
 whose first child is a `CRC-32` is read in full to check it, in 16 KiB

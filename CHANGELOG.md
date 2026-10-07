@@ -106,17 +106,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rescans from the end of its header, so a Cluster right after an empty one
   is found. `SegmentUUID`, `PrevUUID` and `NextUUID` must be 16 octets.
   Text fields of `Info`, `Chapters` and `Attachments` hold at most 64 KiB,
-  checked before a read, and each of the three keeps at most 1 MiB;
-  attachment payloads are never read at open. Everything the open keeps
-  from `Tracks` and from `Tags` — records, per-stream views, tag
-  resolution and flat entries, and working room for parsing a codec
-  configuration — is charged to the master's 32 MiB limit before it is
-  allocated, and the per-stream views and extradata take the parsed data
-  instead of copying it. H.264 Annex B NAL units are split without
-  buffering their offsets. The Cues index keeps at most 32 MiB: past that
-  it keeps the CuePoints that fit and records a `DamagedMaster(Cues)` event
-  on either open, and a seek past the last `CueTime` kept for its track, or
-  on a track with none kept, scans the Clusters from the first one.
+  checked before a read, and each of the three keeps at most 1 MiB. Past
+  it, `Chapters` and `Attachments` keep the records that fit, in order,
+  and either open records one `DamagedMaster` event and goes on.
+  Attachment payloads are never read at open; `attachment_data()` reads
+  one into a buffer that grows as bytes arrive and refuses a payload
+  reaching past its `AttachedFile` or the Segment unread, which the open
+  no longer follows either. Everything the open keeps from `Tracks` and
+  from `Tags` — records, per-stream views, tag resolution and flat
+  entries, and working room for parsing a codec configuration — is charged
+  to the master's 32 MiB limit before it is allocated, and the per-stream
+  views and extradata take the parsed data instead of copying it. A
+  compressed CodecPrivate, LZO included, is decompressed only as far as
+  its budget allows. H.264 Annex B NAL units are split without buffering
+  their offsets. The Cues index keeps at most 32 MiB: past that it keeps
+  the CuePoints that fit and records a `DamagedMaster(Cues)` event on
+  either open, and a seek past the last `CueTime` kept for its track, or on
+  a track with none kept, scans the Clusters from the first one.
 - Laces advance by their per-frame durations rather than repeating the
   first timestamp. BlockDuration and DefaultDuration use FFmpeg 9's integer
   remainder distribution; duration-less Vorbis, Opus, FLAC, WavPack, MP3,

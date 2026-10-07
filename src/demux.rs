@@ -376,12 +376,12 @@ fn open_typed_impl(
                 }
                 ids::CUES => {
                     if let Some(stop) = parse_cues(&mut *input, end, &mut cues, &mut cue_points, &mut cue_budget)? {
-                        damage_events.push(cues_cut_at(stop, end));
+                        damage_events.push(cut_at(ids::CUES, stop, end));
                         cues_cut = true;
                     }
                 }
                 ids::CHAPTERS => {
-                    parse_chapters_typed(
+                    let cut = parse_chapters_typed(
                         &mut *input,
                         end,
                         &mut metadata,
@@ -390,9 +390,12 @@ fn open_typed_impl(
                         &mut editions,
                         &mut chapter_budget,
                     )?;
+                    if let Some(stop) = cut {
+                        damage_events.push(cut_at(ids::CHAPTERS, stop, end));
+                    }
                 }
                 ids::ATTACHMENTS => {
-                    parse_attachments(
+                    let cut = parse_attachments(
                         &mut *input,
                         end,
                         &mut metadata,
@@ -400,6 +403,9 @@ fn open_typed_impl(
                         &mut attachments,
                         &mut attachment_budget,
                     )?;
+                    if let Some(stop) = cut {
+                        damage_events.push(cut_at(ids::ATTACHMENTS, stop, end));
+                    }
                 }
                 ids::SEEK_HEAD if !over_quota => {
                     seek_heads += 1;
@@ -1773,11 +1779,13 @@ const MAX_TEXT_BYTES: usize = 64 << 10;
 const MAX_INFO_BYTES: usize = 1 << 20;
 /// Everything the `Chapters` masters keep together: editions, chapters,
 /// their displays, processes and lists, the UID indexes and flat metadata
-/// entries.
+/// entries. Past it, the chapters that fit are kept in order and the rest
+/// are dropped, as a Cues index past its budget is.
 const MAX_CHAPTER_BYTES: usize = 1 << 20;
 /// Everything the `Attachments` masters keep together: the attachment
 /// records, their names, MIME types, descriptions and referrals, the UID
-/// index and flat metadata entries. The payloads stay on disk.
+/// index and flat metadata entries. The payloads stay on disk. Past it,
+/// the attachments that fit are kept in order and the rest are dropped.
 const MAX_ATTACHMENT_BYTES: usize = 1 << 20;
 /// What the open builds for each `TrackEntry` besides its own fields: its
 /// stream, codec parser, clocks and per-stream views. Charged to the
@@ -1794,7 +1802,7 @@ const MAX_CUE_BYTES: usize = 32 << 20;
 const TAGS_OVER_BUDGET: &str = "MKV: Tags records exceed their 32 MiB budget";
 
 /// The budgets the open shares between its walk and the SeekHead chase,
-/// and where a Cues index cut at its budget is noted.
+/// and where a master cut at its budget is noted.
 struct MetadataBudgets<'a> {
     info: &'a mut Budget,
     chapters: &'a mut Budget,
@@ -1826,11 +1834,11 @@ fn merge_map(into: &mut std::collections::HashMap<u64, u32>, more: std::collecti
     }
 }
 
-/// The damage a Cues index cut at its budget records: the CuePoints from
-/// `stop` to the end of the Cues at `end` were dropped.
-fn cues_cut_at(stop: u64, end: u64) -> DamageEvent {
+/// The damage a master cut at its budget records: its records from `stop`
+/// to the end of the master at `end` were dropped.
+fn cut_at(id: u32, stop: u64, end: u64) -> DamageEvent {
     DamageEvent {
-        kind: DamageKind::DamagedMaster(ids::CUES),
+        kind: DamageKind::DamagedMaster(id),
         offset: stop,
         resumed_at: Some(end),
         bytes_skipped: end.saturating_sub(stop),
@@ -7167,7 +7175,10 @@ pub struct ChapProcessCommand {
 ///
 /// Each text field holds at most [`MAX_TEXT_BYTES`], and everything both
 /// views and the UID indexes keep is charged to `budget` (see
-/// [`MAX_CHAPTER_BYTES`]) before it is read or stored.
+/// [`MAX_CHAPTER_BYTES`]) before it is read or stored. When the budget
+/// runs out, the chapters read before are kept in order (see [`Lifted`]),
+/// the reader is left at `end`, and the offset of the first element not
+/// kept is returned.
 #[allow(clippy::too_many_arguments)]
 fn parse_chapters_typed(
     r: &mut dyn ReadSeek,
@@ -7177,99 +7188,187 @@ fn parse_chapters_typed(
     edition_uid_to_index: &mut std::collections::HashMap<u64, u32>,
     editions: &mut Vec<Edition>,
     budget: &mut Budget,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     // Shared 1-based counter across the whole Chapters element (every
     // EditionEntry, every nesting level), assigned depth-first in document
     // order. Keeps the `chapter:N:*` flat keys and `TagChapterUID`
     // resolution stable while extending indexing to nested atoms.
     let mut chapter_index: u32 = 0;
     let mut edition_index: u32 = 0;
-    while r.stream_position()? < end {
+    loop {
+        let at = r.stream_position()?;
+        if at >= end {
+            return Ok(None);
+        }
         let e = read_element_header(r)?;
         match e.id {
             ids::EDITION_ENTRY => {
                 let ee_end = r.stream_position()?.saturating_add(e.size);
                 edition_index += 1;
-                let edition = parse_edition_entry(
-                    r,
-                    ee_end,
-                    metadata,
-                    &mut chapter_index,
-                    edition_index,
-                    chapter_uid_to_index,
-                    edition_uid_to_index,
-                    budget,
-                )?;
-                budget.room(editions)?;
-                editions.push(edition);
+                // Room for the edition comes first, so one cut short can
+                // still be kept.
+                let lifted = match budget.room(editions) {
+                    Ok(()) => parse_edition_entry(
+                        r,
+                        ee_end,
+                        at,
+                        metadata,
+                        &mut chapter_index,
+                        edition_index,
+                        chapter_uid_to_index,
+                        edition_uid_to_index,
+                        budget,
+                    )?,
+                    Err(_) if budget.exhausted() => Lifted::Cut(None, at),
+                    Err(err) => return Err(err),
+                };
+                match lifted {
+                    Lifted::Whole(edition) => editions.push(edition),
+                    Lifted::Cut(edition, stop) => {
+                        editions.extend(edition);
+                        r.seek(SeekFrom::Start(end))?;
+                        return Ok(Some(stop));
+                    }
+                }
             }
             _ => skip(r, e.size)?,
         }
     }
-    Ok(())
+}
+
+/// One edition or chapter of a `Chapters` master.
+enum Lifted<T> {
+    /// Read whole.
+    Whole(T),
+    /// The chapter budget ran out inside it, so nothing after it is read.
+    /// It is kept with what was read before when that holds a kept chapter
+    /// (`Some`), and dropped with its UID otherwise. The offset is that of
+    /// the first element not kept.
+    Cut(Option<T>, u64),
+}
+
+/// Octets a flat metadata entry holds: two slots of a list that doubles as
+/// it grows, its key and its value.
+fn entry_bytes(key: usize, value: usize) -> usize {
+    2 * std::mem::size_of::<(String, String)>() + key + value
+}
+
+/// The most octets the flat key `{scope}:{index}:{field}` holds.
+fn flat_key_len(scope: &str, field: &str) -> usize {
+    // Two colons and the ten digits of the largest index.
+    scope.len() + field.len() + 12
+}
+
+/// The flat key `{scope}:{index}:{field}`, allocated to fit.
+fn flat_key(scope: &str, index: u32, field: &str) -> String {
+    use std::fmt::Write as _;
+    let mut key = String::with_capacity(flat_key_len(scope, field));
+    let _ = write!(key, "{scope}:{index}:{field}");
+    key
+}
+
+/// The decimal milliseconds in `ns` nanoseconds, in at most 20 octets.
+fn millis(ns: u64) -> String {
+    use std::fmt::Write as _;
+    let mut value = String::with_capacity(20);
+    let _ = write!(value, "{}", ns / 1_000_000);
+    value
+}
+
+/// What a chapter's `start_ms` or `end_ms` flat entry holds.
+fn chapter_time_entry_bytes() -> usize {
+    entry_bytes(flat_key_len("chapter", "start_ms"), 20)
 }
 
 const CHAPTER_TEXT_EXCEEDED: &str = "MKV: Chapters text field exceeds 64 KiB";
 
+/// Parse the `EditionEntry` whose header starts at `start`. See [`Lifted`]
+/// for one the chapter budget cuts short.
 #[allow(clippy::too_many_arguments)]
 fn parse_edition_entry(
     r: &mut dyn ReadSeek,
     end: u64,
+    start: u64,
     metadata: &mut Vec<(String, String)>,
     chapter_index: &mut u32,
     edition_index: u32,
     chapter_uid_to_index: &mut std::collections::HashMap<u64, u32>,
     edition_uid_to_index: &mut std::collections::HashMap<u64, u32>,
     budget: &mut Budget,
-) -> Result<Edition> {
+) -> Result<Lifted<Edition>> {
     let mut edition = Edition::default();
-    while r.stream_position()? < end {
-        let e = read_element_header(r)?;
-        match e.id {
-            ids::EDITION_UID => {
-                let uid = read_uint(r, e.size as usize)?;
-                if uid != 0 {
-                    budget.map_room(edition_uid_to_index)?;
-                    edition_uid_to_index.insert(uid, edition_index);
-                    edition.uid = Some(uid);
+    // The element being read.
+    let mut at = start;
+    let read = (|| -> Result<Option<u64>> {
+        loop {
+            at = r.stream_position()?;
+            if at >= end {
+                return Ok(None);
+            }
+            let e = read_element_header(r)?;
+            match e.id {
+                ids::EDITION_UID => {
+                    let uid = read_uint(r, e.size as usize)?;
+                    if uid != 0 {
+                        budget.map_room(edition_uid_to_index)?;
+                        edition_uid_to_index.insert(uid, edition_index);
+                        edition.uid = Some(uid);
+                    }
                 }
-            }
-            ids::EDITION_FLAG_DEFAULT => edition.default = read_uint(r, e.size as usize)? != 0,
-            ids::EDITION_FLAG_ORDERED => edition.ordered = read_uint(r, e.size as usize)? != 0,
-            // Legacy EditionFlagHidden (0x45BD, outside the RFC 9559
-            // registry — staged legacy-element-ids.md): historical
-            // default 0, uinteger 0-1.
-            ids::EDITION_FLAG_HIDDEN => edition.hidden = read_uint(r, e.size as usize)? != 0,
-            // EditionDisplay (Matroska v5 0x4520, staged
-            // post-rfc9559-elements.md): repeatable master pairing one
-            // mandatory EditionString with 0..n EditionLanguageIETF
-            // tags. A master missing its EditionString is malformed
-            // (minOccurs: 1, no default) and dropped.
-            ids::EDITION_DISPLAY => {
-                let ed_end = r.stream_position()?.saturating_add(e.size);
-                if let Some(disp) = parse_edition_display(r, ed_end, budget)? {
-                    budget.room(&mut edition.displays)?;
-                    edition.displays.push(disp);
+                ids::EDITION_FLAG_DEFAULT => edition.default = read_uint(r, e.size as usize)? != 0,
+                ids::EDITION_FLAG_ORDERED => edition.ordered = read_uint(r, e.size as usize)? != 0,
+                // Legacy EditionFlagHidden (0x45BD, outside the RFC 9559
+                // registry — staged legacy-element-ids.md): historical
+                // default 0, uinteger 0-1.
+                ids::EDITION_FLAG_HIDDEN => edition.hidden = read_uint(r, e.size as usize)? != 0,
+                // EditionDisplay (Matroska v5 0x4520, staged
+                // post-rfc9559-elements.md): repeatable master pairing one
+                // mandatory EditionString with 0..n EditionLanguageIETF
+                // tags. A master missing its EditionString is malformed
+                // (minOccurs: 1, no default) and dropped.
+                ids::EDITION_DISPLAY => {
+                    let ed_end = r.stream_position()?.saturating_add(e.size);
+                    if let Some(disp) = parse_edition_display(r, ed_end, budget)? {
+                        budget.room(&mut edition.displays)?;
+                        edition.displays.push(disp);
+                    }
                 }
+                ids::CHAPTER_ATOM => {
+                    let ca_end = r.stream_position()?.saturating_add(e.size);
+                    budget.room(&mut edition.chapters)?;
+                    let atom = parse_chapter_atom(
+                        r,
+                        ca_end,
+                        at,
+                        metadata,
+                        chapter_index,
+                        chapter_uid_to_index,
+                        0,
+                        budget,
+                    )?;
+                    match atom {
+                        Lifted::Whole(atom) => edition.chapters.push(atom),
+                        Lifted::Cut(atom, stop) => {
+                            edition.chapters.extend(atom);
+                            return Ok(Some(stop));
+                        }
+                    }
+                }
+                _ => skip(r, e.size)?,
             }
-            ids::CHAPTER_ATOM => {
-                let ca_end = r.stream_position()?.saturating_add(e.size);
-                let atom = parse_chapter_atom(
-                    r,
-                    ca_end,
-                    metadata,
-                    chapter_index,
-                    chapter_uid_to_index,
-                    0,
-                    budget,
-                )?;
-                budget.room(&mut edition.chapters)?;
-                edition.chapters.push(atom);
-            }
-            _ => skip(r, e.size)?,
         }
+    })();
+    let stop = match read {
+        Ok(None) => return Ok(Lifted::Whole(edition)),
+        Ok(Some(stop)) => stop,
+        Err(_) if budget.exhausted() => at,
+        Err(err) => return Err(err),
+    };
+    if edition.chapters.is_empty() {
+        edition_uid_to_index.retain(|_, i| *i != edition_index);
+        return Ok(Lifted::Cut(None, start));
     }
-    Ok(edition)
+    Ok(Lifted::Cut(Some(edition), stop))
 }
 
 /// Maximum recursion depth for nested `ChapterAtom` elements. RFC 9559
@@ -7281,15 +7380,21 @@ fn parse_edition_entry(
 /// beyond any legitimate use.
 const MAX_CHAPTER_NESTING: u32 = 64;
 
+/// Parse the `ChapterAtom` whose header starts at `start`, nested `depth`
+/// deep. Its flat entries are charged as the fields they show are read,
+/// so one the chapter budget cuts short can still be kept with them; see
+/// [`Lifted`].
+#[allow(clippy::too_many_arguments)]
 fn parse_chapter_atom(
     r: &mut dyn ReadSeek,
     end: u64,
+    start: u64,
     metadata: &mut Vec<(String, String)>,
     chapter_index: &mut u32,
     chapter_uid_to_index: &mut std::collections::HashMap<u64, u32>,
     depth: u32,
     budget: &mut Budget,
-) -> Result<Chapter> {
+) -> Result<Lifted<Chapter>> {
     if depth >= MAX_CHAPTER_NESTING {
         return Err(Error::invalid(format!(
             "MKV: ChapterAtom nesting exceeds {MAX_CHAPTER_NESTING}"
@@ -7303,106 +7408,142 @@ fn parse_chapter_atom(
         index,
         ..Chapter::default()
     };
-    while r.stream_position()? < end {
-        let e = read_element_header(r)?;
-        match e.id {
-            ids::CHAPTER_UID => {
-                let uid = read_uint(r, e.size as usize)?;
-                if uid != 0 {
-                    budget.map_room(chapter_uid_to_index)?;
-                    chapter_uid_to_index.insert(uid, index);
-                    atom.uid = Some(uid);
-                }
+    // The element being read.
+    let mut at = start;
+    let read = (|| -> Result<Option<u64>> {
+        // Every kept chapter gets a `start_ms` entry.
+        budget.charge(chapter_time_entry_bytes())?;
+        loop {
+            at = r.stream_position()?;
+            if at >= end {
+                return Ok(None);
             }
-            ids::CHAPTER_STRING_UID => {
-                atom.string_uid = Some(text_field(r, e.size, budget, CHAPTER_TEXT_EXCEEDED)?);
-            }
-            ids::CHAPTER_TIME_START => atom.time_start_ns = read_uint(r, e.size as usize)?,
-            ids::CHAPTER_TIME_END => atom.time_end_ns = Some(read_uint(r, e.size as usize)?),
-            ids::CHAPTER_FLAG_HIDDEN => atom.hidden = read_uint(r, e.size as usize)? != 0,
-            ids::CHAPTER_FLAG_ENABLED => atom.enabled = read_uint(r, e.size as usize)? != 0,
-            ids::CHAPTER_SEGMENT_UUID => {
-                // RFC 9559 §5.1.7.1.4.6: length is exactly 16 bytes.
-                // A malformed file may carry a different length; we read
-                // exactly what's there and let the consumer treat any
-                // value with `len() != 16` as malformed.
-                atom.segment_uuid = Some(budget.read(r, e.size)?);
-            }
-            ids::CHAPTER_SEGMENT_EDITION_UID => {
-                let v = read_uint(r, e.size as usize)?;
-                // Spec range "not 0" — drop zero values silently rather
-                // than store a sentinel the consumer would have to filter.
-                if v != 0 {
-                    atom.segment_edition_uid = Some(v);
-                }
-            }
-            ids::CHAPTER_PHYSICAL_EQUIV => {
-                atom.physical_equiv = Some(read_uint(r, e.size as usize)?);
-            }
-            // ChapterSkipType (Matroska v5 0x4588, staged
-            // post-rfc9559-elements.md): uinteger with NO default —
-            // absence stays observable (`None`), never collapsed into
-            // NoSkipping. Out-of-enumeration values surface as
-            // Unknown(v) per the robust-reader rule.
-            ids::CHAPTER_SKIP_TYPE => {
-                atom.skip_type = Some(ChapterSkipType::from_raw(read_uint(r, e.size as usize)?));
-            }
-            ids::CHAPTER_DISPLAY => {
-                let cd_end = r.stream_position()?.saturating_add(e.size);
-                if let Some(disp) = parse_chapter_display(r, cd_end, budget)? {
-                    budget.room(&mut atom.displays)?;
-                    atom.displays.push(disp);
-                }
-            }
-            ids::CHAP_PROCESS => {
-                let cp_end = r.stream_position()?.saturating_add(e.size);
-                let process = parse_chap_process(r, cp_end, budget)?;
-                budget.room(&mut atom.chap_processes)?;
-                atom.chap_processes.push(process);
-            }
-            // Legacy ChapterTrack master (0x8F, outside the RFC 9559
-            // registry — staged legacy-element-ids.md): collect its
-            // ChapterTrackUID children (0x89, "not 0", unbounded) in
-            // on-disk order; zeros are spec-illegal and dropped.
-            ids::CHAPTER_TRACK => {
-                let ct_end = r.stream_position()?.saturating_add(e.size);
-                while r.stream_position()? < ct_end {
-                    let c = read_element_header(r)?;
-                    match c.id {
-                        ids::CHAPTER_TRACK_UID => {
-                            let v = read_uint(r, c.size as usize)?;
-                            if v != 0 {
-                                budget.room(&mut atom.track_uids)?;
-                                atom.track_uids.push(v);
-                            }
-                        }
-                        _ => skip(r, c.size)?,
+            let e = read_element_header(r)?;
+            match e.id {
+                ids::CHAPTER_UID => {
+                    let uid = read_uint(r, e.size as usize)?;
+                    if uid != 0 {
+                        budget.map_room(chapter_uid_to_index)?;
+                        chapter_uid_to_index.insert(uid, index);
+                        atom.uid = Some(uid);
                     }
                 }
+                ids::CHAPTER_STRING_UID => {
+                    atom.string_uid = Some(text_field(r, e.size, budget, CHAPTER_TEXT_EXCEEDED)?);
+                }
+                ids::CHAPTER_TIME_START => atom.time_start_ns = read_uint(r, e.size as usize)?,
+                ids::CHAPTER_TIME_END => {
+                    let ns = read_uint(r, e.size as usize)?;
+                    if atom.time_end_ns.is_none() {
+                        budget.charge(chapter_time_entry_bytes())?;
+                    }
+                    atom.time_end_ns = Some(ns);
+                }
+                ids::CHAPTER_FLAG_HIDDEN => atom.hidden = read_uint(r, e.size as usize)? != 0,
+                ids::CHAPTER_FLAG_ENABLED => atom.enabled = read_uint(r, e.size as usize)? != 0,
+                ids::CHAPTER_SEGMENT_UUID => {
+                    // RFC 9559 §5.1.7.1.4.6: length is exactly 16 bytes.
+                    // A malformed file may carry a different length; we read
+                    // exactly what's there and let the consumer treat any
+                    // value with `len() != 16` as malformed.
+                    atom.segment_uuid = Some(budget.read(r, e.size)?);
+                }
+                ids::CHAPTER_SEGMENT_EDITION_UID => {
+                    let v = read_uint(r, e.size as usize)?;
+                    // Spec range "not 0" — drop zero values silently rather
+                    // than store a sentinel the consumer would have to filter.
+                    if v != 0 {
+                        atom.segment_edition_uid = Some(v);
+                    }
+                }
+                ids::CHAPTER_PHYSICAL_EQUIV => {
+                    atom.physical_equiv = Some(read_uint(r, e.size as usize)?);
+                }
+                // ChapterSkipType (Matroska v5 0x4588, staged
+                // post-rfc9559-elements.md): uinteger with NO default —
+                // absence stays observable (`None`), never collapsed into
+                // NoSkipping. Out-of-enumeration values surface as
+                // Unknown(v) per the robust-reader rule.
+                ids::CHAPTER_SKIP_TYPE => {
+                    atom.skip_type = Some(ChapterSkipType::from_raw(read_uint(r, e.size as usize)?));
+                }
+                ids::CHAPTER_DISPLAY => {
+                    let cd_end = r.stream_position()?.saturating_add(e.size);
+                    if let Some(disp) = parse_chapter_display(r, cd_end, budget)? {
+                        // The first display kept titles the chapter.
+                        if atom.displays.is_empty() {
+                            budget.charge(entry_bytes(flat_key_len("chapter", "title"), disp.string.len()))?;
+                        }
+                        budget.room(&mut atom.displays)?;
+                        atom.displays.push(disp);
+                    }
+                }
+                ids::CHAP_PROCESS => {
+                    let cp_end = r.stream_position()?.saturating_add(e.size);
+                    let process = parse_chap_process(r, cp_end, budget)?;
+                    budget.room(&mut atom.chap_processes)?;
+                    atom.chap_processes.push(process);
+                }
+                // Legacy ChapterTrack master (0x8F, outside the RFC 9559
+                // registry — staged legacy-element-ids.md): collect its
+                // ChapterTrackUID children (0x89, "not 0", unbounded) in
+                // on-disk order; zeros are spec-illegal and dropped.
+                ids::CHAPTER_TRACK => {
+                    let ct_end = r.stream_position()?.saturating_add(e.size);
+                    while r.stream_position()? < ct_end {
+                        let c = read_element_header(r)?;
+                        match c.id {
+                            ids::CHAPTER_TRACK_UID => {
+                                let v = read_uint(r, c.size as usize)?;
+                                if v != 0 {
+                                    budget.room(&mut atom.track_uids)?;
+                                    atom.track_uids.push(v);
+                                }
+                            }
+                            _ => skip(r, c.size)?,
+                        }
+                    }
+                }
+                ids::CHAPTER_ATOM => {
+                    let ca_end = r.stream_position()?.saturating_add(e.size);
+                    budget.room(&mut atom.children)?;
+                    let child = parse_chapter_atom(
+                        r,
+                        ca_end,
+                        at,
+                        metadata,
+                        chapter_index,
+                        chapter_uid_to_index,
+                        depth + 1,
+                        budget,
+                    )?;
+                    match child {
+                        Lifted::Whole(child) => atom.children.push(child),
+                        Lifted::Cut(child, stop) => {
+                            atom.children.extend(child);
+                            return Ok(Some(stop));
+                        }
+                    }
+                }
+                _ => skip(r, e.size)?,
             }
-            ids::CHAPTER_ATOM => {
-                let ca_end = r.stream_position()?.saturating_add(e.size);
-                let child = parse_chapter_atom(
-                    r,
-                    ca_end,
-                    metadata,
-                    chapter_index,
-                    chapter_uid_to_index,
-                    depth + 1,
-                    budget,
-                )?;
-                budget.room(&mut atom.children)?;
-                atom.children.push(child);
-            }
-            _ => skip(r, e.size)?,
         }
+    })();
+    let cut = match read {
+        Ok(cut) => cut,
+        Err(_) if budget.exhausted() => Some(at),
+        Err(err) => return Err(err),
+    };
+    if cut.is_some() && atom.children.is_empty() {
+        chapter_uid_to_index.retain(|_, i| *i != index);
+        return Ok(Lifted::Cut(None, start));
     }
     // Flat metadata view: only top-of-atom fields, keyed by the 1-based
-    // index. `title` is the first non-empty display string (back-compat
-    // with the pre-typed behaviour).
-    keep_entry(metadata, format!("chapter:{index}:start_ms"), &(atom.time_start_ns / 1_000_000).to_string(), budget)?;
+    // index, already charged. `title` is the first non-empty display
+    // string (back-compat with the pre-typed behaviour).
+    metadata.push((flat_key("chapter", index, "start_ms"), millis(atom.time_start_ns)));
     if let Some(ns) = atom.time_end_ns {
-        keep_entry(metadata, format!("chapter:{index}:end_ms"), &(ns / 1_000_000).to_string(), budget)?;
+        metadata.push((flat_key("chapter", index, "end_ms"), millis(ns)));
     }
     if let Some(t) = atom
         .displays
@@ -7410,9 +7551,12 @@ fn parse_chapter_atom(
         .map(|d| &d.string)
         .find(|s| !s.is_empty())
     {
-        keep_entry(metadata, format!("chapter:{index}:title"), t, budget)?;
+        metadata.push((flat_key("chapter", index, "title"), t.clone()));
     }
-    Ok(atom)
+    Ok(match cut {
+        None => Lifted::Whole(atom),
+        Some(stop) => Lifted::Cut(Some(atom), stop),
+    })
 }
 
 /// Parse one `EditionDisplay` master (Matroska v5 `0x4520`, staged
@@ -7549,7 +7693,9 @@ fn parse_chap_process_command(r: &mut dyn ReadSeek, end: u64, budget: &mut Budge
 /// is the on-disk size (no compression decoded). Each text field holds at
 /// most [`MAX_TEXT_BYTES`], and the records, the UID index and the flat
 /// entries are charged to `budget` (see [`MAX_ATTACHMENT_BYTES`]) before
-/// they are read or stored.
+/// they are read or stored. The AttachedFile that does not fit is dropped
+/// with every one after it, the reader is left at `end`, and the offset of
+/// that first dropped AttachedFile is returned.
 fn parse_attachments(
     r: &mut dyn ReadSeek,
     end: u64,
@@ -7557,15 +7703,21 @@ fn parse_attachments(
     attachment_uid_to_index: &mut std::collections::HashMap<u64, u32>,
     attachments: &mut Vec<Attachment>,
     budget: &mut Budget,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     let mut idx: u32 = 0;
-    while r.stream_position()? < end {
+    loop {
+        let at = r.stream_position()?;
+        if at >= end {
+            return Ok(None);
+        }
         let e = read_element_header(r)?;
         match e.id {
             ids::ATTACHED_FILE => {
-                let af_end = r.stream_position()?.saturating_add(e.size);
+                // An AttachedFile ends with its Attachments at the latest.
+                let af_end = r.stream_position()?.saturating_add(e.size).min(end);
                 idx += 1;
-                parse_attached_file(
+                let kept = metadata.len();
+                let parsed = parse_attached_file(
                     r,
                     af_end,
                     metadata,
@@ -7573,12 +7725,20 @@ fn parse_attachments(
                     attachment_uid_to_index,
                     attachments,
                     budget,
-                )?;
+                );
+                if let Err(err) = parsed {
+                    if !budget.exhausted() {
+                        return Err(err);
+                    }
+                    metadata.truncate(kept);
+                    attachment_uid_to_index.retain(|_, i| *i != idx);
+                    r.seek(SeekFrom::Start(end))?;
+                    return Ok(Some(at));
+                }
             }
             _ => skip(r, e.size)?,
         }
     }
-    Ok(())
 }
 
 const ATTACHMENT_TEXT_EXCEEDED: &str = "MKV: Attachments text field exceeds 64 KiB";
@@ -7637,11 +7797,13 @@ fn parse_attached_file(
                 // past it. `stream_position()` here is the byte right after
                 // the `FileData` element's id+size header — i.e. the first
                 // byte of the payload itself. `attachment_data` re-reads from
-                // this offset on demand.
+                // this offset on demand. A payload declared past the end of
+                // its AttachedFile is not followed there: the walk resumes at
+                // that end, and `attachment_data` refuses the payload.
                 data_offset = r.stream_position()?;
                 data_size = e.size;
                 has_data = true;
-                skip(r, e.size)?;
+                r.seek(SeekFrom::Start(data_offset.saturating_add(e.size).min(end)))?;
             }
             _ => skip(r, e.size)?,
         }
@@ -7673,6 +7835,7 @@ fn parse_attached_file(
         uid,
         data_offset,
         data_size,
+        parent_end: end,
         referral,
         used_start_time,
         used_end_time,
@@ -7730,6 +7893,9 @@ pub struct Attachment {
     /// child (which would be unusual — the spec marks the element as
     /// mandatory).
     pub data_size: u64,
+    /// Where the AttachedFile holding the payload ends: a payload reaching
+    /// past it, or past the Segment, is refused unread.
+    parent_end: u64,
     /// `FileReferral` (RFC 9559 Appendix A.40, binary) — a reclaimed
     /// legacy element carrying a binary value a track/codec can refer to
     /// when the attachment is needed. `None` when absent (the common
@@ -8041,8 +8207,9 @@ fn parse_cue_reference(r: &mut dyn ReadSeek, end: u64) -> Result<CueReference> {
 /// or the entry is ignored. The parse lands in *temporary* collections
 /// that are merged only when the whole parse succeeds — a hostile or
 /// stale SeekPosition can never leave partially-parsed state behind. A
-/// Cues index cut at its budget is the one exception: the CuePoints that
-/// fit are kept and the cut is a [`DamageEvent`], as in the walk.
+/// Cues, Chapters or Attachments master cut at its budget is the one
+/// exception: the records that fit are kept and the cut is a
+/// [`DamageEvent`], as in the walk.
 /// The caller restores the reader position afterwards.
 #[allow(clippy::too_many_arguments)]
 fn follow_seek_target(
@@ -8114,7 +8281,7 @@ fn follow_seek_target(
             match parse_cues(r, end, cues, cue_points, budgets.cues) {
                 Ok(None) => {}
                 Ok(Some(stop)) => {
-                    budgets.damage_events.push(cues_cut_at(stop, end));
+                    budgets.damage_events.push(cut_at(ids::CUES, stop, end));
                     *budgets.cues_cut = true;
                 }
                 Err(err) => {
@@ -8137,7 +8304,7 @@ fn follow_seek_target(
             let mut tmp_chap_map = std::collections::HashMap::new();
             let mut tmp_ed_map = std::collections::HashMap::new();
             let mut tmp_editions = Vec::new();
-            parse_chapters_typed(
+            let cut = parse_chapters_typed(
                 r,
                 end,
                 &mut tmp_meta,
@@ -8150,15 +8317,21 @@ fn follow_seek_target(
             merge_map(chapter_uid_to_index, tmp_chap_map);
             merge_map(edition_uid_to_index, tmp_ed_map);
             merge(editions, tmp_editions);
+            if let Some(stop) = cut {
+                budgets.damage_events.push(cut_at(ids::CHAPTERS, stop, end));
+            }
         }
         ids::ATTACHMENTS => {
             let mut tmp_meta = Vec::new();
             let mut tmp_att_map = std::collections::HashMap::new();
             let mut tmp_atts = Vec::new();
-            parse_attachments(r, end, &mut tmp_meta, &mut tmp_att_map, &mut tmp_atts, budgets.attachments)?;
+            let cut = parse_attachments(r, end, &mut tmp_meta, &mut tmp_att_map, &mut tmp_atts, budgets.attachments)?;
             merge(metadata, tmp_meta);
             merge_map(attachment_uid_to_index, tmp_att_map);
             merge(attachments, tmp_atts);
+            if let Some(stop) = cut {
+                budgets.damage_events.push(cut_at(ids::ATTACHMENTS, stop, end));
+            }
         }
         _ => return Ok(()),
     }
@@ -8782,22 +8955,13 @@ impl Budget {
         self.charge(buckets.saturating_mul(std::mem::size_of::<T>() + 1).saturating_add(32))
     }
 
-    /// A stored element of `size` octets, charged before any of it is held.
-    /// Its buffer grows only as bytes arrive, so a size the input cannot
-    /// back costs no more than the input does, and ends exactly `size`
-    /// octets large: the capacity charged.
+    /// A stored element of `size` octets, charged before any of it is held
+    /// and read as [`read_growing`] does, so it ends exactly `size` octets
+    /// large: the capacity charged.
     fn read(&mut self, r: &mut dyn ReadSeek, size: u64) -> Result<Vec<u8>> {
         let size = usize::try_from(size).map_err(|_| Error::invalid(self.exceeded))?;
         self.charge(size)?;
-        let mut stored = Vec::new();
-        while stored.len() < size {
-            let start = stored.len();
-            let more = (size - start).min(start.max(64 << 10));
-            stored.reserve_exact(more);
-            stored.resize(start + more, 0);
-            r.read_exact(&mut stored[start..])?;
-        }
-        Ok(stored)
+        Ok(read_growing(r, size)?)
     }
 
     /// Whether a charge has failed since the last call: what was being
@@ -8810,6 +8974,21 @@ impl Budget {
     fn left(&self) -> usize {
         self.left
     }
+}
+
+/// `size` octets of `r` in a buffer that grows in steps only as they
+/// arrive, so a size the input cannot back costs no more than the input
+/// does. The buffer ends exactly `size` octets large.
+fn read_growing(r: &mut dyn ReadSeek, size: usize) -> std::io::Result<Vec<u8>> {
+    let mut stored = Vec::new();
+    while stored.len() < size {
+        let start = stored.len();
+        let more = (size - start).min(start.max(64 << 10));
+        stored.reserve_exact(more);
+        stored.resize(start + more, 0);
+        r.read_exact(&mut stored[start..])?;
+    }
+    Ok(stored)
 }
 
 const BLOCK_OVER_BUDGET: &str = "MKV: Block exceeds its 32 MiB budget";
@@ -10753,7 +10932,9 @@ impl MkvDemuxer {
     /// title), and any nested [`Chapter::children`].
     ///
     /// Returned in the order editions and atoms appear in the Segment.
-    /// Empty when the file carries no `Chapters` element.
+    /// Empty when the file carries no `Chapters` element. A list past its
+    /// 1 MiB budget keeps the chapters that fit, in this order, and its cut
+    /// is a [`DamageEvent`].
     pub fn chapters(&self) -> &[Edition] {
         &self.editions
     }
@@ -10771,7 +10952,9 @@ impl MkvDemuxer {
     /// demand without paying for them at open time.
     ///
     /// Returned in segment order. Empty when the file carries no
-    /// `Attachments` element.
+    /// `Attachments` element. A list past its 1 MiB budget keeps the
+    /// attachments that fit, in this order, and its cut is a
+    /// [`DamageEvent`].
     pub fn attachments(&self) -> &[Attachment] {
         &self.attachments
     }
@@ -10783,13 +10966,16 @@ impl MkvDemuxer {
     /// `attachment:N:*` metadata keys.
     ///
     /// Reads exactly [`Attachment::data_size`] bytes from
-    /// [`Attachment::data_offset`] in the input stream. The reader's
-    /// position is restored afterwards, so calling this between
-    /// `next_packet` calls (or while the demuxer is mid-cluster) is
-    /// safe.
+    /// [`Attachment::data_offset`] in the input stream, in a buffer that
+    /// grows only as the bytes arrive: nothing is allocated for the
+    /// declared size up front. The reader's position is restored
+    /// afterwards, so calling this between `next_packet` calls (or while
+    /// the demuxer is mid-cluster) is safe.
     ///
-    /// Returns `Err(Error::invalid)` if `index` is out of range or
-    /// `0` (attachments are 1-indexed).
+    /// Returns `Err(Error::invalid)` if `index` is out of range or `0`
+    /// (attachments are 1-indexed), if the payload reaches past its
+    /// `AttachedFile` or the Segment (refused before anything is read), or
+    /// if the input ends before the payload does.
     pub fn attachment_data(&mut self, index: u32) -> Result<Vec<u8>> {
         if index == 0 {
             return Err(Error::invalid(
@@ -10803,24 +10989,27 @@ impl MkvDemuxer {
             .ok_or_else(|| Error::invalid(format!("MKV: no attachment with index {index}")))?;
         let offset = att.data_offset;
         let size = att.data_size;
+        let room = att.parent_end.min(self.segment_data_end).saturating_sub(offset);
+        if size > room {
+            return Err(Error::invalid(format!(
+                "MKV: attachment {index} payload of {size} bytes exceeds the {room} bytes left in its parent"
+            )));
+        }
+        let size = usize::try_from(size).map_err(|_| Error::invalid(format!("MKV: attachment {index} payload of {size} bytes")))?;
         // Save and restore the caller's reader position so a payload fetch
         // between `next_packet` calls doesn't shift the cluster walker.
         let saved_pos = self.input.stream_position()?;
         self.input.seek(SeekFrom::Start(offset))?;
-        // `Read::take(n).read_to_end()` grows the destination only as bytes
-        // actually arrive — defensive against the file being truncated below
-        // the recorded `data_size`. Matches the allocation discipline in
-        // `ebml::read_bytes`.
-        let mut out = Vec::new();
-        let n = (&mut *self.input).take(size).read_to_end(&mut out)?;
+        let payload = read_growing(&mut *self.input, size);
         // Restore reader position regardless of the read outcome.
         self.input.seek(SeekFrom::Start(saved_pos))?;
-        if (n as u64) != size {
-            return Err(Error::invalid(format!(
-                "MKV: attachment {index} payload truncated (got {n} of {size} bytes)"
-            )));
+        match payload {
+            Ok(payload) => Ok(payload),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Err(Error::invalid(format!(
+                "MKV: attachment {index} payload truncated (input ends before its {size} bytes)"
+            ))),
+            Err(e) => Err(e.into()),
         }
-        Ok(out)
     }
 
     /// `TrackOperation` (RFC 9559 §5.1.4.1.30) for the stream at

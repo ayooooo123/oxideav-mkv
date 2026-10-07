@@ -175,6 +175,13 @@ fn full_tracks(child: &[u8]) -> Vec<u8> {
     elem(ids::TRACKS, &[first, second].concat())
 }
 
+/// TrackEntry `n` with 64 KiB of CodecPrivate and a BlockAdditionMapping
+/// holding `extra` octets of BlockAddIDExtraData.
+fn filled_entry(n: u64, extra: usize) -> Vec<u8> {
+    let mapping = elem(ids::BLOCK_ADDITION_MAPPING, &elem(ids::BLOCK_ADD_ID_EXTRA_DATA, &vec![2; extra]));
+    elem(ids::TRACK_ENTRY, &[track_fields(n), elem(ids::CODEC_PRIVATE, &vec![1; 64 << 10]), mapping].concat())
+}
+
 #[test]
 fn tracks_stay_within_their_limit() {
     let _serial = serial();
@@ -208,12 +215,7 @@ fn tracks_stay_within_their_limit() {
     }
     // 256 tracks of 64 KiB CodecPrivate each, the whole CodecPrivate
     // budget, and a 24 KiB BlockAddIDExtraData each: kept whole.
-    let entries: Vec<u8> = (1..=256u64)
-        .flat_map(|n| {
-            let mapping = elem(ids::BLOCK_ADDITION_MAPPING, &elem(ids::BLOCK_ADD_ID_EXTRA_DATA, &vec![2; 24 << 10]));
-            elem(ids::TRACK_ENTRY, &[track_fields(n), elem(ids::CODEC_PRIVATE, &vec![1; 64 << 10]), mapping].concat())
-        })
-        .collect();
+    let entries: Vec<u8> = (1..=256u64).flat_map(|n| filled_entry(n, 24 << 10)).collect();
     let (d, peak, held) = opened(file(&[elem(ids::TRACKS, &entries), cluster()]), false);
     let kept = d.as_ref().map(|d| {
         let private = d.streams().iter().filter(|s| s.params.extradata.len() == 64 << 10).count();
@@ -244,4 +246,31 @@ fn tracks_stay_within_their_limit() {
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A CodecPrivate compressed with LZO is decompressed only as far as its
+/// budget allows, so a Tracks master near its limit cannot grow past it
+/// through the decompressor's output.
+#[test]
+fn an_lzo_codec_private_stays_within_the_tracks_limit() {
+    let _serial = serial();
+    // 255 tracks with 64 KiB of CodecPrivate and 40 KiB of extra data each
+    // hold most of the Tracks budget, and all but 64 KiB of the
+    // CodecPrivate budget.
+    let mut entries: Vec<u8> = (1..=255u64).flat_map(|n| filled_entry(n, 40 << 10)).collect();
+    // Track 256 keeps 10 MB of zeros, which LZO packs into about 39 KB.
+    let mut packed = Vec::new();
+    compcol::lzo::block::encode_block(&vec![0; 10_000_000], &mut packed);
+    let compression = elem(ids::CONTENT_COMPRESSION, &uint(ids::CONTENT_COMP_ALGO, ids::CONTENT_COMP_ALGO_LZO1X));
+    let encoding = elem(ids::CONTENT_ENCODING, &[uint(ids::CONTENT_ENCODING_SCOPE, ids::CONTENT_ENCODING_SCOPE_PRIVATE), compression].concat());
+    entries.extend(elem(ids::TRACK_ENTRY, &[
+        track_fields(256), elem(ids::CONTENT_ENCODINGS, &encoding), elem(ids::CODEC_PRIVATE, &packed),
+    ].concat()));
+    let (d, peak, _) = opened(file(&[elem(ids::TRACKS, &entries), cluster()]), false);
+    let outcome = d.as_ref().map(|_| ()).map_err(String::as_str);
+    assert!(
+        outcome == Err("InvalidData") && peak <= LIMIT + SLACK,
+        "{} bytes of LZO: {outcome:?}, peak {peak} heap bytes",
+        packed.len(),
+    );
 }

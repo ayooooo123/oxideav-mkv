@@ -109,12 +109,19 @@ pub(super) fn decompress(
             Decompression::Zlib => inflate::<compcol::zlib::Zlib>(&data, cap, budget)?,
             Decompression::Bzlib => inflate::<compcol::bzip2::Bzip2>(&data, cap, budget)?,
             Decompression::Lzo1x => {
-                // LZO reports any exceeded limit as corruption, so decode to
-                // FFmpeg's bound and apply the budget to the result.
+                // The decoder stops at the tighter of FFmpeg's bound and the
+                // budget, so its output never grows past either. It reports
+                // output past its limit as corruption: when the budget is the
+                // tighter limit, that failure is the output outgrowing the
+                // budget (a stream corrupt in the same way counts so too).
                 let mut out = Vec::new();
-                compcol::lzo::block::decode_block(&data, &mut out, cap)
-                    .map_err(|e| Undo::Corrupt(Error::invalid(format!("MKV: lzo frame: {e:?}"))))?;
-                out
+                match compcol::lzo::block::decode_block(&data, &mut out, cap.min(budget)) {
+                    Ok(()) => out,
+                    Err(compcol::Error::Corrupt) if budget < cap => return Err(Undo::OverBudget),
+                    Err(e) => {
+                        return Err(Undo::Corrupt(Error::invalid(format!("MKV: lzo frame: {e:?}"))));
+                    }
+                }
             }
         };
         if data.len() > budget {

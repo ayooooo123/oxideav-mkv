@@ -1,20 +1,23 @@
 //! The metadata masters read at open stay within their budgets however
 //! their children are sized: every child in a `Tracks` or `Tags` tree must
 //! fit its parent, no Top-Level master but a Cluster may use the unknown
-//! size, `Info` fields keep their lengths, and the Cues index keeps what
-//! fits its budget, seeking past that by scanning the Clusters.
+//! size, `Info` fields keep their lengths, Chapters, Attachments and the
+//! Cues index keep what fits their budgets, seeks past the kept Cues scan
+//! the Clusters, and an attachment payload is read only from inside its
+//! parents.
 //!
 //! Bytes read are counted and the heap is measured by a counting global
 //! allocator. Every test holds one lock, so nothing else allocates while
 //! one measures.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::BTreeMap;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use oxideav_core::{Demuxer, Error, NullCodecResolver, ReadSeek};
-use oxideav_mkv::demux::{self, DamageKind};
+use oxideav_mkv::demux::{self, Chapter, DamageKind};
 use oxideav_mkv::ebml::{write_element_id, write_vint};
 use oxideav_mkv::ids;
 
@@ -349,28 +352,162 @@ fn chapter_and_attachment_text_fields_hold_64_kib() {
     assert!(cases.0.is_empty(), "{:#?}", cases.0);
 }
 
-/// Chapters and Attachments each keep at most 1 MiB of records: twenty
-/// thousand small chapters or attached files are over it, a hundred of
-/// either are not.
+/// The chapters of `chapters` depth first, as (index, UID) pairs.
+fn chapter_order(chapters: &[Chapter], out: &mut Vec<(u64, u64)>) {
+    for c in chapters {
+        out.push((u64::from(c.index), c.uid.unwrap_or(0)));
+        chapter_order(&c.children, out);
+    }
+}
+
+/// What an open of `input` keeps: its first packet, the chapters depth
+/// first and the attachments, each as (index, UID) pairs, how many flat
+/// metadata keys name each index under `scope`, and the damage noted.
+#[derive(Debug)]
+struct Kept {
+    packet: Result<Vec<u8>, String>,
+    chapters: Vec<(u64, u64)>,
+    attachments: Vec<(u64, u64)>,
+    flat: BTreeMap<u64, usize>,
+    damage: Vec<DamageKind>,
+}
+
+fn kept(input: Box<dyn ReadSeek>, resilient: bool, scope: &str) -> Result<Kept, String> {
+    let mut d = if resilient {
+        demux::open_resilient_typed(input, &NullCodecResolver)
+    } else {
+        demux::open_typed(input, &NullCodecResolver)
+    }.map_err(kind)?;
+    let mut chapters = Vec::new();
+    for edition in d.chapters() {
+        chapter_order(&edition.chapters, &mut chapters);
+    }
+    let attachments = d.attachments().iter().map(|a| (u64::from(a.index), a.uid)).collect();
+    let mut flat = BTreeMap::new();
+    for (key, _) in d.metadata() {
+        let mut parts = key.split(':');
+        if parts.next() == Some(scope) {
+            if let Some(i) = parts.next().and_then(|i| i.parse().ok()) {
+                *flat.entry(i).or_insert(0) += 1;
+            }
+        }
+    }
+    let damage = d.damage_events().iter().map(|e| e.kind()).collect();
+    let packet = d.next_packet().map(|p| p.data).map_err(kind);
+    Ok(Kept { packet, chapters, attachments, flat, damage })
+}
+
+/// What the open may hold when a list overruns its 1 MiB budget: the
+/// budget, and the rest of the open.
+const CUT_PEAK: usize = (1 << 20) + (512 << 10);
+
+/// Builds a master holding the number of records it is given.
+type Master<'a> = &'a dyn Fn(u64) -> Vec<u8>;
+
+/// Past their 1 MiB budget, Chapters and Attachments keep the records that
+/// fit, in order and with their flat metadata, note the cut as one damage
+/// event and let the open go on, strict or resilient, in line or found
+/// through the SeekHead: a long list never stops playback.
 #[test]
-fn chapters_and_attachments_keep_at_most_1_mib() {
+fn chapters_and_attachments_past_1_mib_keep_what_fit() {
     let _serial = serial();
-    let mut cases = Cases::default();
-    let with = |master: Vec<u8>| file(&[tracks(), master, cluster(0, b"a")]);
-    let chapters = |n: u64| elem(ids::CHAPTERS, &elem(ids::EDITION_ENTRY, &(1..=n).flat_map(|i| chapter_atom(i, b"c")).collect::<Vec<u8>>()));
+    let mut failures = Vec::new();
+    let flat_chapters = |n: u64| {
+        elem(ids::CHAPTERS, &elem(ids::EDITION_ENTRY, &(1..=n).flat_map(|i| chapter_atom(i, b"c")).collect::<Vec<u8>>()))
+    };
+    // One chapter holding all the others.
+    let nested_chapters = |n: u64| {
+        let children: Vec<u8> = (2..=n).flat_map(|i| chapter_atom(i, b"c")).collect();
+        let parent = [uint(ids::CHAPTER_UID, 1), elem(ids::CHAPTER_DISPLAY, &elem(ids::CHAP_STRING, b"p")), children].concat();
+        elem(ids::CHAPTERS, &elem(ids::EDITION_ENTRY, &elem(ids::CHAPTER_ATOM, &parent)))
+    };
     let attachments = |n: u64| elem(ids::ATTACHMENTS, &(1..=n).flat_map(|i| attached_file(i, b"f", b"d")).collect::<Vec<u8>>());
-    for (name, master) in [("chapters", &chapters as &dyn Fn(u64) -> Vec<u8>), ("attached files", &attachments)] {
-        cases.check(&format!("100 {name}"), with(master(100)), false, Ok(b"a"));
-        let over = with(master(20_000));
-        cases.check(&format!("20,000 {name}"), over.clone(), false, Err("InvalidData"));
-        cases.check(&format!("20,000 {name}, resilient"), over, true, Ok(b"a"));
+    // Each list, the flat metadata scope and how many keys each record gets
+    // there: start time and title, or name, MIME type and size.
+    let lists: [(&str, u32, &str, usize, Master); 3] = [
+        ("chapters", ids::CHAPTERS, "chapter", 2, &flat_chapters),
+        ("nested chapters", ids::CHAPTERS, "chapter", 2, &nested_chapters),
+        ("attached files", ids::ATTACHMENTS, "attachment", 3, &attachments),
+    ];
+    for (name, id, scope, keys, list) in lists {
+        for n in [100, 20_000u64] {
+            let (t, master, c) = (tracks(), list(n), cluster(0, b"a"));
+            let position = (index(id, 0).len() + t.len() + c.len()) as u64;
+            let layouts = [
+                ("in line", file(&[t.clone(), master.clone(), c.clone()])),
+                ("after the Clusters", file(&[index(id, position), t, c, master])),
+            ];
+            for (layout, bytes) in layouts {
+                for resilient in [false, true] {
+                    let case = format!("{n} {name} {layout}{}", if resilient { ", resilient" } else { "" });
+                    let (outcome, _, peak) = measure(bytes.clone(), |input| kept(input, resilient, scope));
+                    let Ok(kept) = outcome else {
+                        failures.push(format!("{case}: open {outcome:?}"));
+                        continue;
+                    };
+                    let records = if id == ids::CHAPTERS { &kept.chapters } else { &kept.attachments };
+                    let k = records.len() as u64;
+                    let prefix: Vec<(u64, u64)> = (1..=k).map(|i| (i, i)).collect();
+                    let flat: BTreeMap<u64, usize> = (1..=k).map(|i| (i, keys)).collect();
+                    let (cut, bound) = if n == 100 { (vec![], SMALL) } else { (vec![DamageKind::DamagedMaster(id)], CUT_PEAK) };
+                    let whole = if n == 100 { k == n } else { k > 0 && k < n };
+                    if kept.packet != Ok(b"a".to_vec()) || !whole || *records != prefix || kept.flat != flat || kept.damage != cut || peak >= bound {
+                        failures.push(format!(
+                            "{case}: packet {:?}, kept {k} in order {}, flat keys {}, damage {:?}, peak {peak} heap bytes",
+                            kept.packet, *records == prefix, kept.flat == flat, kept.damage,
+                        ));
+                    }
+                }
+            }
+        }
     }
-    let d = demux::open_typed(Box::new(Cursor::new(with(chapters(100)))), &NullCodecResolver).unwrap();
-    let kept = d.chapters().iter().map(|e| e.chapters.len()).sum::<usize>();
-    if kept != 100 {
-        cases.0.push(format!("100 chapters kept {kept}"));
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// An attachment payload is read only from inside its AttachedFile and
+/// the Segment, its buffer growing as the bytes arrive. A FileData
+/// declaring 4 GiB that its AttachedFile does not hold is refused unread,
+/// and the open steps over it to the Clusters.
+#[test]
+fn attachment_payloads_are_read_only_inside_their_parents() {
+    let _serial = serial();
+    let mut failures = Vec::new();
+    // A real payload spanning several reads.
+    let payload: Vec<u8> = (0..200u32 << 10).map(|i| (i % 251) as u8).collect();
+    let forged = elem(ids::ATTACHED_FILE, &[
+        elem(ids::FILE_NAME, b"forged.ttf"), uint(ids::FILE_UID, 2),
+        header(ids::FILE_DATA, 1 << 32), b"abcdefgh".to_vec(),
+    ].concat());
+    let attachments = elem(ids::ATTACHMENTS, &[attached_file(1, b"real.ttf", &payload), forged].concat());
+    let layouts = [
+        ("in a tiny file", file(&[tracks(), attachments.clone(), cluster(0, b"a")])),
+        ("before 4 MiB more", file(&[tracks(), attachments, cluster(0, b"a"), void(4 << 20)])),
+    ];
+    for (layout, bytes) in layouts {
+        let read = Arc::new(AtomicUsize::new(0));
+        let input = Box::new(Counted { inner: Cursor::new(bytes), read: read.clone() });
+        let mut d = match demux::open_typed(input, &NullCodecResolver) {
+            Ok(d) => d,
+            Err(e) => {
+                failures.push(format!("{layout}: open {}", kind(e)));
+                continue;
+            }
+        };
+        let packet = d.next_packet().map(|p| p.data).map_err(kind);
+        let real = d.attachment_data(1).map_err(kind);
+        read.store(0, Ordering::SeqCst);
+        let base = LIVE.load(Ordering::SeqCst);
+        PEAK.store(base, Ordering::SeqCst);
+        let forged = d.attachment_data(2).map(|data| data.len()).map_err(kind);
+        let (forged_read, peak) = (read.load(Ordering::SeqCst), PEAK.load(Ordering::SeqCst) - base);
+        let real_exact = real.as_ref() == Ok(&payload);
+        if packet != Ok(b"a".to_vec()) || !real_exact || forged != Err("InvalidData".to_string()) || forged_read > 8 || peak >= 64 << 10 {
+            failures.push(format!(
+                "{layout}: packet {packet:?}, real payload exact {real_exact}, forged {forged:?} after reading {forged_read} bytes, peak {peak} heap bytes",
+            ));
+        }
     }
-    assert!(cases.0.is_empty(), "{:#?}", cases.0);
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 /// A CuePoint at `time` for track 1, in the Cluster at Segment Position
