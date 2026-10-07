@@ -76,7 +76,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A failed seek is treated as physical truncation only when its target
   exceeds a confirmed physical end. Seeking resets the resync floor;
   a forged SignatureSlot must fit its Cluster; Vorbis recognises 64 modes
-  and restores mode 0's window on seek.
+  and restores mode 0's window on seek. A Top-Level master is read for its
+  `CRC-32` only when its first child is one, then in 16 KiB chunks; a
+  third SeekHead is skipped unread. Every BlockGroup child must fit its
+  parent, and stored children and their records are charged to the Block's
+  budget before they are read or held, including before a Block waits for
+  room. A Block emits exactly the frames its lace declares, so a one-frame
+  EBML lace is InvalidData; a Block that fails after waiting recovers from
+  its own offset. Source errors while reading trailing Tags, a Cluster's
+  `CRC-32`, a seek's Block headers or a Cue landing are returned instead of
+  skipping the element or landing elsewhere.
 - Laces advance by their per-frame durations rather than repeating the
   first timestamp. BlockDuration and DefaultDuration use FFmpeg 9's integer
   remainder distribution; duration-less Vorbis, Opus, FLAC, WavPack, MP3,

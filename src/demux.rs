@@ -311,6 +311,9 @@ fn open_typed_impl(
             input.seek(SeekFrom::Start(body_start - e.header_len as u64))?;
             break;
         }
+        // A SeekHead past the two RFC 9559 §5.1.1 allows is skipped below
+        // unread: not even its CRC-32 is checked.
+        let over_quota = e.id == ids::SEEK_HEAD && seek_heads >= MAX_SEEK_HEADS;
         // Parse the Top-Level master. In resilient mode the whole parse is
         // fallible-but-recoverable: whatever the parser lifted before an
         // error is kept, the rest of the element is skipped, and the walk
@@ -321,7 +324,7 @@ fn open_typed_impl(
             // body). The helper rewinds the reader to `body_start` so the
             // parse below is unaffected.
             if let Some(end) = body_end_known {
-                if matches!(
+                if !over_quota && matches!(
                     e.id,
                     ids::INFO
                         | ids::TRACKS
@@ -1657,7 +1660,8 @@ const MAX_SEEK_HEADS: usize = 2;
 const MAX_SEEK_ENTRIES: usize = 4096;
 /// Bytes one Block retains: its frames after undoing ContentEncodings and
 /// restoring codec framing, every virtual-track copy, and its
-/// BlockAdditions / BlockGroup side data.
+/// BlockAdditions / BlockGroup side data. Reading a BlockGroup charges its
+/// stored children and their records before they are held.
 const MAX_BLOCK_BYTES: usize = 32 << 20;
 /// One track's `CodecPrivate`, stored or decompressed.
 const MAX_CODEC_PRIVATE: usize = 4 << 20;
@@ -1707,6 +1711,16 @@ fn source_error(error: std::io::Error) -> std::io::Error {
         error
     } else {
         std::io::Error::new(error.kind(), SourceError(error))
+    }
+}
+
+/// `None` for damage the caller steps over; the source's own failure is
+/// returned as itself (see [`is_damage`]).
+fn recoverable<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if is_damage(&e) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -2316,14 +2330,15 @@ impl TrackLegacy {
 /// Per RFC 8794 §11.3.1 the `CRC-32` element, if used, MUST be the first
 /// ordered child of its parent, and its 4-byte value is the IEEE CRC-32 of
 /// all the parent's Element Data *except* the `CRC-32` element itself,
-/// computed and stored little-endian. So we read the body once, peel off a
-/// leading `CRC-32` child if there is one, and CRC the remainder.
+/// computed and stored little-endian. Only the first child's header is
+/// read to find one, so a master without it (an attachment's megabytes,
+/// say) is not read here at all; a present one is checked over the rest of
+/// the body in fixed-size chunks.
 ///
 /// Returns `Ok(None)` when the element has no leading `CRC-32` child (the
 /// common, spec-permitted case) and `Ok(Some(status))` when one was found
-/// and checked. Any short read leaves the reader rewound and yields
-/// `Ok(None)` rather than failing the whole open — a torn checksum should
-/// not make an otherwise-readable file un-demuxable.
+/// and checked. A read cut short, or the source's own failure, is an
+/// error.
 fn validate_top_level_crc(
     r: &mut dyn ReadSeek,
     element_id: u32,
@@ -2337,40 +2352,34 @@ fn validate_top_level_crc(
         r.seek(SeekFrom::Start(body_start))?;
         return Ok(None);
     }
+    // The first child's ID, a size VINT of at most 8 octets and a 4-octet
+    // value fit in 13 octets.
+    let mut head = [0u8; 13];
+    let head_len = len.min(head.len() as u64) as usize;
     r.seek(SeekFrom::Start(body_start))?;
-    let body = read_bytes(r, len as usize)?;
-    // Always rewind for the caller before returning, regardless of outcome.
-    r.seek(SeekFrom::Start(body_start))?;
-
-    let mut cur = std::io::Cursor::new(&body[..]);
-    let (id, _) = match read_vint(&mut cur, true) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
-    };
-    if id != ids::CRC32 as u64 {
-        return Ok(None);
-    }
-    let (size, _) = match read_vint(&mut cur, false) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
-    };
-    if size != 4 {
+    r.read_exact(&mut head[..head_len])?;
+    let mut cur = std::io::Cursor::new(&head[..head_len]);
+    let is_crc = matches!(read_vint(&mut cur, true), Ok((id, _)) if id == ids::CRC32 as u64)
         // A CRC-32 element is fixed at 4 bytes; a different size is
         // malformed — treat as "no CRC to check" rather than erroring.
-        return Ok(None);
-    }
+        && matches!(read_vint(&mut cur, false), Ok((4, _)));
     let header_len = cur.position() as usize;
-    if header_len + 4 > body.len() {
+    if !is_crc || header_len + 4 > head_len {
+        r.seek(SeekFrom::Start(body_start))?;
         return Ok(None);
     }
-    let stored = u32::from_le_bytes([
-        body[header_len],
-        body[header_len + 1],
-        body[header_len + 2],
-        body[header_len + 3],
-    ]);
-    let rest = &body[header_len + 4..];
-    let computed = crc32_ieee(rest);
+    let value = &head[header_len..header_len + 4];
+    let stored = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+    let mut computed = crc32_ieee(&head[header_len + 4..head_len]);
+    let mut chunk = [0u8; 16 * 1024];
+    let mut pos = body_start + head_len as u64;
+    while pos < body_end {
+        let n = (body_end - pos).min(chunk.len() as u64) as usize;
+        r.read_exact(&mut chunk[..n])?;
+        computed = crc32_ieee_update(computed, &chunk[..n]);
+        pos += n as u64;
+    }
+    r.seek(SeekFrom::Start(body_start))?;
     Ok(Some(CrcStatus {
         element_id,
         stored,
@@ -8303,6 +8312,42 @@ fn parse_block_addition_mapping(r: &mut dyn ReadSeek, end: u64) -> Result<BlockA
     })
 }
 
+/// What one Block may still retain while its `BlockGroup` is read — see
+/// [`MAX_BLOCK_BYTES`]. Charged before each read or allocation, so a Block
+/// over its budget fails before it holds the memory.
+struct BlockBudget(usize);
+
+impl BlockBudget {
+    fn charge(&mut self, bytes: usize) -> Result<()> {
+        self.0 = self.0.checked_sub(bytes).ok_or_else(block_over_budget)?;
+        Ok(())
+    }
+
+    /// Room in `records` for one more, charging its growth first.
+    fn room<T>(&mut self, records: &mut Vec<T>) -> Result<()> {
+        if records.len() == records.capacity() {
+            let more = records.capacity().max(4);
+            self.charge(more.saturating_mul(std::mem::size_of::<T>()))?;
+            records.reserve_exact(more);
+        }
+        Ok(())
+    }
+}
+
+fn block_over_budget() -> Error {
+    Error::invalid("MKV: Block exceeds its 32 MiB budget")
+}
+
+/// The end of the element whose header `r` has just read, which must lie
+/// within its parent's.
+fn child_end(r: &mut dyn ReadSeek, size: u64, parent_end: u64) -> Result<u64> {
+    let end = r.stream_position()?.saturating_add(size);
+    if size == VINT_UNKNOWN_SIZE || end > parent_end {
+        return Err(Error::invalid("MKV: element exceeds its parent"));
+    }
+    Ok(end)
+}
+
 /// Parse a `BlockAdditions` master (RFC 9559 §5.1.3.5.2) into a list of
 /// typed [`BlockAddition`]s, in on-disk `BlockMore` order.
 ///
@@ -8321,26 +8366,33 @@ fn parse_block_addition_mapping(r: &mut dyn ReadSeek, end: u64) -> Result<BlockA
 ///   makes id uniqueness within one `BlockAdditions` a MUST, so a later
 ///   duplicate is the invalid one.
 /// * Unknown children are skipped (forward-compat).
-fn parse_block_additions(r: &mut dyn ReadSeek, end: u64) -> Result<Vec<BlockAddition>> {
+/// * Every child must fit its parent; payloads and records are charged to
+///   the Block's budget before they are read or stored.
+fn parse_block_additions(r: &mut dyn ReadSeek, end: u64, budget: &mut BlockBudget) -> Result<Vec<BlockAddition>> {
     let mut out: Vec<BlockAddition> = Vec::new();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::BLOCK_MORE => {
-                let bm_end = r.stream_position()?.saturating_add(e.size);
                 // §5.1.3.5.2.3 default: BlockAddID = 1 (codec-defined).
                 let mut id: u64 = 1;
                 let mut data: Option<Vec<u8>> = None;
-                while r.stream_position()? < bm_end {
+                while r.stream_position()? < e_end {
                     let c = read_element_header(r)?;
+                    child_end(r, c.size, e_end)?;
                     match c.id {
                         ids::BLOCK_ADD_ID => id = read_uint(r, c.size as usize)?,
-                        ids::BLOCK_ADDITIONAL => data = Some(read_bytes(r, c.size as usize)?),
+                        ids::BLOCK_ADDITIONAL => {
+                            budget.charge(c.size as usize)?;
+                            data = Some(read_bytes(r, c.size as usize)?);
+                        }
                         _ => skip(r, c.size)?,
                     }
                 }
                 if let Some(data) = data {
                     if id != 0 && !out.iter().any(|a| a.id == id) {
+                        budget.room(&mut out)?;
                         out.push(BlockAddition { id, data });
                     }
                 }
@@ -8356,16 +8408,19 @@ fn parse_block_additions(r: &mut dyn ReadSeek, end: u64) -> Result<Vec<BlockAddi
 /// on-disk order. Each `TimeSlice` folds the five reclaimed per-lace
 /// timing fields (A.7..A.11). A `TimeSlice` that carried none of them
 /// still surfaces (an empty record) so a re-mux can preserve the element
-/// count. Non-`TimeSlice` children of `Slices` are skipped.
-fn parse_slices(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TimeSlice>) -> Result<()> {
+/// count; each record is charged to the Block's budget before it is
+/// stored. Non-`TimeSlice` children of `Slices` are skipped, and every
+/// child must fit its parent.
+fn parse_slices(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TimeSlice>, budget: &mut BlockBudget) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::TIME_SLICE => {
-                let ts_end = r.stream_position()?.saturating_add(e.size);
                 let mut ts = TimeSlice::default();
-                while r.stream_position()? < ts_end {
+                while r.stream_position()? < e_end {
                     let c = read_element_header(r)?;
+                    child_end(r, c.size, e_end)?;
                     match c.id {
                         ids::LACE_NUMBER => ts.lace_number = Some(read_uint(r, c.size as usize)?),
                         ids::FRAME_NUMBER => ts.frame_number = Some(read_uint(r, c.size as usize)?),
@@ -8379,6 +8434,7 @@ fn parse_slices(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TimeSlice>) -> Res
                         _ => skip(r, c.size)?,
                     }
                 }
+                budget.room(out)?;
                 out.push(ts);
             }
             _ => skip(r, e.size)?,
@@ -8389,11 +8445,13 @@ fn parse_slices(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TimeSlice>) -> Res
 
 /// Parse a `ReferenceFrame` master (RFC 9559 Appendix A.12, id `0xC8`)
 /// into its `ReferenceOffset` (A.13, id `0xC9`) and `ReferenceTimestamp`
-/// (A.14, id `0xCA`) uinteger children. Any other child is skipped.
+/// (A.14, id `0xCA`) uinteger children. Any other child is skipped; every
+/// child must fit the `ReferenceFrame`.
 fn parse_reference_frame(r: &mut dyn ReadSeek, end: u64) -> Result<ReferenceFrame> {
     let mut rf = ReferenceFrame::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        child_end(r, e.size, end)?;
         match e.id {
             ids::REFERENCE_OFFSET => rf.reference_offset = Some(read_uint(r, e.size as usize)?),
             ids::REFERENCE_TIMESTAMP => {
@@ -8933,6 +8991,10 @@ struct DeferredBlock {
     explicit_duration: Option<i64>,
     additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
     meta: Option<std::sync::Arc<BlockGroupMeta>>,
+    /// Offset of the `SimpleBlock` / `BlockGroup` element: where the walk
+    /// recovers if the Block fails once it is queued, rather than wherever
+    /// the walk has read on to.
+    offset: u64,
 }
 
 /// Matroska / WebM demuxer.
@@ -9261,14 +9323,16 @@ impl Demuxer for MkvDemuxer {
                     return Ok(q.packet);
                 }
             }
-            let before = self.input.stream_position()?;
-            let step = if let Some(block) = self.deferred_block.take() {
-                self.queue_block_packets_with(
+            let (step, failed_at) = if let Some(block) = self.deferred_block.take() {
+                let at = block.offset;
+                let step = self.queue_block_packets_with(
                     block.bytes, block.cluster_timecode, block.group_keyframe,
-                    block.explicit_duration, block.additions, block.meta,
-                )
+                    block.explicit_duration, block.additions, block.meta, at,
+                );
+                (step, at)
             } else {
-                self.advance()
+                let before = self.input.stream_position()?;
+                (self.advance(), before)
             };
             let step = match step {
                 Ok(()) => Ok(()),
@@ -9276,7 +9340,7 @@ impl Demuxer for MkvDemuxer {
                 // Damaged Cluster stream — seek the next Top-Level element
                 // without discarding packets held for timestamp analysis.
                 // Transport failures are not damage; they reach the caller.
-                Err(e) if is_damage(&e) => self.resync_cluster_stream(before),
+                Err(e) if is_damage(&e) => self.resync_cluster_stream(failed_at),
                 Err(e) => Err(e),
             };
             match step {
@@ -9816,15 +9880,15 @@ impl MkvDemuxer {
 
     /// Probe what actually sits at a `CueClusterPosition` target offset
     /// — shared by [`Self::audit_cues`] and the resilient `seek_to`
-    /// verification. Moves the reader; callers reposition.
+    /// verification. Moves the reader; callers reposition. The source's own
+    /// failure is returned rather than taken for a lie.
     fn probe_cue_target(&mut self, abs: u64) -> Result<CueProbe> {
         if abs >= self.segment_data_end {
             return Ok(CueProbe::OutOfSegment);
         }
         self.input.seek(SeekFrom::Start(abs))?;
-        let e = match read_element_header(&mut *self.input) {
-            Ok(e) => e,
-            Err(_) => return Ok(CueProbe::NotCluster),
+        let Some(e) = recoverable(read_element_header(&mut *self.input))? else {
+            return Ok(CueProbe::NotCluster);
         };
         if e.id != ids::CLUSTER {
             return Ok(CueProbe::NotCluster);
@@ -9843,17 +9907,16 @@ impl MkvDemuxer {
             .min(self.segment_data_end);
         let mut timestamp = None;
         while self.input.stream_position()? < limit {
-            let c = match read_element_header(&mut *self.input) {
-                Ok(c) => c,
-                Err(_) => break,
+            let Some(c) = recoverable(read_element_header(&mut *self.input))? else {
+                break;
             };
             match c.id {
                 ids::TIMECODE => {
-                    timestamp = read_uint(&mut *self.input, c.size as usize).ok();
+                    timestamp = recoverable(read_uint(&mut *self.input, c.size as usize))?;
                     break;
                 }
                 ids::CRC32 | ids::POSITION | ids::PREV_SIZE | ids::SILENT_TRACKS => {
-                    if skip(&mut *self.input, c.size).is_err() {
+                    if recoverable(skip(&mut *self.input, c.size))?.is_none() {
                         break;
                     }
                 }
@@ -10972,7 +11035,8 @@ impl MkvDemuxer {
     /// relative position runs past the Cluster body, the helper leaves
     /// the reader at the Cluster header and the state at `Idle` so the
     /// regular `advance()` loop can take over — i.e. it degrades to the
-    /// legacy "scan the cluster from the start" path.
+    /// legacy "scan the cluster from the start" path. A source failure is
+    /// returned instead.
     fn apply_cue_relative_position(&mut self, relative_position: u64) -> Result<()> {
         let cluster_head_pos = self.input.stream_position()?;
         let e = read_element_header(&mut *self.input)?;
@@ -11015,12 +11079,9 @@ impl MkvDemuxer {
         let mut pos = body_start;
         while pos < target {
             self.input.seek(SeekFrom::Start(pos))?;
-            let child = match read_element_header(&mut *self.input) {
-                Ok(c) => c,
-                Err(_) => {
-                    self.input.seek(SeekFrom::Start(cluster_head_pos))?;
-                    return Ok(());
-                }
+            let Some(child) = recoverable(read_element_header(&mut *self.input))? else {
+                self.input.seek(SeekFrom::Start(cluster_head_pos))?;
+                return Ok(());
             };
             // Compute the position right after the child (id+size+body).
             let child_body_start = self.input.stream_position()?;
@@ -11068,7 +11129,8 @@ impl MkvDemuxer {
     /// malformed walk, an out-of-range `n`, or a non-Cluster element, the
     /// reader is rewound to the Cluster header and the regular `advance()`
     /// walk takes over — byte-for-byte the legacy behaviour, so the seek
-    /// still lands at the start of the right Cluster.
+    /// still lands at the start of the right Cluster. A source failure is
+    /// returned instead.
     fn apply_cue_block_number(&mut self, n: u64) -> Result<()> {
         let cluster_head_pos = self.input.stream_position()?;
         if n == 0 {
@@ -11097,12 +11159,9 @@ impl MkvDemuxer {
         let mut target: Option<u64> = None;
         while pos < body_end {
             self.input.seek(SeekFrom::Start(pos))?;
-            let child = match read_element_header(&mut *self.input) {
-                Ok(c) => c,
-                Err(_) => {
-                    self.input.seek(SeekFrom::Start(cluster_head_pos))?;
-                    return Ok(());
-                }
+            let Some(child) = recoverable(read_element_header(&mut *self.input))? else {
+                self.input.seek(SeekFrom::Start(cluster_head_pos))?;
+                return Ok(());
             };
             let child_body_start = self.input.stream_position()?;
             if child.id == ids::TIMECODE {
@@ -11161,10 +11220,10 @@ impl MkvDemuxer {
     /// * A Cluster declared with unknown size (`body_end ==
     ///   self.segment_data_end`) can't be CRC-checked — RFC 8794 §11.3.1
     ///   requires a bounded body — so the check is skipped.
-    /// * A truncated read, a walk that leaves the Cluster early (a seek, a
-    ///   damaged child) or any other I/O hiccup silently degrades to "no
-    ///   status recorded"; the Cluster still demuxes normally per RFC 8794
-    ///   §12 ("a reader MAY ignore the data").
+    /// * A read cut short or a walk that leaves the Cluster early (a seek,
+    ///   a damaged child) degrades to "no status recorded"; the Cluster
+    ///   still demuxes normally per RFC 8794 §12 ("a reader MAY ignore the
+    ///   data"). The source's own failure is returned.
     /// * The dedup set keyed on `body_start` guarantees the same Cluster
     ///   isn't recorded twice when a back-then-forward seek revisits it.
     fn validate_cluster_crc(
@@ -11189,8 +11248,8 @@ impl MkvDemuxer {
         }
         // A CRC-32 element is fixed at 4 bytes; any other size is
         // malformed — "no CRC to check" rather than an error.
-        let stored = match read_element_header(&mut *self.input) {
-            Ok(e) if e.id == ids::CRC32 && e.size == 4 => read_bytes(&mut *self.input, 4).ok(),
+        let stored = match recoverable(read_element_header(&mut *self.input))? {
+            Some(e) if e.id == ids::CRC32 && e.size == 4 => recoverable(read_bytes(&mut *self.input, 4))?,
             _ => None,
         };
         let crc_end = self.input.stream_position()?;
@@ -11341,7 +11400,8 @@ impl MkvDemuxer {
     /// Damage-tolerant like the rest of the resilient stream walk: an
     /// unparseable stretch is stepped over with the same Top-Level scan
     /// `next_packet` resynchronisation uses (no [`DamageEvent`] is
-    /// recorded — the scan is navigation, not packet loss).
+    /// recorded — the scan is navigation, not packet loss). The source's
+    /// own failure is returned, not stepped over.
     fn seek_by_cluster_scan(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
         let target_ticks = self.stream_pts_to_ticks(stream_index, pts);
         // A zero-Cluster Segment has nothing to scan — same signal the
@@ -11365,9 +11425,9 @@ impl MkvDemuxer {
         let mut fallback: Option<(u64, u64)> = None;
         while pos < self.segment_data_end {
             self.input.seek(SeekFrom::Start(pos))?;
-            let e = match read_element_header(&mut *self.input) {
-                Ok(e) => e,
-                Err(_) => {
+            let e = match recoverable(read_element_header(&mut *self.input))? {
+                Some(e) => e,
+                None => {
                     match scan_top_level_element(
                         &mut *self.input,
                         pos.saturating_add(1),
@@ -11392,20 +11452,19 @@ impl MkvDemuxer {
                 let mut tc: Option<u64> = None;
                 let child_limit = bounded_end.unwrap_or(self.segment_data_end);
                 while self.input.stream_position()? < child_limit {
-                    let c = match read_element_header(&mut *self.input) {
-                        Ok(c) => c,
-                        Err(_) => break,
+                    let Some(c) = recoverable(read_element_header(&mut *self.input))? else {
+                        break;
                     };
                     match c.id {
                         ids::TIMECODE => {
-                            tc = read_uint(&mut *self.input, c.size as usize).ok();
+                            tc = recoverable(read_uint(&mut *self.input, c.size as usize))?;
                             break;
                         }
                         // §5.1.3.1 usage note: Timestamp SHOULD be first,
                         // or second after a CRC-32 — tolerate Position /
                         // PrevSize / SilentTracks in front too.
                         ids::CRC32 | ids::POSITION | ids::PREV_SIZE | ids::SILENT_TRACKS => {
-                            if skip(&mut *self.input, c.size).is_err() {
+                            if recoverable(skip(&mut *self.input, c.size))?.is_none() {
                                 break;
                             }
                         }
@@ -11476,9 +11535,8 @@ impl MkvDemuxer {
         let mut pos = body_start;
         while pos < self.segment_data_end {
             self.input.seek(SeekFrom::Start(pos))?;
-            let c = match read_element_header(&mut *self.input) {
-                Ok(c) => c,
-                Err(_) => return Ok(None),
+            let Some(c) = recoverable(read_element_header(&mut *self.input))? else {
+                return Ok(None);
             };
             if TOP_LEVEL_IDS.contains(&c.id) {
                 return Ok(Some(pos));
@@ -11507,9 +11565,8 @@ impl MkvDemuxer {
         let mut pos = start;
         while pos < end {
             self.input.seek(SeekFrom::Start(pos))?;
-            let e = match read_element_header(&mut *self.input) {
-                Ok(e) => e,
-                Err(_) => break,
+            let Some(e) = recoverable(read_element_header(&mut *self.input))? else {
+                break;
             };
             let body_start = self.input.stream_position()?;
             let unknown_size = e.size == VINT_UNKNOWN_SIZE;
@@ -11539,8 +11596,8 @@ impl MkvDemuxer {
             let mut cluster_stop = Some(walk_end);
             while child < walk_end {
                 self.input.seek(SeekFrom::Start(child))?;
-                let c = match read_element_header(&mut *self.input) {
-                    Ok(c) if c.size != VINT_UNKNOWN_SIZE => c,
+                let c = match recoverable(read_element_header(&mut *self.input))? {
+                    Some(c) if c.size != VINT_UNKNOWN_SIZE => c,
                     _ => {
                         cluster_stop = None;
                         break;
@@ -11555,7 +11612,7 @@ impl MkvDemuxer {
                 // `(keyframe, timestamp offset)` of a Block of the track.
                 let block = match c.id {
                     ids::TIMECODE => {
-                        if let Ok(v) = read_uint(&mut *self.input, c.size as usize) {
+                        if let Some(v) = recoverable(read_uint(&mut *self.input, c.size as usize))? {
                             cluster_timecode = v as i64;
                         }
                         None
@@ -11570,8 +11627,8 @@ impl MkvDemuxer {
                         let mut g = c_body;
                         while g < c_end.min(walk_end) {
                             self.input.seek(SeekFrom::Start(g))?;
-                            let gc = match read_element_header(&mut *self.input) {
-                                Ok(gc) if gc.size != VINT_UNKNOWN_SIZE => gc,
+                            let gc = match recoverable(read_element_header(&mut *self.input))? {
+                                Some(gc) if gc.size != VINT_UNKNOWN_SIZE => gc,
                                 _ => break,
                             };
                             let gc_body = self.input.stream_position()?;
@@ -11620,12 +11677,13 @@ impl MkvDemuxer {
 
     /// Read the header of a Block body of `size` bytes at the reader
     /// (RFC 9559 §10.1): track number, signed 16-bit timestamp offset and
-    /// flags. `None` when the body is too short to hold one.
+    /// flags. `None` when the body is too short to hold one or is cut
+    /// short; the source's own failure is returned.
     fn read_block_header(&mut self, size: u64) -> Result<Option<(u64, i64, u8)>> {
         // An 8-octet track number VINT plus timestamp and flags.
         let mut head = [0u8; 11];
         let len = size.min(head.len() as u64) as usize;
-        if self.input.read_exact(&mut head[..len]).is_err() {
+        if recoverable(self.input.read_exact(&mut head[..len]).map_err(Error::from))?.is_none() {
             return Ok(None);
         }
         let mut cur = std::io::Cursor::new(&head[..len]);
@@ -11675,11 +11733,12 @@ impl MkvDemuxer {
     ///
     /// UID scopes resolve against the same maps the open-time walk built,
     /// so `tag:track:N:*` / `tag:chapter:N:*` keys keep their meaning.
-    /// Best-effort by design: an unknown-size or malformed `Tags` element
-    /// is skipped without resetting anything (the reader is repositioned
-    /// past it when the size is known; a parse error inside an
+    /// Best-effort by design: an unknown-size, malformed or truncated `Tags`
+    /// element is skipped without resetting anything (the reader is
+    /// repositioned past it when the size is known; a parse error inside an
     /// unknown-size element surfaces to the caller like any other
-    /// stream-walk error, where resilient mode resynchronises).
+    /// stream-walk error, where resilient mode resynchronises). The
+    /// source's own failure reading it is returned, not skipped.
     fn apply_mid_stream_tags(&mut self, size: u64) -> Result<()> {
         if size == VINT_UNKNOWN_SIZE {
             // A `Tags` master may not use the unknown-size VINT (RFC 8794
@@ -11692,14 +11751,14 @@ impl MkvDemuxer {
         let end = body_start.saturating_add(size);
         // Validate a leading CRC-32 child like the open-time walk does
         // for Top-Level masters (RFC 9559 §6.2); informational.
-        if let Ok(Some(status)) =
-            validate_top_level_crc(&mut *self.input, ids::TAGS, body_start, end)
-        {
+        let crc = recoverable(validate_top_level_crc(&mut *self.input, ids::TAGS, body_start, end))?;
+        if let Some(Some(status)) = crc {
             self.crc_status.push(status);
         }
         let mut pending: Vec<RawTag> = Vec::new();
-        if parse_tags(&mut *self.input, end, &mut pending).is_err() {
-            // Malformed mid-stream Tags: skip it whole, reset nothing.
+        if crc.is_none() || recoverable(parse_tags(&mut *self.input, end, &mut pending))?.is_none() {
+            // Malformed or truncated mid-stream Tags: skip it whole, reset
+            // nothing.
             self.input.seek(SeekFrom::Start(end))?;
             return Ok(());
         }
@@ -11870,11 +11929,11 @@ impl MkvDemuxer {
                     }
                     ids::SIMPLE_BLOCK => {
                         let bytes = read_bytes(&mut *self.input, e.size as usize)?;
-                        self.queue_block_packets(bytes, cluster_timecode, false)?;
+                        self.queue_block_packets(bytes, cluster_timecode, pos)?;
                     }
                     ids::BLOCK_GROUP => {
                         let bg_end = self.input.stream_position()?.saturating_add(e.size);
-                        self.parse_block_group(bg_end, cluster_timecode)?;
+                        self.parse_block_group(bg_end, cluster_timecode, pos)?;
                     }
                     // An unknown-size Cluster (body_end == segment_data_end)
                     // terminates when a sibling Segment-child element is
@@ -11893,7 +11952,13 @@ impl MkvDemuxer {
         }
     }
 
-    fn parse_block_group(&mut self, end: u64, cluster_timecode: i64) -> Result<()> {
+    /// Read a `BlockGroup` stored at `offset` and ending at `end`, then
+    /// queue its Block. Every child must fit the BlockGroup, and each
+    /// nested child its own parent. The Block's bytes, its side data and
+    /// their records share the Block's budget, charged before they are
+    /// read or stored.
+    fn parse_block_group(&mut self, end: u64, cluster_timecode: i64, offset: u64) -> Result<()> {
+        let mut budget = BlockBudget(MAX_BLOCK_BYTES);
         let mut block_bytes: Option<Vec<u8>> = None;
         let mut duration: Option<i64> = None;
         let mut is_keyframe = true;
@@ -11901,8 +11966,10 @@ impl MkvDemuxer {
         let mut meta = BlockGroupMeta::default();
         while self.input.stream_position()? < end {
             let e = read_element_header(&mut *self.input)?;
+            let e_end = child_end(&mut *self.input, e.size, end)?;
             match e.id {
                 ids::BLOCK => {
+                    budget.charge(e.size as usize)?;
                     block_bytes = Some(read_bytes(&mut *self.input, e.size as usize)?);
                 }
                 ids::BLOCK_DURATION => {
@@ -11914,6 +11981,7 @@ impl MkvDemuxer {
                     // non-keyframe; the value is surfaced through
                     // `block_group_meta()`. A BlockGroup may carry several.
                     is_keyframe = false;
+                    budget.room(&mut meta.reference_blocks)?;
                     meta.reference_blocks
                         .push(read_int(&mut *self.input, e.size as usize)?);
                 }
@@ -11923,6 +11991,7 @@ impl MkvDemuxer {
                 }
                 ids::CODEC_STATE => {
                     // §5.1.3.5.6 — codec-private state bytes.
+                    budget.charge(e.size as usize)?;
                     meta.codec_state = Some(read_bytes(&mut *self.input, e.size as usize)?);
                 }
                 ids::DISCARD_PADDING => {
@@ -11933,14 +12002,14 @@ impl MkvDemuxer {
                     // RFC 9559 §5.1.3.5.2 — per-Block side-channel
                     // payloads, surfaced through `block_additions()`
                     // alongside the de-laced packets.
-                    let ba_end = self.input.stream_position()?.saturating_add(e.size);
-                    let list = parse_block_additions(&mut *self.input, ba_end)?;
+                    let list = parse_block_additions(&mut *self.input, e_end, &mut budget)?;
                     if !list.is_empty() {
                         additions = Some(std::sync::Arc::new(list));
                     }
                 }
                 ids::BLOCK_VIRTUAL => {
                     // RFC 9559 Appendix A.3 — reclaimed data-less Block.
+                    budget.charge(e.size as usize)?;
                     meta.block_virtual = Some(read_bytes(&mut *self.input, e.size as usize)?);
                 }
                 ids::REFERENCE_VIRTUAL => {
@@ -11951,14 +12020,12 @@ impl MkvDemuxer {
                 ids::SLICES => {
                     // RFC 9559 Appendix A.5..A.11 — reclaimed per-frame
                     // time-slice descriptions; surfaced for re-mux.
-                    let s_end = self.input.stream_position()?.saturating_add(e.size);
-                    parse_slices(&mut *self.input, s_end, &mut meta.slices)?;
+                    parse_slices(&mut *self.input, e_end, &mut meta.slices, &mut budget)?;
                 }
                 ids::REFERENCE_FRAME => {
                     // RFC 9559 Appendix A.12..A.14 — reclaimed Smooth FF/RW
                     // trick-track back-reference.
-                    let rf_end = self.input.stream_position()?.saturating_add(e.size);
-                    meta.reference_frame = Some(parse_reference_frame(&mut *self.input, rf_end)?);
+                    meta.reference_frame = Some(parse_reference_frame(&mut *self.input, e_end)?);
                 }
                 _ => skip(&mut *self.input, e.size)?,
             }
@@ -11971,23 +12038,25 @@ impl MkvDemuxer {
             } else {
                 Some(std::sync::Arc::new(meta))
             };
-            self.queue_block_packets_with(b, cluster_timecode, Some(is_keyframe), duration, additions, meta)?;
+            self.queue_block_packets_with(b, cluster_timecode, Some(is_keyframe), duration, additions, meta, offset)?;
         }
         Ok(())
     }
 
-    fn queue_block_packets(&mut self, bytes: Vec<u8>, cluster_timecode: i64, _hint: bool) -> Result<()> {
+    fn queue_block_packets(&mut self, bytes: Vec<u8>, cluster_timecode: i64, offset: u64) -> Result<()> {
         // A SimpleBlock's keyframe bit is bit 7 of its flags byte. A
         // SimpleBlock can never carry BlockAdditions (the element lives
         // only on BlockGroup, RFC 9559 §5.1.3.5.2) nor the BlockGroup meta
         // children (ReferenceBlock / ReferencePriority / CodecState /
         // DiscardPadding).
-        self.queue_block_packets_with(bytes, cluster_timecode, None, None, None, None)
+        self.queue_block_packets_with(bytes, cluster_timecode, None, None, None, None, offset)
     }
 
     /// De-laces a Block and queues its frames. `group_keyframe` is the
     /// keyframe signal of a BlockGroup's Block (no `ReferenceBlock`),
-    /// `None` for a SimpleBlock, whose flags byte carries it.
+    /// `None` for a SimpleBlock, whose flags byte carries it. `offset` is
+    /// where the Block's element is stored — see [`DeferredBlock::offset`].
+    #[allow(clippy::too_many_arguments)]
     fn queue_block_packets_with(
         &mut self,
         bytes: Vec<u8>,
@@ -11996,6 +12065,7 @@ impl MkvDemuxer {
         explicit_duration: Option<i64>,
         additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
         meta: Option<std::sync::Arc<BlockGroupMeta>>,
+        offset: u64,
     ) -> Result<()> {
         let mut cur = std::io::Cursor::new(bytes.as_slice());
         let (track_number, _) = crate::ebml::read_vint(&mut cur, false)?;
@@ -12021,16 +12091,28 @@ impl MkvDemuxer {
         } else {
             0
         };
+        // The lace decides how many packets the Block emits: exactly the
+        // frames it holds, each copied once per virtual track. It is read
+        // before the Block is queued or waits; an invalid one queues
+        // nothing.
+        let (data_start, sizes) = lace_sizes(lacing, &bytes[body_start..])?;
+        let packets = sizes.len().checked_mul(copies)
+            .filter(|&n| n <= MAX_PROBE_PACKETS)
+            .ok_or_else(|| Error::invalid("MKV: Block exceeds its 1024-packet budget"))?;
+        // Everything this Block retains shares one budget: payload
+        // capacity, every TrackOperation copy, side data and each queued
+        // packet's own size. An over-budget Block queues nothing, and does
+        // not wait for room first.
+        let side_data = additions.as_ref().map_or(0, |a| {
+            ARC_HEADER + std::mem::size_of::<Vec<BlockAddition>>()
+                + a.capacity() * std::mem::size_of::<BlockAddition>()
+                + a.iter().map(|a| a.data.capacity()).sum::<usize>()
+        }) + meta.as_ref().map_or(0, |m| ARC_HEADER + std::mem::size_of::<BlockGroupMeta>() + m.retained_bytes());
+        let retained = side_data + packets * std::mem::size_of::<QueuedPacket>();
+        let mut budget = MAX_BLOCK_BYTES.checked_sub(retained).ok_or_else(block_over_budget)?;
         // A Block whose packets would take the queue past the startup
         // analysis cap ends the analysis, then waits, whole, until the
         // packets held so far have been returned.
-        let laces = match lacing {
-            0 => 1,
-            _ => bytes.get(body_start).map_or(1, |&n| usize::from(n) + 1),
-        };
-        let packets = laces.checked_mul(copies)
-            .filter(|&n| n <= MAX_PROBE_PACKETS)
-            .ok_or_else(|| Error::invalid("MKV: Block exceeds its 1024-packet budget"))?;
         if self.out_queue.len() + packets > MAX_PROBE_PACKETS {
             if !self.timestamps_primed {
                 self.finish_timestamp_probe();
@@ -12042,30 +12124,10 @@ impl MkvDemuxer {
                 explicit_duration,
                 additions,
                 meta,
+                offset,
             });
             return Ok(());
         }
-        let body = &bytes[body_start..];
-
-        let frames = match lacing {
-            0 => vec![body.to_vec()],
-            1 => parse_xiph_lacing(body)?,
-            2 => parse_fixed_lacing(body)?,
-            3 => parse_ebml_lacing(body)?,
-            _ => unreachable!(),
-        };
-
-        // Everything this Block retains shares one budget: payload
-        // capacity, every TrackOperation copy, side data and each queued
-        // packet's own size. An over-budget Block queues nothing.
-        let side_data = additions.as_ref().map_or(0, |a| {
-            ARC_HEADER + std::mem::size_of::<Vec<BlockAddition>>()
-                + a.capacity() * std::mem::size_of::<BlockAddition>()
-                + a.iter().map(|a| a.data.capacity()).sum::<usize>()
-        }) + meta.as_ref().map_or(0, |m| ARC_HEADER + std::mem::size_of::<BlockGroupMeta>() + m.retained_bytes());
-        let over_budget = || Error::invalid("MKV: Block exceeds its 32 MiB budget");
-        let retained = side_data + packets * std::mem::size_of::<QueuedPacket>();
-        let mut budget = MAX_BLOCK_BYTES.checked_sub(retained).ok_or_else(over_budget)?;
         let mut probe_charge = retained;
         let mut queued = Vec::with_capacity(packets);
         let time_base = self.streams[si].time_base;
@@ -12081,7 +12143,7 @@ impl MkvDemuxer {
             // negative PTS. Duration interpolation starts relative to zero.
             None
         };
-        let n_frames = frames.len().max(1) as i128;
+        let n_frames = sizes.len().max(1) as i128;
         // FFmpeg 9 computes the whole Block duration in segment ticks first,
         // then distributes the integer remainder between laces.
         let block_duration = explicit_duration.filter(|&d| d > 0)
@@ -12089,7 +12151,10 @@ impl MkvDemuxer {
             .or_else(|| self.track_timing[si].default_duration.map(|ns| {
                 ns as i128 * n_frames / self.timecode_scale_ns as i128
             })).unwrap_or(0);
-        for (lace, f) in frames.into_iter().enumerate() {
+        let mut frame_at = body_start + data_start;
+        for (lace, &size) in sizes.iter().enumerate() {
+            let f = bytes[frame_at..frame_at + size].to_vec();
+            frame_at += size;
             let i = lace as i128;
             let lace_duration = (block_duration * (i + 1) / n_frames
                 - block_duration * i / n_frames).min(i64::MAX as i128) as i64;
@@ -12103,7 +12168,7 @@ impl MkvDemuxer {
             let mut frame_bytes = match chain.and_then(Option::as_ref) {
                 Some(chain) => content::decompress(chain, f, budget / copies)
                     .map_err(content::Undo::into_error)?,
-                None if f.len() > budget / copies => return Err(over_budget()),
+                None if f.len() > budget / copies => return Err(block_over_budget()),
                 None => f,
             };
             // Header stripping can restore data even to an empty stored
@@ -12135,7 +12200,7 @@ impl MkvDemuxer {
                 + webvtt.as_ref().map_or(0, |w| {
                     ARC_HEADER + std::mem::size_of::<WebVttMetadata>() + w.identifier.capacity() + w.settings.capacity()
                 });
-            budget = budget.checked_sub(retained).ok_or_else(over_budget)?;
+            budget = budget.checked_sub(retained).ok_or_else(block_over_budget)?;
             probe_charge += retained;
             // FFmpeg flags a packet a keyframe from what its codec parser
             // reads in the frame where it runs one, and every packet of an
@@ -12212,10 +12277,22 @@ impl MkvDemuxer {
 
 // --- Lacing helpers --------------------------------------------------------
 
-fn parse_xiph_lacing(body: &[u8]) -> Result<Vec<Vec<u8>>> {
-    if body.is_empty() {
-        return Ok(vec![]);
+/// Where the frames of a Block body laced per `lacing` (RFC 9559 §10.3)
+/// start, and each frame's size. Laced, the head octet counts the frames
+/// less one and the sizes fill the rest of the body exactly, so the Block
+/// emits as many frames as it declares. A body without lacing is one
+/// frame; a laced body without even a head holds none.
+fn lace_sizes(lacing: u8, body: &[u8]) -> Result<(usize, Vec<usize>)> {
+    match lacing {
+        0 => Ok((0, vec![body.len()])),
+        _ if body.is_empty() => Ok((0, Vec::new())),
+        1 => xiph_lace_sizes(body),
+        2 => fixed_lace_sizes(body),
+        _ => ebml_lace_sizes(body),
     }
+}
+
+fn xiph_lace_sizes(body: &[u8]) -> Result<(usize, Vec<usize>)> {
     let n_frames = body[0] as usize + 1;
     let mut sizes = Vec::with_capacity(n_frames);
     let mut i = 1;
@@ -12235,72 +12312,42 @@ fn parse_xiph_lacing(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         sizes.push(s);
     }
     // Last frame size is whatever's left. Guard the subtraction against
-    // a crafted lace where the encoded sizes already over-run the body
-    // (debug-build subtract would panic; release would wrap to a huge
-    // `last_size` that the per-frame bounds check below would then
-    // turn into an error — but only after a length lookup that itself
-    // could panic on a Vec growth attempt).
+    // a crafted lace where the encoded sizes already over-run the body.
     let used: usize = sizes.iter().sum();
     let last_size = (body.len())
         .checked_sub(i)
         .and_then(|rem| rem.checked_sub(used))
         .ok_or_else(|| Error::invalid("MKV xiph lacing: sizes exceed body"))?;
     sizes.push(last_size);
-    let mut frames = Vec::with_capacity(n_frames);
-    for s in sizes {
-        if i + s > body.len() {
-            return Err(Error::invalid("MKV xiph lacing: frame exceeds body"));
-        }
-        frames.push(body[i..i + s].to_vec());
-        i += s;
-    }
-    Ok(frames)
+    Ok((i, sizes))
 }
 
-fn parse_fixed_lacing(body: &[u8]) -> Result<Vec<Vec<u8>>> {
-    if body.is_empty() {
-        return Ok(vec![]);
-    }
+fn fixed_lace_sizes(body: &[u8]) -> Result<(usize, Vec<usize>)> {
     let n_frames = body[0] as usize + 1;
-    let payload = &body[1..];
-    if payload.len() % n_frames != 0 {
+    let payload = body.len() - 1;
+    if payload % n_frames != 0 {
         return Err(Error::invalid("MKV fixed lacing: non-divisible payload"));
     }
-    let frame_size = payload.len() / n_frames;
-    // `chunks_exact(0)` panics. A zero-length payload with n_frames >= 1
-    // is a legitimate "frame size unknown / zero-byte frames" case from
-    // a crafted Block — emit n_frames empty sub-frames rather than
-    // dividing by zero on the chunker.
-    if frame_size == 0 {
-        return Ok(vec![Vec::new(); n_frames]);
-    }
-    let mut frames = Vec::with_capacity(n_frames);
-    for c in payload.chunks_exact(frame_size) {
-        frames.push(c.to_vec());
-    }
-    Ok(frames)
+    // A zero-length payload is `n_frames` zero-byte frames.
+    Ok((1, vec![payload / n_frames; n_frames]))
 }
 
-fn parse_ebml_lacing(body: &[u8]) -> Result<Vec<Vec<u8>>> {
-    if body.is_empty() {
-        return Ok(vec![]);
+fn ebml_lace_sizes(body: &[u8]) -> Result<(usize, Vec<usize>)> {
+    let n_frames = body[0] as usize + 1;
+    // RFC 9559 §10.3: lacing never stores a single frame. A one-frame EBML
+    // lace codes no size, so what follows its head could only be read as
+    // some other number of frames.
+    if n_frames < 2 {
+        return Err(Error::invalid("MKV ebml lacing: a lace holds at least two frames"));
     }
-    let mut cur = std::io::Cursor::new(body);
-    let n_frames = {
-        let mut buf = [0u8; 1];
-        cur.read_exact(&mut buf)?;
-        buf[0] as usize + 1
-    };
-    let mut sizes = Vec::with_capacity(n_frames);
+    let mut cur = std::io::Cursor::new(&body[1..]);
+    let mut sizes: Vec<i64> = Vec::with_capacity(n_frames);
     // First size: full VINT.
     let (first, _) = crate::ebml::read_vint(&mut cur, false)?;
     sizes.push(first as i64);
-    // Remaining sizes: signed deltas (raw VINT minus mid-of-range bias).
-    // `n_frames` is `body[0] + 1` so it is at least 1; guard the
-    // subtraction so a one-frame lace (which has no deltas to parse)
-    // doesn't underflow the range below.
-    let delta_count = n_frames.saturating_sub(2);
-    for _ in 0..delta_count {
+    // The other sizes but the last: signed deltas (raw VINT minus
+    // mid-of-range bias).
+    for _ in 0..n_frames - 2 {
         let (raw, w) = crate::ebml::read_vint(&mut cur, false)?;
         let bias = ((1i64) << (7 * w as i64 - 1)) - 1;
         let signed = (raw as i64) - bias;
@@ -12311,9 +12358,9 @@ fn parse_ebml_lacing(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         sizes.push(next);
     }
     // Last frame is whatever remains. The arithmetic happens in i64 so
-    // an over-sized or contrived `sum` cannot wrap a usize; the per-
-    // frame bounds check below rejects out-of-range values.
-    let pos = cur.position() as usize;
+    // an over-sized or contrived `sum` cannot wrap a usize; a negative
+    // size anywhere is rejected below.
+    let pos = 1 + cur.position() as usize;
     let used: i64 = sizes
         .iter()
         .try_fold(0i64, |acc, s| acc.checked_add(*s))
@@ -12323,22 +12370,9 @@ fn parse_ebml_lacing(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         .and_then(|rem| rem.checked_sub(used))
         .ok_or_else(|| Error::invalid("MKV ebml lacing: sizes exceed body"))?;
     sizes.push(last);
-    let mut frames = Vec::with_capacity(n_frames);
-    let mut i = pos;
-    for s in sizes {
-        if s < 0 {
-            return Err(Error::invalid("MKV ebml lacing: negative frame size"));
-        }
-        let s_usize = usize::try_from(s)
-            .map_err(|_| Error::invalid("MKV ebml lacing: frame size overflows usize"))?;
-        let end = i
-            .checked_add(s_usize)
-            .ok_or_else(|| Error::invalid("MKV ebml lacing: frame offset overflows"))?;
-        if end > body.len() {
-            return Err(Error::invalid("MKV ebml lacing: invalid frame size"));
-        }
-        frames.push(body[i..end].to_vec());
-        i = end;
-    }
-    Ok(frames)
+    let sizes = sizes
+        .into_iter()
+        .map(|s| usize::try_from(s).map_err(|_| Error::invalid("MKV ebml lacing: negative frame size")))
+        .collect::<Result<Vec<usize>>>()?;
+    Ok((pos, sizes))
 }

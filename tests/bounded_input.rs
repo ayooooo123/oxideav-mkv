@@ -1,14 +1,16 @@
 //! Untrusted P2P input: index chasing, retained Block/CodecPrivate output,
-//! startup timestamp analysis, error classification and Cluster bounds.
+//! startup timestamp analysis, error classification, lacing, Cluster
+//! bounds and recovery.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use oxideav_core::{Demuxer, Error, NullCodecResolver, PacketMetadata, ReadSeek};
 use oxideav_mkv::demux::{self, MkvDemuxer};
-use oxideav_mkv::ebml::{write_element_id, write_vint};
+use oxideav_mkv::ebml::{crc32_ieee, write_element_id, write_vint};
 use oxideav_mkv::ids;
 
 struct Tracking;
@@ -99,13 +101,13 @@ struct Counters {
 }
 
 /// Counts bytes read and position-changing seeks; optionally fails every
-/// read at or after an offset with a transport error, and optionally
+/// read that starts in a byte range with a transport error, and optionally
 /// rejects a seek past the end with `InvalidInput`, as an HTTP range
 /// source does.
 struct Source {
     inner: Cursor<Vec<u8>>,
     counters: Counters,
-    fail_from: Option<(u64, io::ErrorKind)>,
+    fail: Option<(Range<u64>, io::ErrorKind)>,
     reject_past_end: bool,
 }
 
@@ -113,11 +115,13 @@ impl Read for Source {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let pos = self.inner.position();
         let mut len = buf.len();
-        if let Some((at, kind)) = self.fail_from {
-            if pos >= at {
-                return Err(io::Error::new(kind, "injected transport failure"));
+        if let Some((range, kind)) = &self.fail {
+            if range.contains(&pos) {
+                return Err(io::Error::new(*kind, "injected transport failure"));
             }
-            len = len.min((at - pos) as usize);
+            if pos < range.start {
+                len = len.min((range.start - pos) as usize);
+            }
         }
         let n = self.inner.read(&mut buf[..len])?;
         self.counters.bytes.fetch_add(n, Ordering::Relaxed);
@@ -149,13 +153,22 @@ impl Seek for Source {
 
 fn source(bytes: Vec<u8>, fail_from: Option<(u64, io::ErrorKind)>) -> (Box<dyn ReadSeek>, Counters) {
     let counters = Counters::default();
-    let source = Source { inner: Cursor::new(bytes), counters: counters.clone(), fail_from, reject_past_end: false };
+    let fail = fail_from.map(|(at, kind)| (at..u64::MAX, kind));
+    let source = Source { inner: Cursor::new(bytes), counters: counters.clone(), fail, reject_past_end: false };
     (Box::new(source), counters)
+}
+
+/// Like [`source`], failing only the reads that start inside `range`: a
+/// span the transport cannot deliver, while the rest of the file can.
+fn failing(bytes: Vec<u8>, range: Range<u64>, kind: io::ErrorKind) -> Box<dyn ReadSeek> {
+    let fail = Some((range, kind));
+    Box::new(Source { inner: Cursor::new(bytes), counters: Counters::default(), fail, reject_past_end: false })
 }
 
 /// Like [`source`], over a transport that rejects seeks past its end.
 fn http_source(bytes: Vec<u8>, fail_from: Option<(u64, io::ErrorKind)>) -> Box<dyn ReadSeek> {
-    Box::new(Source { inner: Cursor::new(bytes), counters: Counters::default(), fail_from, reject_past_end: true })
+    let fail = fail_from.map(|(at, kind)| (at..u64::MAX, kind));
+    Box::new(Source { inner: Cursor::new(bytes), counters: Counters::default(), fail, reject_past_end: true })
 }
 
 #[test]
@@ -241,16 +254,19 @@ fn more_than_256_tracks_is_invalid_data() {
     assert!(matches!(open(bytes), Err(Error::InvalidData(_))));
 }
 
-#[test]
-fn unsatisfied_avc_probe_returns_first_packet_after_bounded_queue() {
+/// An AVC track 1 whose startup reorder analysis never completes: it
+/// carries no frames, so the other tracks' packets are held for it.
+fn avc_track() -> Vec<u8> {
     let sps = [0x67, 0x42, 0x00, 0x1e, 0xf4, 0xf2];
     let pps = [0x68, 0xce, 0x38, 0x80];
     let avcc = [&[1, 0x42, 0x00, 0x1e, 0xff, 0xe1, 0, sps.len() as u8][..], &sps, &[1, 0, pps.len() as u8], &pps].concat();
     let video = elem(ids::VIDEO, &[uint(ids::PIXEL_WIDTH, 16), uint(ids::PIXEL_HEIGHT, 16)].concat());
-    let tracks = elem(ids::TRACKS, &[
-        track(1, 1, "V_MPEG4/ISO/AVC", &[elem(ids::CODEC_PRIVATE, &avcc), video]),
-        track(2, 0x11, "S_TEXT/UTF8", &[]),
-    ].concat());
+    track(1, 1, "V_MPEG4/ISO/AVC", &[elem(ids::CODEC_PRIVATE, &avcc), video])
+}
+
+#[test]
+fn unsatisfied_avc_probe_returns_first_packet_after_bounded_queue() {
+    let tracks = elem(ids::TRACKS, &[avc_track(), track(2, 0x11, "S_TEXT/UTF8", &[])].concat());
     let addition = elem(ids::BLOCK_ADDITIONS, &elem(ids::BLOCK_MORE, &[
         uint(ids::BLOCK_ADD_ID, 1), elem(ids::BLOCK_ADDITIONAL, b"x"),
     ].concat()));
@@ -397,4 +413,169 @@ fn forged_signature_slot_cannot_skip_later_clusters() {
     ]);
     let mut d = open(bytes).unwrap();
     assert_eq!(drain(&mut d), [(Some(0), b"a".to_vec()), (Some(1000), b"b".to_vec())]);
+}
+
+/// What became of a source failure: its kind, when it reached the caller
+/// as itself.
+fn surfaced<T: std::fmt::Debug>(result: oxideav_core::Result<T>) -> Result<io::ErrorKind, String> {
+    match result {
+        Err(Error::Io(e)) => Ok(e.kind()),
+        Err(e) => Err(format!("became {e}")),
+        Ok(v) => Err(format!("was hidden behind {v:?}")),
+    }
+}
+
+/// A source that times out, and an HTTP body that stayed short after the
+/// transport's retries: both the source's errors, not damage.
+const SOURCE_ERRORS: [io::ErrorKind; 2] = [io::ErrorKind::TimedOut, io::ErrorKind::UnexpectedEof];
+
+/// The Cluster walk reaches a `Tags` element stored after the last Cluster
+/// (RFC 9559 §23.2). A body that never arrives is not the end of the file.
+#[test]
+fn source_errors_reading_trailing_tags_are_returned() {
+    let tags = elem(ids::TAG, &elem(ids::SIMPLE_TAG, &[
+        elem(ids::TAG_NAME, b"TITLE"), elem(ids::TAG_STRING, b"end"),
+    ].concat()));
+    let outcomes: Vec<_> = SOURCE_ERRORS.into_iter().map(|kind| {
+        let bytes = file(&[subtitle_tracks(), cluster(0, &[simple(1, b"a")]), elem(ids::TAGS, &tags)]);
+        let body = (bytes.len() - tags.len()) as u64;
+        let (input, _) = source(bytes, Some((body, kind)));
+        let mut d = demux::open_typed(input, &NullCodecResolver).unwrap();
+        assert_eq!(d.next_packet().unwrap().data, b"a");
+        surfaced(d.next_packet().map(|p| p.pts))
+    }).collect();
+    assert_eq!(outcomes, SOURCE_ERRORS.map(Ok));
+}
+
+/// The walk steps over a Cluster's `CRC-32` once it is being checked, so a
+/// value that cannot be read is never read again: the error is the only
+/// sign of it.
+#[test]
+fn source_errors_reading_a_cluster_crc_are_returned() {
+    let outcomes: Vec<_> = SOURCE_ERRORS.into_iter().map(|kind| {
+        let rest = [uint(ids::TIMECODE, 1000), simple(1, b"b")].concat();
+        let checked = elem(ids::CLUSTER, &[elem(ids::CRC32, &crc32_ieee(&rest).to_le_bytes()), rest].concat());
+        let bytes = file(&[subtitle_tracks(), cluster(0, &[simple(1, b"a")]), checked]);
+        // After the Cluster's ID and size, and the CRC-32's own header.
+        let value = nth_cluster(&bytes, 1) as u64 + 5 + 2;
+        let mut d = demux::open_typed(failing(bytes, value..value + 4, kind), &NullCodecResolver).unwrap();
+        assert_eq!(d.next_packet().unwrap().data, b"a");
+        surfaced(d.next_packet().map(|p| p.pts))
+    }).collect();
+    assert_eq!(outcomes, SOURCE_ERRORS.map(Ok));
+}
+
+/// A Cues-less seek reads Block headers to find its keyframe. One it cannot
+/// read does not make the seek land on an earlier Cluster instead.
+#[test]
+fn source_errors_during_a_cueless_seek_are_returned() {
+    let outcomes: Vec<_> = SOURCE_ERRORS.into_iter().map(|kind| {
+        let bytes = file(&[
+            subtitle_tracks(), cluster(0, &[simple(1, b"a")]),
+            cluster(1000, &[simple(1, b"b")]), cluster(2000, &[simple(1, b"c")]),
+        ]);
+        // The second Cluster's SimpleBlock body: after the Cluster's ID and
+        // size, its 10-octet Timestamp and the SimpleBlock's own header.
+        let block = nth_cluster(&bytes, 1) as u64 + 5 + 10 + 2;
+        let mut d = demux::open_typed(failing(bytes, block..block + 1, kind), &NullCodecResolver).unwrap();
+        surfaced(d.seek_to(0, 1500))
+    }).collect();
+    assert_eq!(outcomes, SOURCE_ERRORS.map(Ok));
+}
+
+/// Landing on a Cue: the resilient check of the Cue's Cluster, and the walk
+/// to its `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3), do not fall back to
+/// another landing when the source fails.
+#[test]
+fn source_errors_landing_on_a_cue_are_returned() {
+    let tracks = subtitle_tracks();
+    let first = cluster(0, &[simple(1, b"a")]);
+    // The Cue names "c": after the second Cluster's 10-octet Timestamp and
+    // the 7-octet "b".
+    let second = cluster(1000, &[simple(1, b"b"), simple(1, b"c")]);
+    let cues = |position: u64| elem(ids::CUES, &elem(ids::CUE_POINT, &[
+        uint(ids::CUE_TIME, 1000),
+        elem(ids::CUE_TRACK_POSITIONS, &[
+            uint(ids::CUE_TRACK, 1), uint(ids::CUE_CLUSTER_POSITION, position),
+            uint(ids::CUE_RELATIVE_POSITION, 17),
+        ].concat()),
+    ].concat()));
+    let position = (tracks.len() + cues(0).len() + first.len()) as u64;
+    let bytes = file(&[tracks, cues(position), first, second]);
+    let landing = nth_cluster(&bytes, 1) as u64;
+    // "b"'s header, which the walk to "c" reads, whether resilient or not;
+    // and the Cluster header, which a resilient seek first reads to check
+    // the Cue.
+    let b = landing + 5 + 10;
+    let cases = [("walk", b, false), ("resilient walk", b, true), ("resilient check", landing, true)];
+    let mut outcomes = Vec::new();
+    let mut expected: Vec<(&str, Result<io::ErrorKind, String>)> = Vec::new();
+    for kind in SOURCE_ERRORS {
+        for (case, at, resilient) in cases {
+            let input = failing(bytes.clone(), at..at + 1, kind);
+            let mut d = if resilient {
+                demux::open_resilient_typed(input, &NullCodecResolver)
+            } else {
+                demux::open_typed(input, &NullCodecResolver)
+            }.unwrap();
+            outcomes.push((case, surfaced(d.seek_to(0, 1000))));
+            expected.push((case, Ok(kind)));
+        }
+    }
+    assert_eq!(outcomes, expected);
+}
+
+/// An EBML lace whose head counts one frame (RFC 9559 §10.3: lacing never
+/// stores a single frame) but whose first size would split it into two.
+fn one_frame_ebml_lace() -> Vec<u8> {
+    elem(ids::SIMPLE_BLOCK, &block(1, 0, 0x86, &[0x00, 0x81, 0x61, 0x62]))
+}
+
+#[test]
+fn a_one_frame_ebml_lace_is_rejected_rather_than_split() {
+    let bytes = file(&[subtitle_tracks(), cluster(0, &[one_frame_ebml_lace()]), cluster(1000, &[simple(1, b"z")])]);
+    let mut d = open(bytes).unwrap();
+    assert_eq!(drain(&mut d), [(Some(1000), b"z".to_vec())]);
+}
+
+/// 1023 joins of one track copy each of its frames 1023 times: one Block
+/// may then hold one frame, its 1024 packets exactly filling the cap.
+#[test]
+fn virtual_copies_of_a_one_frame_lace_stay_within_the_cap() {
+    let joins: Vec<u8> = (0..1023).flat_map(|_| uint(ids::TRACK_JOIN_UID, 1)).collect();
+    let tracks = elem(ids::TRACKS, &[
+        track(1, 0x11, "S_TEXT/UTF8", &[]),
+        track(2, 0x11, "S_TEXT/UTF8", &[elem(ids::TRACK_OPERATION, &elem(ids::TRACK_JOIN_BLOCKS, &joins))]),
+    ].concat());
+    let bytes = file(&[tracks, cluster(0, &[one_frame_ebml_lace()]), cluster(1000, &[simple(1, b"z")])]);
+    let mut d = open(bytes).unwrap();
+    d.set_apply_track_operations(true);
+    let packets = drain(&mut d);
+    assert_eq!(packets.len(), 1024);
+    assert!(packets.iter().all(|p| *p == (Some(1000), b"z".to_vec())));
+}
+
+/// A Block that waited for queue room and then fails is recovered from where
+/// it was stored, not from wherever the walk had read on to: here the very
+/// next byte, which starts a Cluster.
+#[test]
+fn a_failing_deferred_block_recovers_the_cluster_right_after_it() {
+    let tracks = elem(ids::TRACKS, &[
+        avc_track(), track(2, 0x11, "S_TEXT/UTF8", &[]), track(3, 0x11, "D_WEBVTT/SUBTITLES", &[]),
+    ].concat());
+    // 1023 held packets, then two Xiph-laced frames that cannot both join
+    // them. Their lace is sound; neither frame is a WebVTT cue.
+    let mut first: Vec<Vec<u8>> = (0..1023u16)
+        .map(|i| elem(ids::SIMPLE_BLOCK, &block(2, i as i16, 0x80, &i.to_be_bytes())))
+        .collect();
+    first.push(elem(ids::SIMPLE_BLOCK, &block(3, 0, 0x82, &[&[1, 3][..], b"bad", b"x"].concat())));
+    let next = cluster(5000, &[elem(ids::SIMPLE_BLOCK, &block(2, 0, 0x80, b"next"))]);
+    let mut d = open(file(&[tracks, cluster(0, &first), next])).unwrap();
+    let data: Vec<Vec<u8>> = drain(&mut d).into_iter().map(|(_, data)| data).collect();
+    // The held packets intact and in order, nothing of the failed Block,
+    // then the next Cluster's packet.
+    let held: Vec<Vec<u8>> = (0..1023u16).map(|i| i.to_be_bytes().to_vec()).collect();
+    let (returned, after) = data.split_at(data.len().min(held.len()));
+    assert_eq!(returned, held);
+    assert_eq!(after, [b"next".to_vec()]);
 }

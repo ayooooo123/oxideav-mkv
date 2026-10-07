@@ -72,14 +72,20 @@ The old typed WebVTT accessor/type are replaced by this common API.
 Common metadata clears before every read or seek, including errors and EOF.
 
 Startup DTS analysis holds at most 1024 packets, counting virtual-track
-copies. A compliant Block waits whole if its laces and copies cannot fit
-alongside held packets. A single Block needing more than 1024 packets is
-InvalidData and queues nothing; normal damage recovery seeks the next
-Cluster. Retained Block payload capacity, side data and packet slots share
-the 32 MiB budget. The 512 KiB startup byte threshold also counts this state;
-the bounded current/deferred Block and temporary expansion remain additional
-working memory. Source I/O failures propagate, including source-generated
-UnexpectedEof; only parser damage and physical truncation are recovered.
+copies. A Block emits exactly the frames its lace declares, counted before
+it is queued or waits; a one-frame EBML lace is InvalidData. A compliant
+Block waits whole if its laces and copies cannot fit alongside held packets,
+and if it fails once queued, recovery starts from its own offset. A single
+Block needing more than 1024 packets is InvalidData and queues nothing;
+normal damage recovery seeks the next Cluster. Retained Block payload
+capacity, side data and packet slots share the 32 MiB budget; a BlockGroup's
+children must fit their parents, and its stored children and records are
+charged to that budget before they are read or held. The 512 KiB startup
+byte threshold also counts this state; the bounded current/deferred Block
+and temporary expansion remain additional working memory. Source I/O
+failures propagate, including source-generated UnexpectedEof and failures
+met reading trailing Tags, Cluster `CRC-32`s or seek landings; only parser
+damage and physical truncation are recovered.
 
 Duration-less laces use codec frame timing, including AAC/HE-AAC, MP3,
 AC-3/E-AC-3 and 16-bit DTS core headers. AAC preserves FFmpeg 9's untimed
@@ -757,7 +763,9 @@ SeekPreRoll consumption remain shared AudioTrim integration work.
   is informational — a mismatch does **not** abort the open (RFC 8794
   §12: a reader MAY ignore the data); strict callers reject any non-
   valid status. Elements with no `CRC-32` child produce no status
-  (omission is spec-legal).
+  (omission is spec-legal) and are not read for one: only the first
+  child's header is inspected, and a present `CRC-32` is checked over the
+  rest of the body in 16 KiB chunks. A third `SeekHead` is skipped unread.
 - **`TrackOperation` typed decode** (RFC 9559 §5.1.4.1.30): a *virtual*
   track assembled from other tracks. `MkvDemuxer::track_operation(stream_index)`
   (and the per-stream `track_operations()` slice) returns a typed
