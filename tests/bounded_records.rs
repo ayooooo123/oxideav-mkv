@@ -133,25 +133,22 @@ fn tags_stay_within_their_limit() {
     let _serial = serial();
     let mut failures = Vec::new();
     let bytes = file(&[tracks(), full_tags(), cluster()]);
-    let (strict, peak, _) = opened(bytes.clone(), false);
-    if strict.as_ref().err().map(String::as_str) != Some("InvalidData") || peak > LIMIT + SLACK {
-        failures.push(format!("full Tags, strict: {:?}, peak {peak} heap bytes", strict.as_ref().map(|_| ())));
-    }
-    drop(strict);
-    // Resilient: the Tags that fit are kept and the rest is damage.
-    let (d, peak, held) = opened(bytes, true);
-    match d {
-        Ok(mut d) => {
-            let kept = d.tags().len();
-            let damaged = d.damage_events().iter().any(|e| e.kind() == DamageKind::DamagedMaster(ids::TAGS));
-            let played = d.next_packet().map(|p| p.data).ok();
-            if kept == 0 || !damaged || played != Some(b"a".to_vec()) || peak > LIMIT + SLACK || held > LIMIT + SLACK {
-                failures.push(format!(
-                    "full Tags, resilient: kept {kept} Tags, damaged {damaged}, played {played:?}, peak {peak}, held {held} heap bytes"
-                ));
+    // Either open keeps the Tags that fit; the rest is damage.
+    for resilient in [false, true] {
+        let (d, peak, held) = opened(bytes.clone(), resilient);
+        match d {
+            Ok(mut d) => {
+                let kept = d.tags().len();
+                let damaged = d.damage_events().iter().any(|e| e.kind() == DamageKind::DamagedMaster(ids::TAGS));
+                let played = d.next_packet().map(|p| p.data).ok();
+                if kept == 0 || !damaged || played != Some(b"a".to_vec()) || peak > LIMIT + SLACK || held > LIMIT + SLACK {
+                    failures.push(format!(
+                        "full Tags, resilient {resilient}: kept {kept} Tags, damaged {damaged}, played {played:?}, peak {peak}, held {held} heap bytes"
+                    ));
+                }
             }
+            Err(e) => failures.push(format!("full Tags, resilient {resilient}: {e}, peak {peak} heap bytes")),
         }
-        Err(e) => failures.push(format!("full Tags, resilient: {e}, peak {peak} heap bytes")),
     }
     // A thousand Tags of four 256-byte values each fit and are kept whole.
     let value = vec![b'v'; 256];

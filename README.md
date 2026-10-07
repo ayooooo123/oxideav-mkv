@@ -99,13 +99,21 @@ failures propagate, including source-generated UnexpectedEof and failures
 met reading trailing Tags, Cluster `CRC-32`s or seek landings; only parser
 damage and physical truncation are recovered.
 
-The metadata read at open is bounded too. Every element in a `Tracks` or
-`Tags` tree must fit its parent. RFC 9559 allows the unknown size on a
-Segment and a Cluster alone, so any other Top-Level element of unknown size
-is InvalidData: a strict open fails, and a resilient open skips it as a
-damaged master. Between Clusters it is damage in the Cluster stream, so the
+The metadata read at open is bounded too, and optional metadata never
+stops playback. The EBML header, the Segment, `Info` and `Tracks` are
+essential: damage there fails a strict open, as before. Damage in any other
+Top-Level master (`Chapters`, `Attachments`, `Tags`, `Cues`, a `SeekHead` or
+an unassigned one) is stepped over by either open: the master is dropped,
+or cut to the records before the damage, and one `DamagedMaster` event is
+recorded. Without Cues, a seek scans the Clusters. Every element in a
+`Tracks`, `Tags`, `Chapters`, `Cues` or `SeekHead` tree must fit its parent,
+as in `Info`; in `Attachments`, an `AttachedFile` ends with its parent at
+the latest and its fields must fit it. RFC 9559 allows the unknown size on
+a Segment and a Cluster alone, so any other Top-Level element of unknown
+size is damage. Between Clusters it is damage in the Cluster stream, so the
 walk resumes at the next Cluster; a SeekHead target of unknown size is
-ignored unread. In `Info`, `SegmentUUID`, `PrevUUID` and `NextUUID` must be
+ignored unread, and a target whose parse finds damage is noted as a
+damaged master. In `Info`, `SegmentUUID`, `PrevUUID` and `NextUUID` must be
 16 octets, each text field holds at most 64 KiB, and the `Info` masters
 keep at most 1 MiB together. `Chapters` and `Attachments` text fields hold
 at most 64 KiB too, and each of the two keeps at most 1 MiB: editions,
@@ -114,25 +122,25 @@ records with their names, MIME types, descriptions, referrals, UID index
 and flat entries. Attachment payloads are never read at open.
 `attachment_data()` reads one on request into a buffer that grows only as
 bytes arrive, and keeps nothing; a payload reaching past its `AttachedFile`
-or the Segment is refused unread, and the open does not follow it there.
-Sizes are checked before a read, and a `Void` is stepped over unread.
-Everything the open keeps from `Tracks` and from `Tags` is charged to the
-master's 32 MiB limit before it is allocated: records, strings, byte
-strings and lists, the per-stream views, tag resolution with its flat
-entries, and working room for parsing a codec configuration. The
-per-stream views take the parsed data instead of copying it, and a
-stream's extradata takes its CodecPrivate bytes; a compressed CodecPrivate
-is decompressed only as far as its budget allows. An `Info`, `Tracks` or
-`Tags` master past its budget is InvalidData: a strict open fails and a
-resilient open skips it. A mid-stream `Tags` may use what the current tag
-state leaves of the 32 MiB. `Chapters` and `Attachments` past theirs keep
-the chapters or attachments that fit, in order and with their flat entries,
-and either open records one `DamagedMaster` event and goes on: a long list
-never stops playback. A chapter cut short is kept only when it holds kept
-chapters of its own. The Cues index keeps at most 32 MiB of CuePoints,
-positions, references and seek entries. Past that, the CuePoints that fit
-are kept and a `DamagedMaster(Cues)` event is recorded on either open. A
-seek past the last `CueTime` kept for its track, or on a track with no
+or the Segment is refused unread, and the open does not follow it there. A
+source failure while it reads is returned as itself. Sizes are checked
+before a read, and a `Void` is stepped over unread. Everything the open
+keeps from `Tracks` and from `Tags` is charged to the master's 32 MiB limit
+before it is allocated: records, strings, byte strings and lists, the
+per-stream views, tag resolution with its flat entries, and working room
+for parsing a codec configuration. The per-stream views take the parsed
+data instead of copying it, and a stream's extradata takes its
+CodecPrivate bytes; a compressed CodecPrivate is decompressed only as far
+as its budget allows. An `Info` or `Tracks` master past its budget is
+InvalidData: a strict open fails and a resilient open skips it. A `Tags`
+master past its budget is dropped, or cut to the Tags that fit. A
+mid-stream `Tags` may use what the current tag state leaves of the 32 MiB.
+`Chapters` and `Attachments` past theirs keep the chapters or attachments
+that fit, in order and with their flat entries. A chapter cut short, by its
+budget or by damage, is kept only when it holds kept chapters of its own.
+The Cues index keeps at most 32 MiB of CuePoints, positions, references and
+seek entries. Past that, or past damage, the CuePoints before it are kept.
+A seek past the last `CueTime` kept for its track, or on a track with no
 kept cue, scans the Clusters as a Cues-less seek does. Known limit: that
 scan starts at the first Cluster, so on a large remote file it costs reads
 up to the target.
@@ -618,8 +626,9 @@ SeekPreRoll consumption remain shared AudioTrim integration work.
   or not they are recoverable in their code"); this Reader recovers where
   the strict `open` fails. A known-size Segment whose declared size runs
   past the input end is clamped (truncated-file recovery); a damaged
-  Top-Level master before the first Cluster (`Tags`, `Chapters`, `Cues`,
-  ...) is skipped keeping whatever parsed before the error; garbage
+  `Info` or `Tracks` master before the first Cluster is skipped like the
+  optional masters both opens skip, keeping whatever parsed before the
+  error; garbage
   between Top-Level elements is stepped over by scanning for the next
   well-formed 4-byte Top-Level element ID; and a corrupt element inside
   the Cluster stream makes `next_packet` resynchronise on the next
@@ -636,12 +645,14 @@ SeekPreRoll consumption remain shared AudioTrim integration work.
   `MkvDemuxer::damage_events()` — empty exactly when the file needed no
   recovery, so strict-minded callers can reject after the fact. The first
   4096 events are kept and `dropped_damage_events()` counts the rest. The
-  strict `open` / `open_typed` behaviour is unchanged byte-for-byte.
+  strict `open` / `open_typed` fails on damage in the EBML header, the
+  Segment, `Info` or `Tracks`, or garbage between Top-Level elements, and
+  records its own `DamageEvent`s for the optional masters it steps over.
 - **Cues-less seek**: `seek_to` on a file with no usable `Cues` (absent —
   RFC 9559 §22.1 only RECOMMENDS the element; live recordings and files
-  written to a pipe have none — or damaged and skipped by a resilient
-  open), or past the last `CueTime` kept for its track from an index cut at
-  its budget,
+  written to a pipe have none — or damaged and skipped), or past the last
+  `CueTime` kept for its track from an index cut at its budget or by
+  damage,
   scans the Clusters up to the target, the way FFmpeg indexes such
   a file: it walks Cluster `Timestamp`s (§5.1.3.1) to the first Cluster
   past the target, then reads Block headers in those Clusters, newest

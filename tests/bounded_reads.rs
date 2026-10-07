@@ -388,10 +388,10 @@ fn opened(input: Box<dyn ReadSeek>, resilient: bool) -> Option<Vec<u8>> {
 }
 
 /// A master larger than its budget is refused before it is read, even for
-/// its CRC-32: a SeekHead is skipped like a third one, a Tracks or Tags
-/// master is invalid data like contents over their budgets, and a followed
-/// or trailing one is passed over as a damaged one is. A master within its
-/// budget is still checked.
+/// its CRC-32: a SeekHead is skipped like a third one, a Tracks master is
+/// invalid data like contents over their budgets, and a Tags master,
+/// optional, is dropped as damage in either open, as a followed or trailing
+/// one is passed over. A master within its budget is still checked.
 #[test]
 fn masters_over_their_budget_are_refused_unread() {
     let _serial = serial();
@@ -420,7 +420,7 @@ fn masters_over_their_budget_are_refused_unread() {
     check("SeekHead", file(&[padded(ids::SEEK_HEAD, &[]), subtitle_tracks(), first.clone()]), false, a.clone());
     for resilient in [false, true] {
         let tags = file(&[subtitle_tracks(), padded(ids::TAGS, &[]), first.clone()]);
-        check(&format!("Tags, resilient {resilient}"), tags, resilient, if resilient { a.clone() } else { None });
+        check(&format!("Tags, resilient {resilient}"), tags, resilient, a.clone());
         let tracks = file(&[padded(ids::TRACKS, &entry), first.clone()]);
         check(&format!("Tracks, resilient {resilient}"), tracks, resilient, None);
     }

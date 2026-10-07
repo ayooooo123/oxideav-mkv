@@ -16,8 +16,8 @@
 //! * a truncated file yields the packet prefix that physically fits, then
 //!   a clean `Error::Eof` — including a known-size Segment whose declared
 //!   size now runs past the input end;
-//! * a damaged Top-Level master (`Tags`) fails the strict open but is
-//!   skipped by the resilient open, keeping tracks and packets intact;
+//! * a damaged optional Top-Level master (`Tags`) is skipped by the strict
+//!   and the resilient open alike, keeping tracks and packets intact;
 //! * damage with no later recovery point drops the tail and ends the
 //!   stream cleanly.
 
@@ -356,12 +356,12 @@ fn known_size_segment_past_eof_is_clamped_with_event() {
 }
 
 // =====================================================================
-// 6. Damaged Top-Level master — strict open fails, resilient open skips
-//    the master and keeps demuxing.
+// 6. Damaged Top-Level master — an optional one (here Tags) is skipped by
+//    either open, which keeps demuxing.
 // =====================================================================
 
 #[test]
-fn resilient_open_skips_damaged_tags_master() {
+fn either_open_skips_a_damaged_tags_master() {
     // A Tags master whose inner TagString declares a 1 GiB size.
     let mut tag_body = Vec::new();
     tag_body.extend_from_slice(&elem_master(ids::TARGETS, &[]));
@@ -378,22 +378,16 @@ fn resilient_open_skips_damaged_tags_master() {
     seg.extend_from_slice(&cluster(0, 0x11));
     let bytes = file_with_segment_body(&seg);
 
-    assert!(
-        open_strict(bytes.clone()).is_err(),
-        "strict open must reject the forged TagString size"
-    );
-
-    let mut dmx = open_resilient(bytes).expect("resilient open");
-    assert_eq!(dmx.streams().len(), 1, "tracks survive the damaged Tags");
-    assert!(
-        dmx.damage_events()
-            .iter()
-            .any(|e| e.kind() == DamageKind::DamagedMaster(ids::TAGS)),
-        "DamagedMaster(Tags) event: {:?}",
-        dmx.damage_events()
-    );
-    let packets = drain(&mut dmx);
-    assert_eq!(packets, vec![(0, 0x11)]);
+    for opened in [open_strict(bytes.clone()), open_resilient(bytes)] {
+        let mut dmx = opened.expect("open");
+        assert_eq!(dmx.streams().len(), 1, "tracks survive the damaged Tags");
+        assert_eq!(
+            dmx.damage_events().iter().map(|e| e.kind()).collect::<Vec<_>>(),
+            [DamageKind::DamagedMaster(ids::TAGS)],
+        );
+        let packets = drain(&mut dmx);
+        assert_eq!(packets, vec![(0, 0x11)]);
+    }
 }
 
 // =====================================================================
@@ -457,10 +451,10 @@ fn resilient_seek_without_cues_scans_cluster_timestamps() {
 }
 
 #[test]
-fn resilient_seek_falls_back_when_cues_master_is_damaged() {
-    // A Cues master whose first CuePoint declares a 1 GiB size — the
-    // strict open rejects the file, the resilient open skips the master
-    // (no usable index) and seek falls back to the Cluster scan.
+fn seek_falls_back_when_the_cues_master_is_damaged() {
+    // A Cues master whose first CuePoint declares a 1 GiB size: either open
+    // skips the master (no usable index) and seek falls back to the
+    // Cluster scan.
     let damaged_cues = elem_master(
         ids::CUES,
         &elem_forged_size(ids::CUE_POINT, 1 << 30, &[0x00; 4]),
@@ -473,16 +467,16 @@ fn resilient_seek_falls_back_when_cues_master_is_damaged() {
     seg.extend_from_slice(&cluster(1000, 0x22));
     let bytes = file_with_segment_body(&seg);
 
-    assert!(open_strict(bytes.clone()).is_err());
-
-    let mut dmx = open_resilient(bytes).expect("resilient open");
-    assert!(dmx
-        .damage_events()
-        .iter()
-        .any(|e| e.kind() == DamageKind::DamagedMaster(ids::CUES)));
-    let landed = dmx.seek_to(0, 1000).expect("fallback seek");
-    assert_eq!(landed, 1000);
-    assert_eq!(drain(&mut dmx), vec![(1000, 0x22)]);
+    for opened in [open_strict(bytes.clone()), open_resilient(bytes)] {
+        let mut dmx = opened.expect("open");
+        assert!(dmx
+            .damage_events()
+            .iter()
+            .any(|e| e.kind() == DamageKind::DamagedMaster(ids::CUES)));
+        let landed = dmx.seek_to(0, 1000).expect("fallback seek");
+        assert_eq!(landed, 1000);
+        assert_eq!(drain(&mut dmx), vec![(1000, 0x22)]);
+    }
 }
 
 #[test]

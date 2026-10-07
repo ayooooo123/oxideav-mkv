@@ -13,7 +13,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use oxideav_core::{Demuxer, Error, NullCodecResolver, ReadSeek};
@@ -202,6 +202,10 @@ fn overrun_tags() -> Vec<u8> {
     elem(ids::TAGS, &elem(ids::TAG, &elem(ids::SIMPLE_TAG, &simple_tag)))
 }
 
+/// Every child in a `Tracks` or `Tags` tree must fit its parent, checked
+/// before it is read. Tracks are essential, so an overrun there fails the
+/// open; a Tags master is optional, so it is dropped as damage and the
+/// open goes on, strict or resilient.
 #[test]
 fn tracks_and_tags_children_must_fit_their_parents() {
     let _serial = serial();
@@ -209,7 +213,7 @@ fn tracks_and_tags_children_must_fit_their_parents() {
     let c = cluster(0, b"a");
     // Ahead of the Clusters, with BIG octets physically following.
     let inline = file(&[tracks(), overrun_tags(), void(BIG), c.clone()]);
-    cases.check("Tags in line", inline.clone(), false, Err("InvalidData"));
+    cases.check("Tags in line", inline.clone(), false, Ok(b"a"));
     cases.check("Tags in line, resilient", inline, true, Ok(b"a"));
     // After the Clusters, reached through the SeekHead.
     let t = tracks();
@@ -233,6 +237,10 @@ fn tracks_and_tags_children_must_fit_their_parents() {
     assert!(cases.0.is_empty(), "{:#?}", cases.0);
 }
 
+/// RFC 9559 allows the unknown size on a Segment and a Cluster alone. Any
+/// other Top-Level master using it is damage: an essential one (Info,
+/// Tracks) fails a strict open, an optional one is dropped and the open
+/// goes on.
 #[test]
 fn only_a_cluster_may_use_the_unknown_size() {
     let _serial = serial();
@@ -240,7 +248,7 @@ fn only_a_cluster_may_use_the_unknown_size() {
     let tag = elem(ids::TAG, &elem(ids::SIMPLE_TAG, &[elem(ids::TAG_NAME, b"T"), elem(ids::TAG_STRING, b"v")].concat()));
     let tags = [unknown_size(ids::TAGS), tag].concat();
     let inline = file(&[tracks(), tags.clone(), cluster(0, b"a")]);
-    cases.check("Tags in line", inline.clone(), false, Err("InvalidData"));
+    cases.check("Tags in line", inline.clone(), false, Ok(b"a"));
     cases.check("Tags in line, resilient", inline, true, Ok(b"a"));
     let unsized_tracks = file(&[[unknown_size(ids::TRACKS), elem(ids::TRACK_ENTRY, &track_fields())].concat(), cluster(0, b"a")]);
     cases.check("Tracks in line", unsized_tracks.clone(), false, Err("InvalidData"));
@@ -263,7 +271,8 @@ fn only_a_cluster_may_use_the_unknown_size() {
     ] {
         let master = [unknown_size(id), body].concat();
         let inline = file(&[tracks(), master.clone(), cluster(0, b"a")]);
-        cases.check(&format!("{name} in line"), inline.clone(), false, Err("InvalidData"));
+        let strict = if id == ids::INFO { Err("InvalidData") } else { Ok(&b"a"[..]) };
+        cases.check(&format!("{name} in line"), inline.clone(), false, strict);
         cases.check(&format!("{name} in line, resilient"), inline, true, Ok(b"a"));
         // A header with nothing after it: the Cluster starts right where
         // its body would.
@@ -328,6 +337,9 @@ fn attachments_named(name: &[u8]) -> Vec<u8> {
     elem(ids::ATTACHMENTS, &attached_file(1, name, b"d"))
 }
 
+/// A Chapters or Attachments text field holds at most 64 KiB, checked
+/// before it is read. A longer one is damage: the chapter or attachment is
+/// dropped and the open goes on, strict or resilient.
 #[test]
 fn chapter_and_attachment_text_fields_hold_64_kib() {
     let _serial = serial();
@@ -336,9 +348,9 @@ fn chapter_and_attachment_text_fields_hold_64_kib() {
     for (field, master) in [("ChapString", chapters_titled as fn(&[u8]) -> Vec<u8>), ("FileName", attachments_named)] {
         cases.check(&format!("64 KiB {field}"), with(master(&vec![b'x'; 64 << 10])), false, Ok(b"a"));
         let over = with(master(&vec![b'x'; (64 << 10) + 1]));
-        cases.check(&format!("64 KiB + 1 {field}"), over.clone(), false, Err("InvalidData"));
+        cases.check(&format!("64 KiB + 1 {field}"), over.clone(), false, Ok(b"a"));
         cases.check(&format!("64 KiB + 1 {field}, resilient"), over, true, Ok(b"a"));
-        cases.check(&format!("48 MiB {field}"), with(master(&vec![b'x'; BIG])), false, Err("InvalidData"));
+        cases.check(&format!("48 MiB {field}"), with(master(&vec![b'x'; BIG])), false, Ok(b"a"));
     }
     // A 48 MiB payload stays on disk at open and is read on request.
     let payload = with(elem(ids::ATTACHMENTS, &attached_file(1, b"font.ttf", &vec![7; BIG])));
@@ -657,4 +669,156 @@ fn a_large_valid_cues_index_still_seeks_by_its_points() {
     assert_eq!(landings, expected);
     assert_eq!(d.cue_points().len(), CLUSTERS as usize);
     assert!(d.damage_events().is_empty(), "{:?}", d.damage_events());
+}
+
+/// What an open of `bytes` plays and keeps: every packet, the damage it
+/// noted, the chapters depth first and the attachments as (index, UID)
+/// pairs, how many CuePoints it kept, and where seeking stream 0 to 0,
+/// 1 s and 2 s lands with the packet read there.
+#[derive(Debug, PartialEq)]
+struct Played {
+    packets: Vec<Vec<u8>>,
+    damage: Vec<DamageKind>,
+    chapters: Vec<(u64, u64)>,
+    attachments: Vec<(u64, u64)>,
+    cue_points: usize,
+    seeks: Vec<Result<(i64, Vec<u8>), String>>,
+}
+
+fn played(bytes: Vec<u8>, resilient: bool) -> Result<Played, String> {
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut d = if resilient {
+        demux::open_resilient_typed(input, &NullCodecResolver)
+    } else {
+        demux::open_typed(input, &NullCodecResolver)
+    }.map_err(kind)?;
+    let mut packets = Vec::new();
+    loop {
+        match d.next_packet() {
+            Ok(p) => packets.push(p.data),
+            Err(Error::Eof) => break,
+            Err(e) => return Err(format!("after {} packets: {}", packets.len(), kind(e))),
+        }
+    }
+    let damage = d.damage_events().iter().map(|e| e.kind()).collect();
+    let mut chapters = Vec::new();
+    for edition in d.chapters() {
+        chapter_order(&edition.chapters, &mut chapters);
+    }
+    let attachments = d.attachments().iter().map(|a| (u64::from(a.index), a.uid)).collect();
+    let cue_points = d.cue_points().len();
+    let seeks = [0, 1000, 2000].map(|target| seek_and_read(&mut d, 0, target)).to_vec();
+    Ok(Played { packets, damage, chapters, attachments, cue_points, seeks })
+}
+
+/// Optional masters never stop an open, strict or resilient. A child whose
+/// size runs past its parent inside Chapters, Cues, Tags, Attachments or a
+/// SeekHead is damage, noted once, and every packet still plays. Chapters,
+/// Attachments and Cues keep what came before the broken child, and a seek
+/// the Cues kept do not cover scans the Clusters.
+#[test]
+fn optional_masters_with_a_child_past_its_parent_are_damage() {
+    let _serial = serial();
+    let mut failures = Vec::new();
+    let t = tracks();
+    let clusters = [cluster(0, b"a"), cluster(1000, b"b"), cluster(2000, b"c")];
+    // Cues ahead of the Clusters: `points` given the first Cluster's
+    // Segment Position.
+    let cues = |points: &dyn Fn(u64) -> Vec<u8>| {
+        let first = (t.len() + elem(ids::CUES, &points(0)).len()) as u64;
+        elem(ids::CUES, &points(first))
+    };
+    let past = |id: u32| header(id, 1 << 20);
+    let second_atom = elem(ids::CHAPTER_ATOM, &[uint(ids::CHAPTER_UID, 2), past(ids::CHAPTER_TIME_START)].concat());
+    let second_file = elem(ids::ATTACHED_FILE, &[elem(ids::FILE_NAME, b"two.ttf"), past(ids::FILE_MIME_TYPE)].concat());
+    let tag = |value: Vec<u8>| elem(ids::TAG, &elem(ids::SIMPLE_TAG, &[elem(ids::TAG_NAME, b"T"), value].concat()));
+    let cases = [
+        ("a ChapterAtom past its EditionEntry", ids::CHAPTERS,
+            elem(ids::CHAPTERS, &elem(ids::EDITION_ENTRY, &[chapter_atom(1, b"one"), past(ids::CHAPTER_ATOM)].concat()))),
+        ("a ChapterTimeStart past its ChapterAtom", ids::CHAPTERS,
+            elem(ids::CHAPTERS, &elem(ids::EDITION_ENTRY, &[chapter_atom(1, b"one"), second_atom].concat()))),
+        ("a CuePoint past its Cues", ids::CUES, cues(&|first| [cue_point(0, first, false), past(ids::CUE_POINT)].concat())),
+        ("the first CuePoint past its Cues", ids::CUES, cues(&|_| past(ids::CUE_POINT))),
+        ("a CueTrack past its CueTrackPositions", ids::CUES, cues(&|first| {
+            let broken = elem(ids::CUE_TRACK_POSITIONS, &[uint(ids::CUE_CLUSTER_POSITION, first), past(ids::CUE_TRACK)].concat());
+            [cue_point(0, first, false), elem(ids::CUE_POINT, &[uint(ids::CUE_TIME, 1000), broken].concat())].concat()
+        })),
+        ("a TagString past its SimpleTag", ids::TAGS, elem(ids::TAGS, &[tag(elem(ids::TAG_STRING, b"v")), tag(past(ids::TAG_STRING))].concat())),
+        ("a FileMimeType past its AttachedFile", ids::ATTACHMENTS,
+            elem(ids::ATTACHMENTS, &[attached_file(1, b"one.ttf", b"d"), second_file].concat())),
+        ("a Seek past its SeekHead", ids::SEEK_HEAD, elem(ids::SEEK_HEAD, &past(ids::SEEK))),
+    ];
+    let every = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+    let landings: Vec<Result<(i64, Vec<u8>), String>> = vec![Ok((0, b"a".to_vec())), Ok((1000, b"b".to_vec())), Ok((2000, b"c".to_vec()))];
+    for (case, id, master) in cases {
+        let bytes = file(&[vec![t.clone(), master], clusters.to_vec()].concat());
+        for resilient in [false, true] {
+            let case = format!("{case}{}", if resilient { ", resilient" } else { "" });
+            let got = match played(bytes.clone(), resilient) {
+                Ok(got) => got,
+                Err(e) => {
+                    failures.push(format!("{case}: {e}"));
+                    continue;
+                }
+            };
+            // What came before the broken child is kept.
+            let kept = match id {
+                ids::CHAPTERS => got.chapters == [(1, 1)],
+                ids::ATTACHMENTS => got.attachments == [(1, 1)],
+                ids::CUES => got.cue_points == usize::from(!case.starts_with("the first")),
+                _ => true,
+            };
+            if got.packets != every || got.damage != [DamageKind::DamagedMaster(id)] || !kept || got.seeks != landings {
+                failures.push(format!("{case}: {got:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Fails each read at or past `from` with the source's own
+/// `UnexpectedEof`, as a transport that drops mid-read does.
+struct Dropping {
+    inner: Cursor<Vec<u8>>,
+    from: Arc<AtomicU64>,
+}
+
+impl Read for Dropping {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.inner.position() >= self.from.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "transport dropped"));
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for Dropping {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+/// A source that fails while a payload is read gets its own error back,
+/// not one for a payload the input cuts short, and the reader is back
+/// where it was: the next packet plays and a later fetch succeeds.
+#[test]
+fn a_source_failure_fetching_an_attachment_is_returned_as_itself() {
+    let _serial = serial();
+    let attachments = elem(ids::ATTACHMENTS, &attached_file(1, b"font.ttf", &[7; 64]));
+    let bytes = file(&[tracks(), attachments, cluster(0, b"a"), cluster(1000, b"b")]);
+    let from = Arc::new(AtomicU64::new(u64::MAX));
+    let input = Box::new(Dropping { inner: Cursor::new(bytes), from: from.clone() });
+    let mut d = demux::open_typed(input, &NullCodecResolver).unwrap();
+    let first = d.next_packet().map(|p| p.data).map_err(kind);
+    from.store(d.attachments()[0].data_offset, Ordering::SeqCst);
+    let fetched = d.attachment_data(1);
+    from.store(u64::MAX, Ordering::SeqCst);
+    let own = matches!(&fetched, Err(Error::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof);
+    let next = d.next_packet().map(|p| p.data).map_err(kind);
+    let again = d.attachment_data(1).map(|data| data == [7; 64]).map_err(kind);
+    assert!(
+        first == Ok(b"a".to_vec()) && own && next == Ok(b"b".to_vec()) && again == Ok(true),
+        "first {first:?}, fetch {:?}, next {next:?}, again {again:?}",
+        fetched.map(|data| data.len()),
+    );
 }
