@@ -85,13 +85,28 @@ exact size. A Block waiting for room holds its stored bytes and side data
 within the same budget, and duplicate `BlockAddID`s are dropped in linear
 time. The 512 KiB startup byte threshold also counts this state; the
 bounded current/deferred Block and temporary expansion remain additional
-working memory. The `EncryptedBlock`s kept on Cluster records share one
-32 MiB budget for the life of the demuxer, and one revisited by a seek is
-not recorded again; a block past the budget is InvalidData, and the walk
-resumes at the next Cluster. Source I/O
+working memory. The `EncryptedBlock`s and `SilentTrackNumber`s kept on
+Cluster records share one 32 MiB budget for the life of the demuxer. It
+counts their lists and the set of elements already recorded, each charged
+before it is allocated, and an element revisited by a seek is not recorded
+again. An element past the budget is InvalidData, and the walk resumes at
+the next Cluster. Source I/O
 failures propagate, including source-generated UnexpectedEof and failures
 met reading trailing Tags, Cluster `CRC-32`s or seek landings; only parser
 damage and physical truncation are recovered.
+
+The metadata read at open is bounded too. Every element in a `Tracks` or
+`Tags` tree must fit its parent, and an unknown-size `Tracks` or `Tags` is
+InvalidData: a strict open fails, and a resilient open skips it as a
+damaged master. An unknown-size `Tags` between Clusters is damage in the
+Cluster stream, so the walk resumes at the next Cluster. In `Info`,
+`SegmentUUID`, `PrevUUID` and `NextUUID` must be 16 octets, each text field
+holds at most 64 KiB, and the `Info` masters keep at most 1 MiB together.
+Sizes are checked before a read, and a `Void` is stepped over unread. The
+Cues index keeps at most 32 MiB of CuePoints, positions, references and
+seek entries. Past that, the CuePoints that fit are kept, a
+`DamagedMaster(Cues)` event is recorded on either open, and a seek past the
+last kept `CueTime` scans the Clusters as a Cues-less seek does.
 
 Known network cost: an `Info`, `Cues`, `Chapters` or `Attachments` master
 whose first child is a `CRC-32` is read in full to check it, in 16 KiB
@@ -594,7 +609,8 @@ SeekPreRoll consumption remain shared AudioTrim integration work.
 - **Cues-less seek**: `seek_to` on a file with no usable `Cues` (absent —
   RFC 9559 §22.1 only RECOMMENDS the element; live recordings and files
   written to a pipe have none — or damaged and skipped by a resilient
-  open) scans the Clusters up to the target, the way FFmpeg indexes such
+  open), or past the last `CueTime` kept from an index cut at its budget,
+  scans the Clusters up to the target, the way FFmpeg indexes such
   a file: it walks Cluster `Timestamp`s (§5.1.3.1) to the first Cluster
   past the target, then reads Block headers in those Clusters, newest
   first, for the last keyframe of the sought track at or before the
@@ -697,8 +713,9 @@ SeekPreRoll consumption remain shared AudioTrim integration work.
   `*Filename`s, the unbounded `SegmentFamily` UID list, and the
   `ChapterTranslate` sub-tree ([`ChapterTranslate`]: `ChapterTranslateID`
   + `ChapterTranslateCodec` + optional `ChapterTranslateEditionUID` list).
-  UID binaries are surfaced verbatim — off-length values round-trip for
-  inspection rather than being truncated. `is_empty()` reports the common
+  `SegmentUUID`, `PrevUUID` and `NextUUID` must be 16 octets: another
+  length is InvalidData. `SegmentFamily` binaries are surfaced verbatim, so
+  an off-length one round-trips for inspection. `is_empty()` reports the common
   standalone Segment; `is_hard_linked()` reports a chain member. Pure
   container surface: no neighbouring-file resolution.
 - Seek: `seek_to(stream, pts)` uses the Cues index — before the first

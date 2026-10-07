@@ -91,10 +91,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   EBML lace is InvalidData; a Block that fails after waiting recovers from
   its own offset. Source errors while reading trailing Tags, a Cluster's
   `CRC-32`, a seek's Block headers or a Cue landing are returned instead of
-  skipping the element or landing elsewhere. The `EncryptedBlock`s kept on
-  Cluster records share one 32 MiB budget, and a block revisited by a seek
-  is not recorded again; one past the budget is InvalidData, recovered at
-  the next Cluster.
+  skipping the element or landing elsewhere. The `EncryptedBlock`s and
+  `SilentTrackNumber`s kept on Cluster records share one 32 MiB budget that
+  also counts their lists and the set of recorded elements, each charged
+  before it is allocated. An element revisited by a seek is not recorded
+  again; one past the budget is InvalidData, recovered at the next Cluster.
+  Every element in a Tracks or Tags tree must fit its parent, and an
+  unknown-size Tracks or Tags master is InvalidData: a resilient open skips
+  it, and between Clusters it is Cluster-stream damage. `SegmentUUID`,
+  `PrevUUID` and `NextUUID` must be 16 octets, each `Info` text field holds
+  at most 64 KiB and the `Info` masters keep at most 1 MiB, checked before
+  a read. The Cues index keeps at most 32 MiB: past that it keeps the
+  CuePoints that fit, records a `DamagedMaster(Cues)` event on either open,
+  and a seek past the last kept `CueTime` scans the Clusters.
 - Laces advance by their per-frame durations rather than repeating the
   first timestamp. BlockDuration and DefaultDuration use FFmpeg 9's integer
   remainder distribution; duration-less Vorbis, Opus, FLAC, WavPack, MP3,

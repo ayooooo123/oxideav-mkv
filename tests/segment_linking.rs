@@ -235,17 +235,14 @@ fn chapter_translate_subtree_parsed() {
 }
 
 #[test]
-fn off_length_uid_round_trips_verbatim() {
-    // A malformed SegmentUUID of the wrong length must still round-trip
-    // verbatim for inspection rather than being silently dropped.
+fn off_length_uid_is_invalid_data() {
+    // RFC 9559 §5.1.2.1: a SegmentUUID is exactly 16 octets. A UID of any
+    // other length is invalid data, which fails a strict open.
     let stub = [0xAB, 0xCD];
     let mut info = Vec::new();
     info.extend_from_slice(&elem_uint(ids::TIMECODE_SCALE, 1_000_000));
     info.extend_from_slice(&elem_bin(ids::SEGMENT_UID, &stub));
-    let dmx = open(build_file(&info));
-
-    assert_eq!(
-        dmx.segment_linking().segment_uuid.as_deref(),
-        Some(&stub[..])
-    );
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(build_file(&info)));
+    let opened = oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver);
+    assert!(matches!(opened, Err(oxideav_core::Error::InvalidData(_))));
 }

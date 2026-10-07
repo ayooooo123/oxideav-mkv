@@ -482,3 +482,72 @@ fn encrypted_blocks_share_one_retention_budget() {
         "played {played}, kept blocks {kept:?}, {damaged} damage events, retained {retained} heap bytes"
     );
 }
+
+/// Opens `segment`, drains it and returns the demuxer with its packets and
+/// the heap it still holds beyond what was live before the open.
+fn drained(segment: &[Vec<u8>]) -> (MkvDemuxer, Vec<Vec<u8>>, usize) {
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(file(segment)));
+    let base = LIVE.load(Ordering::SeqCst);
+    let mut d = demux::open_typed(input, &NullCodecResolver).unwrap();
+    let mut packets = Vec::new();
+    loop {
+        match d.next_packet() {
+            Ok(p) => packets.push(p.data),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+    let held = LIVE.load(Ordering::SeqCst).saturating_sub(base);
+    (d, packets, held)
+}
+
+/// A 31 MiB EncryptedBlock, then 16,000 Clusters each holding an empty one.
+/// Every record's list of blocks costs memory besides the blocks, and the
+/// lists and blocks together stay within the 32 MiB budget.
+#[test]
+fn encrypted_block_lists_count_against_the_budget() {
+    let _serial = serial();
+    let mut big = vec![0x5a; 31 << 20];
+    big[..4].copy_from_slice(&[0x81, 0, 0, 0x80]);
+    let mut segment = vec![subtitle_tracks(), cluster(0, &[simple(1, 0, b"a"), elem(ids::ENCRYPTED_BLOCK, &big)])];
+    for i in 1..=16_000 {
+        segment.push(cluster(i, &[elem(ids::ENCRYPTED_BLOCK, &[])]));
+    }
+    segment.push(cluster(20_000, &[simple(1, 0, b"z")]));
+    let (d, packets, _) = drained(&segment);
+    let records = d.cluster_records();
+    let lists: usize = records.iter().map(|r| r.encrypted_blocks.capacity() * std::mem::size_of::<Vec<u8>>()).sum();
+    let blocks: usize = records.iter().flat_map(|r| &r.encrypted_blocks).map(Vec::capacity).sum();
+    let big_kept = records[0].encrypted_blocks.first().map(Vec::len) == Some(31 << 20);
+    let played = packets == [b"a".to_vec(), b"z".to_vec()];
+    assert!(
+        played && big_kept && lists + blocks <= 32 << 20,
+        "played {played}, 31 MiB block kept {big_kept}, lists {lists} + blocks {blocks} bytes"
+    );
+}
+
+/// Four Clusters, each a packet and then a SilentTracks master of 1.5
+/// million SilentTrackNumbers: 24 MiB on disk that the records would keep
+/// as 48 MB of numbers. They keep what fits the 32 MiB budget they share
+/// with EncryptedBlocks; a master past it is damage, recovered from as any
+/// is, so every Cluster's packet still plays.
+#[test]
+fn silent_tracks_share_the_cluster_record_budget() {
+    let _serial = serial();
+    let numbers = elem(ids::SILENT_TRACK_NUMBER, &[1]).repeat(1_500_000);
+    let mut segment = vec![subtitle_tracks()];
+    for i in 0..4u8 {
+        segment.push(cluster(u64::from(i) * 1000, &[simple(1, 0, &[b'p', i]), elem(ids::SILENT_TRACKS, &numbers)]));
+    }
+    let (d, packets, held) = drained(&segment);
+    let kept: Vec<usize> = d.cluster_records().iter().map(|r| r.silent_track_numbers.len()).collect();
+    let lists: usize = d.cluster_records().iter().map(|r| r.silent_track_numbers.capacity() * 8).sum();
+    let played = packets == (0..4u8).map(|i| vec![b'p', i]).collect::<Vec<_>>();
+    // Two masters fit the budget; the other two are damage.
+    assert!(
+        played && kept == [1_500_000, 1_500_000, 0, 0] && d.damage_events().len() == 2
+            && lists <= 32 << 20 && held < (32 << 20) + (1 << 20),
+        "played {played}, kept {kept:?}, {} damage events, lists {lists} bytes, held {held} heap bytes",
+        d.damage_events().len()
+    );
+}

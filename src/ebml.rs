@@ -186,7 +186,11 @@ pub fn read_float(r: &mut dyn Read, n: usize) -> Result<f64> {
 }
 
 pub fn read_string(r: &mut dyn Read, n: usize) -> Result<String> {
-    let mut buf = read_bytes(r, n)?;
+    into_string(read_bytes(r, n)?)
+}
+
+/// `buf` as an EBML string: trailing NULs trimmed, UTF-8 required.
+pub(crate) fn into_string(mut buf: Vec<u8>) -> Result<String> {
     // Trim trailing NULs (common in MKV strings).
     while buf.last() == Some(&0) {
         buf.pop();

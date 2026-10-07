@@ -381,20 +381,29 @@ fn cluster_records_no_encrypted_blocks_when_absent() {
     assert!(recs[0].encrypted_blocks.is_empty());
 }
 
+/// Walks `dmx` from the start `walks` times, each walk returning exactly the
+/// Cluster's one packet, 0xAA, then the end of the stream.
+fn walk_from_the_start(dmx: &mut oxideav_mkv::demux::MkvDemuxer, walks: usize) {
+    for walk in 0..walks {
+        let packet = dmx.next_packet().unwrap_or_else(|e| panic!("walk {walk}: {e}"));
+        assert_eq!(packet.data, vec![0xAA], "walk {walk}");
+        assert!(matches!(dmx.next_packet(), Err(Error::Eof)), "walk {walk} must end after its packet");
+        dmx.seek_to(0, 0).expect("seek to the start");
+    }
+}
+
 #[test]
 fn revisiting_a_cluster_records_its_encrypted_blocks_once() {
-    // Seeking back to the start walks the Cluster again. Its EncryptedBlocks
-    // are already on its record, so they are not appended a second time.
+    // Seeking back to the start walks the Cluster again: its packet plays
+    // each time, and its EncryptedBlocks, already on its record, are not
+    // appended a second time.
     let mut cluster = Vec::new();
     cluster.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
     cluster.extend_from_slice(&simple_block(1, 0, true, 0xAA));
     cluster.extend_from_slice(&encrypted_block(b"\x81\x00\x00\x80enc-one"));
     cluster.extend_from_slice(&encrypted_block(b"\x81\x00\x10\x80enc-two"));
     let mut dmx = open(build_segment(&[cluster]));
-    for _ in 0..3 {
-        while dmx.next_packet().is_ok() {}
-        dmx.seek_to(0, 0).expect("seek to the start");
-    }
+    walk_from_the_start(&mut dmx, 3);
     let recs = dmx.cluster_records();
     assert_eq!(recs.len(), 1);
     assert_eq!(
@@ -402,4 +411,20 @@ fn revisiting_a_cluster_records_its_encrypted_blocks_once() {
         vec![b"\x81\x00\x00\x80enc-one".to_vec(), b"\x81\x00\x10\x80enc-two".to_vec()],
         "a revisited Cluster's EncryptedBlocks must be recorded once"
     );
+}
+
+#[test]
+fn revisiting_a_cluster_records_its_silent_tracks_once() {
+    // As with EncryptedBlocks: a SilentTracks master revisited by a seek is
+    // already on the record, and its numbers are not appended again.
+    let silent = elem_master(ids::SILENT_TRACKS, &[
+        elem_uint(ids::SILENT_TRACK_NUMBER, 3), elem_uint(ids::SILENT_TRACK_NUMBER, 5),
+    ].concat());
+    let mut cluster = Vec::new();
+    cluster.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
+    cluster.extend_from_slice(&silent);
+    cluster.extend_from_slice(&simple_block(1, 0, true, 0xAA));
+    let mut dmx = open(build_segment(&[cluster]));
+    walk_from_the_start(&mut dmx, 3);
+    assert_eq!(dmx.cluster_records()[0].silent_track_numbers, vec![3, 5]);
 }

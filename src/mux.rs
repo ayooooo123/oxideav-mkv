@@ -4682,9 +4682,10 @@ impl MkvMuxer {
     /// * The three 128-bit UID elements — `SegmentUUID` (§5.1.2.1),
     ///   `PrevUUID` (§5.1.2.3), `NextUUID` (§5.1.2.5) — and every
     ///   `SegmentFamily` (§5.1.2.7) carry a fixed `length: 16`. A
-    ///   wrong-length value is rejected (the demuxer keeps off-length bytes
-    ///   verbatim for inspection, but the muxer refuses to write a
-    ///   spec-violating element).
+    ///   wrong-length value is rejected (the demuxer also treats an
+    ///   off-length `SegmentUUID` / `PrevUUID` / `NextUUID` as invalid
+    ///   data, and keeps an off-length `SegmentFamily` verbatim for
+    ///   inspection).
     /// * `PrevUUID` / `NextUUID` MUST NOT equal `SegmentUUID`
     ///   (§5.1.2.3 / §5.1.2.5). A self-referential link is rejected.
     /// * If any `ChapterTranslate` (§5.1.2.8) is present, a `SegmentFamily`

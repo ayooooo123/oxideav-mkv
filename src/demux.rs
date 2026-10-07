@@ -24,8 +24,8 @@ use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::codec_id::{from_matroska, strip_bitmapinfoheader};
 use crate::ebml::{
-    crc32_ieee, crc32_ieee_update, read_bytes, read_element_header, read_float, read_int,
-    read_string, read_uint, read_vint, skip, VINT_UNKNOWN_SIZE,
+    crc32_ieee, crc32_ieee_update, into_string, read_bytes, read_element_header, read_float,
+    read_int, read_string, read_uint, read_vint, skip, VINT_UNKNOWN_SIZE,
 };
 use crate::ids;
 
@@ -257,6 +257,13 @@ fn open_typed_impl(
     // §6.2). Populated as each Top-Level master with a leading CRC-32
     // child is walked; surfaced via `MkvDemuxer::crc_status`.
     let mut crc_status: Vec<CrcStatus> = Vec::new();
+    // What the Info masters and the Cues index may keep, together over the
+    // walk below and the SeekHead chase after it — see [`MAX_INFO_BYTES`]
+    // and [`MAX_CUE_BYTES`]. A Cues index cut at its budget keeps the
+    // CuePoints that fit; seeks past them scan the Clusters.
+    let mut info_budget = Budget::new(MAX_INFO_BYTES, "MKV: Info exceeds its 1 MiB budget");
+    let mut cue_budget = Budget::new(MAX_CUE_BYTES, "MKV: Cues exceed their 32 MiB budget");
+    let mut cues_cut = false;
 
     let mut seek_heads = 0usize;
     while input.stream_position()? < segment_data_end {
@@ -349,20 +356,25 @@ fn open_typed_impl(
             match e.id {
                 ids::INFO => {
                     let end = body_end_known.unwrap_or(segment_data_end);
-                    parse_info(&mut *input, end, &mut info, &mut metadata)?;
+                    parse_info(&mut *input, end, &mut info, &mut metadata, &mut info_budget)?;
                     have_info = true;
                 }
+                // A Tracks or Tags master has no end to parse within
+                // unless it declares one.
                 ids::TRACKS => {
-                    let end = body_end_known.unwrap_or(segment_data_end);
+                    let end = body_end_known.ok_or_else(unknown_size_master)?;
                     parse_tracks(&mut *input, end, &mut tracks)?;
                 }
                 ids::TAGS => {
-                    let end = body_end_known.unwrap_or(segment_data_end);
+                    let end = body_end_known.ok_or_else(unknown_size_master)?;
                     parse_tags(&mut *input, end, &mut pending_tags)?;
                 }
                 ids::CUES => {
                     let end = body_end_known.unwrap_or(segment_data_end);
-                    parse_cues(&mut *input, end, &mut cues, &mut cue_points)?;
+                    if let Some(stop) = parse_cues(&mut *input, end, &mut cues, &mut cue_points, &mut cue_budget)? {
+                        damage_events.push(cues_cut_at(stop, end));
+                        cues_cut = true;
+                    }
                 }
                 ids::CHAPTERS => {
                     let end = body_end_known.unwrap_or(segment_data_end);
@@ -399,22 +411,12 @@ fn open_typed_impl(
                 // emitted (its ID is formally unassigned in the IANA
                 // registry).
                 ids::SIGNATURE_SLOT => {
-                    if let Some(end) = body_end_known {
-                        input.seek(SeekFrom::Start(end))?;
-                    } else {
-                        return Err(Error::invalid(
-                            "MKV: unknown-size element other than Cluster",
-                        ));
-                    }
+                    let end = body_end_known.ok_or_else(unknown_size_master)?;
+                    input.seek(SeekFrom::Start(end))?;
                 }
                 _ => {
-                    if let Some(end) = body_end_known {
-                        input.seek(SeekFrom::Start(end))?;
-                    } else {
-                        return Err(Error::invalid(
-                            "MKV: unknown-size element other than Cluster",
-                        ));
-                    }
+                    let end = body_end_known.ok_or_else(unknown_size_master)?;
+                    input.seek(SeekFrom::Start(end))?;
                 }
             }
             Ok(())
@@ -520,6 +522,12 @@ fn open_typed_impl(
                 &mut editions,
                 &mut attachment_uid_to_index,
                 &mut attachments,
+                MetadataBudgets {
+                    info: &mut info_budget,
+                    cues: &mut cue_budget,
+                    cues_cut: &mut cues_cut,
+                    damage_events: &mut damage_events,
+                },
             );
             // A stale or damaged target is ignored; a transport failure is not.
             if let Err(e) = followed_target {
@@ -538,6 +546,9 @@ fn open_typed_impl(
 
     // Sort cues by (track, time) for stable lookup.
     cues.sort_by(|a, b| a.track.cmp(&b.track).then(a.time.cmp(&b.time)));
+    // A Cues index cut at its budget covers seeks up to its last kept
+    // point; past that a seek scans the Clusters instead.
+    let cues_cover = if cues_cut { cues.iter().map(|c| c.time).max() } else { None };
 
     if tracks.is_empty() {
         return Err(Error::invalid("MKV: no tracks found"));
@@ -1191,6 +1202,7 @@ fn open_typed_impl(
         duration_micros,
         cues,
         cue_points,
+        cues_cover,
         timecode_scale_ns,
         segment_linking: info.linking,
         tags: typed_tags,
@@ -1236,8 +1248,8 @@ fn open_typed_impl(
         track_identity,
         cluster_records: Vec::new(),
         cluster_record_by_offset: std::collections::HashMap::new(),
-        encrypted_bytes: 0,
-        encrypted_block_offsets: std::collections::HashSet::new(),
+        record_budget: Budget::new(MAX_CLUSTER_RECORD_BYTES, "MKV: Cluster records exceed their 32 MiB budget"),
+        recorded_offsets: std::collections::HashSet::new(),
         resilient,
         damage_events,
         resync_floor: 0,
@@ -1256,7 +1268,10 @@ fn open_typed_impl(
 pub enum DamageKind {
     /// A Top-Level master element (id given) failed to parse during the
     /// open-time Segment walk. Whatever the parser lifted before the
-    /// error was kept; the rest of the element was skipped.
+    /// error was kept; the rest of the element was skipped. Also a `Cues`
+    /// index cut at its budget, on either open: the CuePoints from
+    /// `offset` on were dropped, and a seek past the last one kept scans
+    /// the Clusters.
     DamagedMaster(u32),
     /// Bytes that should have held an element could not be parsed at all
     /// — the walk scanned forward and resumed at the next recognisable
@@ -1712,13 +1727,46 @@ const MAX_PROBE_PACKETS: usize = 1024;
 const MAX_PROBE_BYTES: usize = 512 << 10;
 /// Strong and weak reference counts in a shared side-data allocation.
 const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
-/// `EncryptedBlock` bytes the Cluster records keep, all together; each
-/// block is also charged [`ENCRYPTED_ENTRY_BYTES`].
-const MAX_ENCRYPTED_BYTES: usize = 32 << 20;
-/// What one kept `EncryptedBlock` holds besides its bytes, charged
-/// generously: its buffer's handle and slot in the record's list, and its
-/// offset in the set of blocks already recorded.
-const ENCRYPTED_ENTRY_BYTES: usize = 64;
+/// What the Cluster records keep besides their fixed fields, all together:
+/// `EncryptedBlock` bodies and `SilentTrackNumber`s, the lists holding them
+/// and the set of elements already recorded, each charged before it is
+/// allocated.
+const MAX_CLUSTER_RECORD_BYTES: usize = 32 << 20;
+/// One `Info` text field: a filename, `Title`, `MuxingApp` or `WritingApp`.
+const MAX_INFO_TEXT_BYTES: usize = 64 << 10;
+/// Everything the `Info` masters keep together: strings, UIDs, families,
+/// `ChapterTranslate`s, their lists and flat metadata entries.
+const MAX_INFO_BYTES: usize = 1 << 20;
+/// The `Cues` index the demuxer keeps: its CuePoints, CueTrackPositions,
+/// CueReferences and flat seek entries, with their lists. The CuePoints
+/// past it are dropped, and a seek past the last kept one scans the
+/// Clusters as a Cues-less seek does.
+const MAX_CUE_BYTES: usize = 32 << 20;
+
+/// The budgets the open shares between its walk and the SeekHead chase,
+/// and where a Cues index cut at its budget is noted.
+struct MetadataBudgets<'a> {
+    info: &'a mut Budget,
+    cues: &'a mut Budget,
+    cues_cut: &'a mut bool,
+    damage_events: &'a mut Vec<DamageEvent>,
+}
+
+/// The damage a Cues index cut at its budget records: the CuePoints from
+/// `stop` to the end of the Cues at `end` were dropped.
+fn cues_cut_at(stop: u64, end: u64) -> DamageEvent {
+    DamageEvent {
+        kind: DamageKind::DamagedMaster(ids::CUES),
+        offset: stop,
+        resumed_at: Some(end),
+        bytes_skipped: end.saturating_sub(stop),
+    }
+}
+
+/// RFC 9559 permits the unknown size on a Segment and a Cluster alone.
+fn unknown_size_master() -> Error {
+    Error::invalid("MKV: unknown-size element other than Cluster")
+}
 
 /// Only parser damage or a short read at the physical end is recoverable.
 /// Errors returned by the source itself retain their kind but are tagged
@@ -1977,7 +2025,9 @@ pub struct ClusterRecord {
     /// Cluster has no `SilentTracks` child (the overwhelmingly common
     /// case — the element is deprecated, `maxver: 0`, but historical
     /// Writers emit it). A track marked silent here MAY become active
-    /// again in a later Cluster (A.2).
+    /// again in a later Cluster (A.2). A `SilentTracks` master revisited by
+    /// a seek is not recorded again, and the numbers share the budget
+    /// described on [`Self::encrypted_blocks`].
     pub silent_track_numbers: Vec<u64>,
     /// `EncryptedBlock` payloads (RFC 9559 Appendix A.15, id `0xAF`) carried
     /// directly by this Cluster, in the order the walk first read them (on-
@@ -1992,11 +2042,12 @@ pub struct ClusterRecord {
     /// decryption and exposes no track binding — `EncryptedBlock` carries no
     /// usable track-number header once Transformed.
     ///
-    /// Every record's blocks together stay within a fixed 32 MiB budget, and
-    /// a block revisited by a seek is not recorded again. A block that would
-    /// exceed the budget is invalid data, recovered from like any damaged
-    /// Cluster child: the walk resumes at the next Cluster and the recovery
-    /// is a [`DamageEvent`].
+    /// Every record's blocks and `SilentTrackNumber`s, with the lists
+    /// holding them, stay within one fixed 32 MiB budget, and a block
+    /// revisited by a seek is not recorded again. A block or `SilentTracks`
+    /// master that would exceed the budget is invalid data, recovered from
+    /// like any damaged Cluster child: the walk resumes at the next Cluster
+    /// and the recovery is a [`DamageEvent`].
     pub encrypted_blocks: Vec<Vec<u8>>,
 }
 
@@ -2104,7 +2155,9 @@ impl SeekEntry {
 /// All fields are absent (`None` / empty) on the common standalone
 /// Segment that participates in no linking. This is a pure container
 /// surface: it records the UIDs and filenames verbatim and performs no
-/// cross-file resolution.
+/// cross-file resolution. A `SegmentUUID`, `PrevUUID` or `NextUUID` that
+/// is not 16 octets long is invalid data, and each filename holds at most
+/// 64 KiB.
 ///
 /// [`prev_uuid`]: SegmentLinking::prev_uuid
 /// [`next_uuid`]: SegmentLinking::next_uuid
@@ -2112,9 +2165,9 @@ impl SeekEntry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SegmentLinking {
     /// `SegmentUUID` (RFC 9559 §5.1.2.1, id `0x73A4`) — the 128-bit UID
-    /// identifying this Segment among others. Verbatim bytes (normally
-    /// exactly 16). `None` when the Segment carried none; REQUIRED only
-    /// when the Segment is part of a Linked Segment.
+    /// identifying this Segment among others: exactly 16 bytes. `None`
+    /// when the Segment carried none; REQUIRED only when the Segment is
+    /// part of a Linked Segment.
     pub segment_uuid: Option<Vec<u8>>,
     /// `SegmentFilename` (RFC 9559 §5.1.2.2, id `0x7384`) — a filename
     /// corresponding to this Segment. Display convenience only.
@@ -2719,35 +2772,27 @@ struct RawTrackOperation {
     join_uids: Vec<u64>,
 }
 
+/// Parse an `Info` master ending at `end`; every child must fit it. The
+/// three Segment UIDs must be 16 octets and each text field at most
+/// [`MAX_INFO_TEXT_BYTES`], checked before it is read. What is kept is
+/// charged to `budget` (see [`MAX_INFO_BYTES`]) before it is read or
+/// stored.
 fn parse_info(
     r: &mut dyn ReadSeek,
     end: u64,
     out: &mut SegmentInfo,
     metadata: &mut Vec<(String, String)>,
+    budget: &mut Budget,
 ) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::TIMECODE_SCALE => out.timecode_scale = read_uint(r, e.size as usize)?,
             ids::DURATION => out.duration = read_float(r, e.size as usize)?,
-            ids::TITLE => {
-                let s = read_string(r, e.size as usize)?;
-                if !s.is_empty() {
-                    metadata.push(("title".into(), s));
-                }
-            }
-            ids::MUXING_APP => {
-                let s = read_string(r, e.size as usize)?;
-                if !s.is_empty() {
-                    metadata.push(("muxer".into(), s));
-                }
-            }
-            ids::WRITING_APP => {
-                let s = read_string(r, e.size as usize)?;
-                if !s.is_empty() {
-                    metadata.push(("encoder".into(), s));
-                }
-            }
+            ids::TITLE => keep_info_entry(metadata, "title", info_text(r, e.size, budget)?, budget)?,
+            ids::MUXING_APP => keep_info_entry(metadata, "muxer", info_text(r, e.size, budget)?, budget)?,
+            ids::WRITING_APP => keep_info_entry(metadata, "encoder", info_text(r, e.size, budget)?, budget)?,
             ids::DATE_UTC => {
                 // 8-byte signed integer: nanoseconds since 2001-01-01 00:00:00 UTC.
                 if e.size == 8 {
@@ -2755,47 +2800,69 @@ fn parse_info(
                     let secs_since_2001 = ns / 1_000_000_000;
                     let unix_2001: i64 = 978_307_200;
                     let unix = unix_2001 + secs_since_2001;
-                    metadata.push(("date".into(), format_iso8601(unix)));
+                    let date = format_iso8601(unix);
+                    budget.charge(date.capacity())?;
+                    keep_info_entry(metadata, "date", date, budget)?;
                 } else {
-                    skip(r, e.size)?;
+                    r.seek(SeekFrom::Start(e_end))?;
                 }
             }
-            // Linked-Segment Info (RFC 9559 §5.1.2.1..§5.1.2.8). The three
-            // UID-bearing elements (SegmentUUID / PrevUUID / NextUUID /
-            // SegmentFamily) are 16-byte binaries; we keep them verbatim
-            // rather than forcing them through a fixed-size array so a
-            // malformed off-length value round-trips for inspection instead
-            // of being silently truncated.
-            ids::SEGMENT_UID => {
-                out.linking.segment_uuid = Some(read_bytes(r, e.size as usize)?);
-            }
-            ids::PREV_UID => {
-                out.linking.prev_uuid = Some(read_bytes(r, e.size as usize)?);
-            }
-            ids::NEXT_UID => {
-                out.linking.next_uuid = Some(read_bytes(r, e.size as usize)?);
-            }
+            // Linked-Segment Info (RFC 9559 §5.1.2.1..§5.1.2.8).
+            // SegmentUUID / PrevUUID / NextUUID are 16-byte binaries: one
+            // of another length is invalid data. SegmentFamily values are
+            // kept verbatim.
+            ids::SEGMENT_UID => out.linking.segment_uuid = Some(info_uid(r, e.size, budget)?),
+            ids::PREV_UID => out.linking.prev_uuid = Some(info_uid(r, e.size, budget)?),
+            ids::NEXT_UID => out.linking.next_uuid = Some(info_uid(r, e.size, budget)?),
             ids::SEGMENT_FAMILY => {
                 // Unbounded (no maxOccurs): a Segment can belong to several
                 // families. Each is a separate 16-byte UID.
-                out.linking.families.push(read_bytes(r, e.size as usize)?);
+                budget.room(&mut out.linking.families)?;
+                out.linking.families.push(budget.read(r, e.size)?);
             }
-            ids::SEGMENT_FILENAME => {
-                out.linking.segment_filename = Some(read_string(r, e.size as usize)?);
-            }
-            ids::PREV_FILENAME => {
-                out.linking.prev_filename = Some(read_string(r, e.size as usize)?);
-            }
-            ids::NEXT_FILENAME => {
-                out.linking.next_filename = Some(read_string(r, e.size as usize)?);
-            }
+            ids::SEGMENT_FILENAME => out.linking.segment_filename = Some(info_text(r, e.size, budget)?),
+            ids::PREV_FILENAME => out.linking.prev_filename = Some(info_text(r, e.size, budget)?),
+            ids::NEXT_FILENAME => out.linking.next_filename = Some(info_text(r, e.size, budget)?),
             ids::CHAPTER_TRANSLATE => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
-                let translate = parse_chapter_translate(r, body_end)?;
+                budget.room(&mut out.linking.chapter_translates)?;
+                let translate = parse_chapter_translate(r, e_end, budget)?;
                 out.linking.chapter_translates.push(translate);
             }
-            _ => skip(r, e.size)?,
+            _ => {
+                r.seek(SeekFrom::Start(e_end))?;
+            }
         }
+    }
+    Ok(())
+}
+
+/// One `Info` text field of `size` octets at the reader: at most
+/// [`MAX_INFO_TEXT_BYTES`], charged to `budget` before it is read.
+fn info_text(r: &mut dyn ReadSeek, size: u64, budget: &mut Budget) -> Result<String> {
+    if size > MAX_INFO_TEXT_BYTES as u64 {
+        return Err(Error::invalid("MKV: Info text field exceeds 64 KiB"));
+    }
+    into_string(budget.read(r, size)?)
+}
+
+/// One of the three Segment UIDs (RFC 9559 §5.1.2.1, §5.1.2.3, §5.1.2.5),
+/// `size` octets at the reader: exactly 16, charged to `budget` before it
+/// is read.
+fn info_uid(r: &mut dyn ReadSeek, size: u64, budget: &mut Budget) -> Result<Vec<u8>> {
+    if size != 16 {
+        return Err(Error::invalid("MKV: Segment UID is not 16 octets"));
+    }
+    budget.read(r, size)
+}
+
+/// Keep a non-empty `Info` value as the flat metadata entry `key`. The
+/// value was charged as it was read; its key and two of the shared list's
+/// slots, the most a list that doubles as it grows holds per entry, are
+/// charged here.
+fn keep_info_entry(metadata: &mut Vec<(String, String)>, key: &str, value: String, budget: &mut Budget) -> Result<()> {
+    if !value.is_empty() {
+        budget.charge(2 * std::mem::size_of::<(String, String)>() + key.len())?;
+        metadata.push((key.into(), value));
     }
     Ok(())
 }
@@ -2805,18 +2872,23 @@ fn parse_info(
 /// (uinteger, `minOccurs: 1`) are mandatory; `ChapterTranslateEditionUID`
 /// (uinteger, unbounded) is optional and lists the chapter editions the
 /// mapping applies to — an empty list means "all editions using the given
-/// codec" per §5.1.2.8.3.
-fn parse_chapter_translate(r: &mut dyn ReadSeek, end: u64) -> Result<ChapterTranslate> {
+/// codec" per §5.1.2.8.3. Every child must fit the master, and what is
+/// kept is charged to the `Info` budget.
+fn parse_chapter_translate(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<ChapterTranslate> {
     let mut out = ChapterTranslate::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
-            ids::CHAPTER_TRANSLATE_ID => out.id = read_bytes(r, e.size as usize)?,
+            ids::CHAPTER_TRANSLATE_ID => out.id = budget.read(r, e.size)?,
             ids::CHAPTER_TRANSLATE_CODEC => out.codec = read_uint(r, e.size as usize)?,
             ids::CHAPTER_TRANSLATE_EDITION_UID => {
+                budget.room(&mut out.edition_uids)?;
                 out.edition_uids.push(read_uint(r, e.size as usize)?);
             }
-            _ => skip(r, e.size)?,
+            _ => {
+                r.seek(SeekFrom::Start(e_end))?;
+            }
         }
     }
     Ok(out)
@@ -2834,6 +2906,7 @@ fn parse_track_translate(r: &mut dyn ReadSeek, end: u64) -> Result<TrackTranslat
     let mut out = TrackTranslate::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        child_end(r, e.size, end)?;
         match e.id {
             ids::TRACK_TRANSLATE_TRACK_ID => out.track_id = read_bytes(r, e.size as usize)?,
             ids::TRACK_TRANSLATE_CODEC => out.codec = read_uint(r, e.size as usize)?,
@@ -2962,12 +3035,14 @@ struct RawSimpleTag {
 /// `ChapterAtom` walker — real files nest one or two levels at most.
 const MAX_SIMPLE_TAG_DEPTH: u32 = 16;
 
+/// Parse a `Tags` master ending at `end`. Every element in its tree must
+/// fit its parent.
 fn parse_tags(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<RawTag>) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let tag_end = child_end(r, e.size, end)?;
         match e.id {
             ids::TAG => {
-                let tag_end = r.stream_position()?.saturating_add(e.size);
                 let mut t = RawTag {
                     track_uids: Vec::new(),
                     edition_uids: Vec::new(),
@@ -2992,13 +3067,12 @@ fn parse_tags(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<RawTag>) -> Result<(
 fn parse_tag(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::TARGETS => {
-                let tg_end = r.stream_position()?.saturating_add(e.size);
-                parse_targets(r, tg_end, t)?;
+                parse_targets(r, e_end, t)?;
             }
             ids::SIMPLE_TAG => {
-                let st_end = r.stream_position()?.saturating_add(e.size);
                 let mut s = RawSimpleTag {
                     name: String::new(),
                     value: SimpleTagValue::None,
@@ -3007,7 +3081,7 @@ fn parse_tag(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
                     default: true,
                     children: Vec::new(),
                 };
-                parse_simple_tag(r, st_end, &mut s, MAX_SIMPLE_TAG_DEPTH)?;
+                parse_simple_tag(r, e_end, &mut s, MAX_SIMPLE_TAG_DEPTH)?;
                 // Drop SimpleTags with no name — they're malformed per
                 // RFC 9559 §5.1.8.1.2.1 (TagName has minOccurs 1).
                 if !s.name.is_empty() {
@@ -3023,6 +3097,7 @@ fn parse_tag(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
 fn parse_targets(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        child_end(r, e.size, end)?;
         match e.id {
             ids::TAG_TRACK_UID => {
                 let v = read_uint(r, e.size as usize)?;
@@ -3072,6 +3147,7 @@ fn parse_simple_tag(
 ) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::TAG_NAME => s.name = read_string(r, e.size as usize)?,
             ids::SIMPLE_TAG => {
@@ -3081,7 +3157,6 @@ fn parse_simple_tag(
                 // §5.1.8.1.2.1 minOccurs rule) is dropped so a hostile
                 // file can't exhaust the stack or surface a malformed
                 // descriptor.
-                let child_end = r.stream_position()?.saturating_add(e.size);
                 if depth == 0 {
                     skip(r, e.size)?;
                     continue;
@@ -3094,7 +3169,7 @@ fn parse_simple_tag(
                     default: true,
                     children: Vec::new(),
                 };
-                parse_simple_tag(r, child_end, &mut child, depth - 1)?;
+                parse_simple_tag(r, e_end, &mut child, depth - 1)?;
                 if !child.name.is_empty() {
                     s.children.push(child);
                 }
@@ -7647,23 +7722,41 @@ pub struct CueReference {
     pub ref_codec_state: Option<u64>,
 }
 
+/// Parse the `Cues` master ending at `end` into the flat seek index `out`
+/// and the CuePoints `typed`, charging every record and list to `budget`
+/// before it is stored — see [`MAX_CUE_BYTES`]. The CuePoint that does not
+/// fit is dropped with every one after it, the reader is left at `end`,
+/// and the offset of that first dropped CuePoint is returned.
 fn parse_cues(
     r: &mut dyn ReadSeek,
     end: u64,
     out: &mut Vec<CueEntry>,
     typed: &mut Vec<CuePoint>,
-) -> Result<()> {
-    while r.stream_position()? < end {
+    budget: &mut Budget,
+) -> Result<Option<u64>> {
+    loop {
+        let at = r.stream_position()?;
+        if at >= end {
+            return Ok(None);
+        }
         let e = read_element_header(r)?;
         match e.id {
             ids::CUE_POINT => {
                 let body_end = r.stream_position()?.saturating_add(e.size);
-                parse_cue_point(r, body_end, out, typed)?;
+                let kept = (out.len(), typed.len());
+                if let Err(err) = parse_cue_point(r, body_end, out, typed, budget) {
+                    if !budget.exhausted() {
+                        return Err(err);
+                    }
+                    out.truncate(kept.0);
+                    typed.truncate(kept.1);
+                    r.seek(SeekFrom::Start(end))?;
+                    return Ok(Some(at));
+                }
             }
             _ => skip(r, e.size)?,
         }
     }
-    Ok(())
 }
 
 fn parse_cue_point(
@@ -7671,6 +7764,7 @@ fn parse_cue_point(
     end: u64,
     out: &mut Vec<CueEntry>,
     typed: &mut Vec<CuePoint>,
+    budget: &mut Budget,
 ) -> Result<()> {
     let mut time: u64 = 0;
     let mut point = CuePoint::default();
@@ -7683,11 +7777,12 @@ fn parse_cue_point(
             }
             ids::CUE_TRACK_POSITIONS => {
                 let body_end = r.stream_position()?.saturating_add(e.size);
-                parse_cue_track_positions(r, body_end, time, out, &mut point.track_positions)?;
+                parse_cue_track_positions(r, body_end, time, out, &mut point.track_positions, budget)?;
             }
             _ => skip(r, e.size)?,
         }
     }
+    budget.room(typed)?;
     typed.push(point);
     Ok(())
 }
@@ -7698,6 +7793,7 @@ fn parse_cue_track_positions(
     time: u64,
     out: &mut Vec<CueEntry>,
     typed: &mut Vec<CueTrackPositions>,
+    budget: &mut Budget,
 ) -> Result<()> {
     let mut track: u64 = 0;
     let mut cluster_offset: Option<u64> = None;
@@ -7731,12 +7827,14 @@ fn parse_cue_track_positions(
             ids::CUE_REFERENCE => {
                 let body_end = r.stream_position()?.saturating_add(e.size);
                 let reference = parse_cue_reference(r, body_end)?;
+                budget.room(&mut tp.references)?;
                 tp.references.push(reference);
             }
             _ => skip(r, e.size)?,
         }
     }
     if let Some(off) = cluster_offset {
+        budget.room(out)?;
         out.push(CueEntry {
             track,
             time,
@@ -7745,6 +7843,7 @@ fn parse_cue_track_positions(
             block_number,
         });
     }
+    budget.room(typed)?;
     typed.push(tp);
     Ok(())
 }
@@ -7774,7 +7873,9 @@ fn parse_cue_reference(r: &mut dyn ReadSeek, end: u64) -> Result<CueReference> {
 /// the ID the `SeekID` promised and a bounded body inside the Segment,
 /// or the entry is ignored. The parse lands in *temporary* collections
 /// that are merged only when the whole parse succeeds — a hostile or
-/// stale SeekPosition can never leave partially-parsed state behind.
+/// stale SeekPosition can never leave partially-parsed state behind. A
+/// Cues index cut at its budget is the one exception: the CuePoints that
+/// fit are kept and the cut is a [`DamageEvent`], as in the walk.
 /// The caller restores the reader position afterwards.
 #[allow(clippy::too_many_arguments)]
 fn follow_seek_target(
@@ -7796,6 +7897,7 @@ fn follow_seek_target(
     editions: &mut Vec<Edition>,
     attachment_uid_to_index: &mut std::collections::HashMap<u64, u32>,
     attachments: &mut Vec<Attachment>,
+    budgets: MetadataBudgets<'_>,
 ) -> Result<()> {
     r.seek(SeekFrom::Start(abs))?;
     let e = read_element_header(r)?;
@@ -7822,7 +7924,7 @@ fn follow_seek_target(
         ids::INFO => {
             let mut tmp_info = SegmentInfo::default();
             let mut tmp_meta = Vec::new();
-            parse_info(r, end, &mut tmp_info, &mut tmp_meta)?;
+            parse_info(r, end, &mut tmp_info, &mut tmp_meta, budgets.info)?;
             *info = tmp_info;
             *have_info = true;
             metadata.extend(tmp_meta);
@@ -7840,11 +7942,20 @@ fn follow_seek_target(
             }
         }
         ids::CUES => {
-            let mut tmp_cues = Vec::new();
-            let mut tmp_points = Vec::new();
-            parse_cues(r, end, &mut tmp_cues, &mut tmp_points)?;
-            cues.extend(tmp_cues);
-            cue_points.extend(tmp_points);
+            // Parsed in place: a failed parse is undone by truncating back.
+            let kept = (cues.len(), cue_points.len());
+            match parse_cues(r, end, cues, cue_points, budgets.cues) {
+                Ok(None) => {}
+                Ok(Some(stop)) => {
+                    budgets.damage_events.push(cues_cut_at(stop, end));
+                    *budgets.cues_cut = true;
+                }
+                Err(err) => {
+                    cues.truncate(kept.0);
+                    cue_points.truncate(kept.1);
+                    return Err(err);
+                }
+            }
         }
         ids::TAGS => {
             let mut tmp = Vec::new();
@@ -7889,17 +8000,19 @@ fn follow_seek_target(
     Ok(())
 }
 
+/// Parse a `Tracks` master ending at `end`. Every element in its tree must
+/// fit its parent.
 fn parse_tracks(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TrackEntry>) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::TRACK_ENTRY => {
                 if out.len() >= MAX_TRACKS {
                     return Err(Error::invalid("MKV: more than 256 tracks"));
                 }
-                let body_end = r.stream_position()?.saturating_add(e.size);
                 let mut t = TrackEntry::default();
-                parse_track_entry(r, body_end, &mut t)?;
+                parse_track_entry(r, e_end, &mut t)?;
                 let private: usize = out.iter().map(|t| t.codec_private.len()).sum();
                 if private.saturating_add(t.codec_private.len()) > MAX_CODEC_PRIVATE_TOTAL {
                     return Err(Error::invalid("MKV: CodecPrivate data exceeds its budget"));
@@ -7915,6 +8028,7 @@ fn parse_tracks(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TrackEntry>) -> Re
 fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::TRACK_NUMBER => t.number = read_uint(r, e.size as usize)?,
             ids::TRACK_UID => t.uid = read_uint(r, e.size as usize)?,
@@ -7951,27 +8065,18 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
                     t.attachment_links.push(v);
                 }
             }
-            ids::AUDIO => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
-                parse_audio(r, body_end, t)?;
-            }
-            ids::VIDEO => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
-                parse_video(r, body_end, t)?;
-            }
+            ids::AUDIO => parse_audio(r, e_end, t)?,
+            ids::VIDEO => parse_video(r, e_end, t)?,
             ids::TRACK_OPERATION => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
                 let mut op = RawTrackOperation::default();
-                parse_track_operation(r, body_end, &mut op)?;
+                parse_track_operation(r, e_end, &mut op)?;
                 t.track_operation = Some(op);
             }
             ids::CONTENT_ENCODINGS => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
-                t.content_encodings = Some(parse_content_encodings(r, body_end)?);
+                t.content_encodings = Some(parse_content_encodings(r, e_end)?);
             }
             ids::BLOCK_ADDITION_MAPPING => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
-                let mapping = parse_block_addition_mapping(r, body_end)?;
+                let mapping = parse_block_addition_mapping(r, e_end)?;
                 t.block_addition_mappings.push(mapping);
             }
             // TrackTranslate (RFC 9559 §5.1.4.1.27) — the chapter-codec
@@ -7982,8 +8087,7 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
             // malformed file sees what the writer emitted, mirroring the
             // tolerant `ChapterTranslate` parse.
             ids::TRACK_TRANSLATE => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
-                let tt = parse_track_translate(r, body_end)?;
+                let tt = parse_track_translate(r, e_end)?;
                 t.track_translates.push(tt);
             }
             // Reclaimed Appendix-A `TrackEntry`-level legacy elements (RFC 9559
@@ -8120,10 +8224,10 @@ fn parse_content_encodings(r: &mut dyn ReadSeek, end: u64) -> Result<ContentEnco
     let mut encodings: Vec<ContentEncoding> = Vec::new();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::CONTENT_ENCODING => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
-                encodings.push(parse_content_encoding(r, body_end)?);
+                encodings.push(parse_content_encoding(r, e_end)?);
             }
             _ => skip(r, e.size)?,
         }
@@ -8151,17 +8255,16 @@ fn parse_content_encoding(r: &mut dyn ReadSeek, end: u64) -> Result<ContentEncod
     let mut encr: Option<(u64, Vec<u8>, Option<u64>, ContentSigning)> = None;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::CONTENT_ENCODING_ORDER => order = read_uint(r, e.size as usize)?,
             ids::CONTENT_ENCODING_SCOPE => scope = read_uint(r, e.size as usize)?,
             ids::CONTENT_ENCODING_TYPE => enc_type = read_uint(r, e.size as usize)?,
             ids::CONTENT_COMPRESSION => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
-                comp = Some(parse_content_compression(r, body_end)?);
+                comp = Some(parse_content_compression(r, e_end)?);
             }
             ids::CONTENT_ENCRYPTION => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
-                encr = Some(parse_content_encryption(r, body_end)?);
+                encr = Some(parse_content_encryption(r, e_end)?);
             }
             _ => skip(r, e.size)?,
         }
@@ -8202,6 +8305,7 @@ fn parse_content_compression(r: &mut dyn ReadSeek, end: u64) -> Result<(u64, Vec
     let mut settings: Vec<u8> = Vec::new();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        child_end(r, e.size, end)?;
         match e.id {
             ids::CONTENT_COMP_ALGO => algo = read_uint(r, e.size as usize)?,
             ids::CONTENT_COMP_SETTINGS => settings = read_bytes(r, e.size as usize)?,
@@ -8226,12 +8330,12 @@ fn parse_content_encryption(
     let mut signing = ContentSigning::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::CONTENT_ENC_ALGO => algo = read_uint(r, e.size as usize)?,
             ids::CONTENT_ENC_KEY_ID => key_id = read_bytes(r, e.size as usize)?,
             ids::CONTENT_ENC_AES_SETTINGS => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
-                cipher_mode = parse_aes_settings(r, body_end)?;
+                cipher_mode = parse_aes_settings(r, e_end)?;
             }
             // Reclaimed content-signing quartet (Appendix A.33..A.36). The
             // appendix defines no defaults, so each element surfaces verbatim
@@ -8252,6 +8356,7 @@ fn parse_aes_settings(r: &mut dyn ReadSeek, end: u64) -> Result<Option<u64>> {
     let mut mode: Option<u64> = None;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        child_end(r, e.size, end)?;
         match e.id {
             ids::AES_SETTINGS_CIPHER_MODE => mode = Some(read_uint(r, e.size as usize)?),
             _ => skip(r, e.size)?,
@@ -8266,14 +8371,13 @@ fn parse_aes_settings(r: &mut dyn ReadSeek, end: u64) -> Result<Option<u64>> {
 fn parse_track_operation(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::TRACK_COMBINE_PLANES => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
-                parse_combine_planes(r, body_end, op)?;
+                parse_combine_planes(r, e_end, op)?;
             }
             ids::TRACK_JOIN_BLOCKS => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
-                parse_join_blocks(r, body_end, op)?;
+                parse_join_blocks(r, e_end, op)?;
             }
             _ => skip(r, e.size)?,
         }
@@ -8286,15 +8390,16 @@ fn parse_track_operation(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperat
 fn parse_combine_planes(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::TRACK_PLANE => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
                 let mut uid: Option<u64> = None;
                 // Default per Table 20 / §5.1.4.1.30.4: absent type means 0
                 // (left eye), but we only keep it when a UID is present.
                 let mut plane_type: u64 = ids::TRACK_PLANE_TYPE_LEFT_EYE;
-                while r.stream_position()? < body_end {
+                while r.stream_position()? < e_end {
                     let ce = read_element_header(r)?;
+                    child_end(r, ce.size, e_end)?;
                     match ce.id {
                         ids::TRACK_PLANE_UID => uid = Some(read_uint(r, ce.size as usize)?),
                         ids::TRACK_PLANE_TYPE => plane_type = read_uint(r, ce.size as usize)?,
@@ -8320,6 +8425,7 @@ fn parse_combine_planes(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperati
 fn parse_join_blocks(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        child_end(r, e.size, end)?;
         match e.id {
             ids::TRACK_JOIN_UID => {
                 let u = read_uint(r, e.size as usize)?;
@@ -8351,6 +8457,7 @@ fn parse_block_addition_mapping(r: &mut dyn ReadSeek, end: u64) -> Result<BlockA
     let mut extra_data: Option<Vec<u8>> = None;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        child_end(r, e.size, end)?;
         match e.id {
             ids::BLOCK_ADD_ID_VALUE => value = Some(read_uint(r, e.size as usize)?),
             ids::BLOCK_ADD_ID_NAME => name = Some(read_string(r, e.size as usize)?),
@@ -8367,15 +8474,35 @@ fn parse_block_addition_mapping(r: &mut dyn ReadSeek, end: u64) -> Result<BlockA
     })
 }
 
-/// What one Block may still retain while it is read — see
-/// [`MAX_BLOCK_BYTES`]. Charged before each read or allocation, so a Block
+/// What a bounded structure may still retain: one Block while it is read
+/// (see [`MAX_BLOCK_BYTES`]), the Cluster records, the `Info` masters or
+/// the Cues index. Charged before each read or allocation, so whatever is
 /// over its budget fails before it holds the memory.
-struct BlockBudget(usize);
+#[derive(Clone, Copy)]
+struct Budget {
+    left: usize,
+    /// The invalid-data message a charge past the budget fails with.
+    exceeded: &'static str,
+    /// Whether a charge has failed since [`Self::exhausted`] last looked.
+    spent: bool,
+}
 
-impl BlockBudget {
+impl Budget {
+    fn new(max: usize, exceeded: &'static str) -> Self {
+        Self { left: max, exceeded, spent: false }
+    }
+
     fn charge(&mut self, bytes: usize) -> Result<()> {
-        self.0 = self.0.checked_sub(bytes).ok_or_else(block_over_budget)?;
-        Ok(())
+        match self.left.checked_sub(bytes) {
+            Some(left) => {
+                self.left = left;
+                Ok(())
+            }
+            None => {
+                self.spent = true;
+                Err(Error::invalid(self.exceeded))
+            }
+        }
     }
 
     /// Room in `records` for one more, charging its growth first.
@@ -8388,12 +8515,28 @@ impl BlockBudget {
         Ok(())
     }
 
-    /// A stored child of `size` octets, charged before any of it is held.
+    /// Room in `set` for one more, charging first for the table it grows
+    /// into: twice what it holds, in at most the power of two of buckets at
+    /// or above 8/7 of that (8 at least), each bucket an entry and a
+    /// control octet, plus 32 octets for the control group. The tables it
+    /// outgrows stay charged, which also covers both tables while it
+    /// rehashes.
+    fn set_room<T: std::hash::Hash + Eq>(&mut self, set: &mut std::collections::HashSet<T>) -> Result<()> {
+        if set.len() == set.capacity() {
+            let holds = (set.capacity() * 2).max(4);
+            let buckets = (holds * 8 / 7).next_power_of_two().max(8);
+            self.charge(buckets.saturating_mul(std::mem::size_of::<T>() + 1).saturating_add(32))?;
+            set.reserve(holds - set.len());
+        }
+        Ok(())
+    }
+
+    /// A stored element of `size` octets, charged before any of it is held.
     /// Its buffer grows only as bytes arrive, so a size the input cannot
     /// back costs no more than the input does, and ends exactly `size`
     /// octets large: the capacity charged.
     fn read(&mut self, r: &mut dyn ReadSeek, size: u64) -> Result<Vec<u8>> {
-        let size = usize::try_from(size).map_err(|_| block_over_budget())?;
+        let size = usize::try_from(size).map_err(|_| Error::invalid(self.exceeded))?;
         self.charge(size)?;
         let mut stored = Vec::new();
         while stored.len() < size {
@@ -8405,16 +8548,24 @@ impl BlockBudget {
         }
         Ok(stored)
     }
+
+    /// Whether a charge has failed since the last call: what was being
+    /// kept did not fit, rather than being malformed.
+    fn exhausted(&mut self) -> bool {
+        std::mem::take(&mut self.spent)
+    }
+}
+
+const BLOCK_OVER_BUDGET: &str = "MKV: Block exceeds its 32 MiB budget";
+
+/// What one Block may retain while it is read.
+fn block_budget() -> Budget {
+    Budget::new(MAX_BLOCK_BYTES, BLOCK_OVER_BUDGET)
 }
 
 fn block_over_budget() -> Error {
-    Error::invalid("MKV: Block exceeds its 32 MiB budget")
+    Error::invalid(BLOCK_OVER_BUDGET)
 }
-
-/// What the duplicate-`BlockAddID` check holds per kept id, charged
-/// generously: a hash set's 8-octet slot and control octet, in a table up
-/// to about twice as large as it is full.
-const KEPT_ID_BYTES: usize = 24;
 
 /// The end of the element whose header `r` has just read, which must lie
 /// within its parent's.
@@ -8446,7 +8597,7 @@ fn child_end(r: &mut dyn ReadSeek, size: u64, parent_end: u64) -> Result<u64> {
 /// * Unknown children are skipped (forward-compat).
 /// * Every child must fit its parent; payloads and records are charged to
 ///   the Block's budget before they are read or stored.
-fn parse_block_additions(r: &mut dyn ReadSeek, end: u64, budget: &mut BlockBudget) -> Result<Vec<BlockAddition>> {
+fn parse_block_additions(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<Vec<BlockAddition>> {
     let mut out: Vec<BlockAddition> = Vec::new();
     // The ids kept so far: a later BlockMore repeating one is dropped.
     let mut kept: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -8472,7 +8623,7 @@ fn parse_block_additions(r: &mut dyn ReadSeek, end: u64, budget: &mut BlockBudge
                 if let Some(data) = data {
                     if id != 0 && !kept.contains(&id) {
                         budget.room(&mut out)?;
-                        budget.charge(KEPT_ID_BYTES)?;
+                        budget.set_room(&mut kept)?;
                         kept.insert(id);
                         out.push(BlockAddition { id, data });
                     }
@@ -8492,7 +8643,7 @@ fn parse_block_additions(r: &mut dyn ReadSeek, end: u64, budget: &mut BlockBudge
 /// count; each record is charged to the Block's budget before it is
 /// stored. Non-`TimeSlice` children of `Slices` are skipped, and every
 /// child must fit its parent.
-fn parse_slices(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TimeSlice>, budget: &mut BlockBudget) -> Result<()> {
+fn parse_slices(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TimeSlice>, budget: &mut Budget) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let e_end = child_end(r, e.size, end)?;
@@ -8546,14 +8697,21 @@ fn parse_reference_frame(r: &mut dyn ReadSeek, end: u64) -> Result<ReferenceFram
 
 /// Parse a `SilentTracks` master (RFC 9559 Appendix A.1, id `0x5854`) into
 /// its `SilentTrackNumber` (A.2, id `0x58D7`) values in on-disk order. Any
-/// other child element is skipped.
-fn parse_silent_tracks(r: &mut dyn ReadSeek, end: u64) -> Result<Vec<u64>> {
+/// other child element is skipped. Every child must fit the master, and
+/// the list's growth is charged to `budget` before it is allocated.
+fn parse_silent_tracks(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<Vec<u64>> {
     let mut out: Vec<u64> = Vec::new();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
-            ids::SILENT_TRACK_NUMBER => out.push(read_uint(r, e.size as usize)?),
-            _ => skip(r, e.size)?,
+            ids::SILENT_TRACK_NUMBER => {
+                budget.room(&mut out)?;
+                out.push(read_uint(r, e.size as usize)?);
+            }
+            _ => {
+                r.seek(SeekFrom::Start(e_end))?;
+            }
         }
     }
     Ok(out)
@@ -8573,6 +8731,7 @@ fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
     let raw = t.audio_raw.get_or_insert_with(RawTrackAudio::default);
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        child_end(r, e.size, end)?;
         match e.id {
             ids::SAMPLING_FREQUENCY => {
                 let v = read_float(r, e.size as usize)?;
@@ -8673,6 +8832,7 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
     let mut alpha_mode: u64 = ids::ALPHA_MODE_NONE;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::PIXEL_WIDTH => t.width = read_uint(r, e.size as usize)?,
             ids::PIXEL_HEIGHT => t.height = read_uint(r, e.size as usize)?,
@@ -8708,7 +8868,6 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
             ids::DISPLAY_HEIGHT => display_height = read_uint(r, e.size as usize)?,
             ids::DISPLAY_UNIT => display_unit = read_uint(r, e.size as usize)?,
             ids::COLOUR => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
                 // Spec defaults — set up front so an empty `Colour` master
                 // still surfaces the §5.1.4.1.28.17 / §5.1.4.1.28.26 /
                 // §5.1.4.1.28.27 default `2`s and the §5.1.4.1.28.23..
@@ -8724,11 +8883,10 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
                     bits_per_channel: 0,
                     ..Default::default()
                 };
-                parse_colour(r, body_end, &mut c)?;
+                parse_colour(r, e_end, &mut c)?;
                 t.colour_raw = Some(c);
             }
             ids::PROJECTION => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
                 // Spec defaults — `ProjectionType` defaults to 0 (rectangular)
                 // per §5.1.4.1.28.42; the three pose floats default to
                 // 0x0p+0 per §5.1.4.1.28.44..46. `parse_projection` overrides
@@ -8739,7 +8897,7 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
                     projection_type_raw: ids::PROJECTION_TYPE_RECTANGULAR,
                     ..Default::default()
                 };
-                parse_projection(r, body_end, &mut p)?;
+                parse_projection(r, e_end, &mut p)?;
                 t.projection_raw = Some(p);
             }
             _ => skip(r, e.size)?,
@@ -8769,6 +8927,7 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
 fn parse_colour(r: &mut dyn ReadSeek, end: u64, c: &mut RawColour) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        let e_end = child_end(r, e.size, end)?;
         match e.id {
             ids::MATRIX_COEFFICIENTS => c.matrix_coefficients = read_uint(r, e.size as usize)?,
             ids::BITS_PER_CHANNEL => c.bits_per_channel = read_uint(r, e.size as usize)?,
@@ -8794,9 +8953,8 @@ fn parse_colour(r: &mut dyn ReadSeek, end: u64, c: &mut RawColour) -> Result<()>
             ids::MAX_CLL => c.max_cll = Some(read_uint(r, e.size as usize)?),
             ids::MAX_FALL => c.max_fall = Some(read_uint(r, e.size as usize)?),
             ids::MASTERING_METADATA => {
-                let body_end = r.stream_position()?.saturating_add(e.size);
                 let mut m = MasteringMetadata::default();
-                parse_mastering_metadata(r, body_end, &mut m)?;
+                parse_mastering_metadata(r, e_end, &mut m)?;
                 c.mastering_metadata = Some(m);
             }
             _ => skip(r, e.size)?,
@@ -8815,6 +8973,7 @@ fn parse_mastering_metadata(
 ) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        child_end(r, e.size, end)?;
         match e.id {
             ids::PRIMARY_R_CHROMATICITY_X => {
                 m.primary_r_chromaticity_x = Some(read_float(r, e.size as usize)?)
@@ -8855,6 +9014,7 @@ fn parse_mastering_metadata(
 fn parse_projection(r: &mut dyn ReadSeek, end: u64, p: &mut RawProjection) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        child_end(r, e.size, end)?;
         match e.id {
             ids::PROJECTION_TYPE => p.projection_type_raw = read_uint(r, e.size as usize)?,
             ids::PROJECTION_PRIVATE => p.private = Some(read_bytes(r, e.size as usize)?),
@@ -9116,6 +9276,10 @@ pub struct MkvDemuxer {
     /// sub-element set the denormalised `cues` seek index collapses. Empty
     /// when the file has no `Cues` element.
     cue_points: Vec<CuePoint>,
+    /// The last CueTime kept when the Cues index was cut at
+    /// [`MAX_CUE_BYTES`]: a seek past it scans the Clusters. `None` for an
+    /// index kept whole.
+    cues_cover: Option<u64>,
     /// Nanoseconds per Matroska timecode tick (the Segment\Info\TimecodeScale
     /// value, defaulted to 1_000_000 when absent).
     timecode_scale_ns: u64,
@@ -9337,12 +9501,12 @@ pub struct MkvDemuxer {
     /// open finds the record already present and reuses it instead of
     /// pushing a duplicate row).
     cluster_record_by_offset: std::collections::HashMap<u64, usize>,
-    /// Bytes charged for every kept `EncryptedBlock` — see
-    /// [`MAX_ENCRYPTED_BYTES`].
-    encrypted_bytes: usize,
-    /// Element offsets of the `EncryptedBlock`s already on a record, so a
-    /// revisit does not record one twice.
-    encrypted_block_offsets: std::collections::HashSet<u64>,
+    /// What the Cluster records may still keep — see
+    /// [`MAX_CLUSTER_RECORD_BYTES`].
+    record_budget: Budget,
+    /// Element offsets of the `EncryptedBlock`s and `SilentTracks` already
+    /// on a record, so a revisit does not record one twice.
+    recorded_offsets: std::collections::HashSet<u64>,
     /// `true` when constructed via [`open_resilient`] /
     /// [`open_resilient_typed`] — metadata-open errors are recoverable.
     /// Cluster-stream errors recover on either path.
@@ -9470,6 +9634,11 @@ impl Demuxer for MkvDemuxer {
             // Cues-less file (RFC 9559 §22.1 only RECOMMENDS a Cues
             // element — live recordings and files written to a pipe have
             // none): scan the Clusters up to the target.
+            return self.seek_by_cluster_scan(stream_index, pts);
+        }
+        // A Cues index cut at its budget covers seeks up to its last kept
+        // CueTime; past that the Clusters are scanned as well.
+        if self.cues_cover.is_some_and(|last| self.stream_pts_to_ticks(stream_index, pts) > last) {
             return self.seek_by_cluster_scan(stream_index, pts);
         }
         let track_number = self.track_number_by_index[stream_index as usize];
@@ -10221,18 +10390,40 @@ impl MkvDemuxer {
         }
     }
 
-    /// Attach `SilentTrackNumber` values (RFC 9559 Appendix A.2) parsed
-    /// from a Cluster's `SilentTracks` (A.1) master to the record keyed by
-    /// `body_start`. No-op when the record is missing — see
-    /// [`Self::set_cluster_position`] for the why. Appends rather than
+    /// Record the `SilentTrackNumber`s (RFC 9559 Appendix A.2) of the
+    /// `SilentTracks` master (A.1) stored at `offset` and ending at `end`
+    /// on the Cluster record keyed by `body_start`. Appends rather than
     /// replaces, so a (malformed) second `SilentTracks` in one Cluster
-    /// accumulates instead of clobbering.
-    fn set_cluster_silent_tracks(&mut self, body_start: u64, mut nums: Vec<u64>) {
-        if let Some(&idx) = self.cluster_record_by_offset.get(&body_start) {
-            self.cluster_records[idx]
-                .silent_track_numbers
-                .append(&mut nums);
+    /// accumulates instead of clobbering. The master is stepped over when
+    /// the record is missing — see [`Self::set_cluster_position`] for the
+    /// why — or already holds it. The numbers are parsed within what the
+    /// records may still keep, then charged to
+    /// [`MAX_CLUSTER_RECORD_BYTES`] as kept; a master that does not fit is
+    /// invalid data.
+    fn record_cluster_silent_tracks(&mut self, body_start: u64, offset: u64, end: u64) -> Result<()> {
+        let Some(&idx) = self.cluster_record_by_offset.get(&body_start) else {
+            self.input.seek(SeekFrom::Start(end))?;
+            return Ok(());
+        };
+        if self.recorded_offsets.contains(&offset) {
+            self.input.seek(SeekFrom::Start(end))?;
+            return Ok(());
         }
+        let mut parsing = self.record_budget;
+        let mut nums = parse_silent_tracks(&mut *self.input, end, &mut parsing)?;
+        if nums.is_empty() {
+            return Ok(());
+        }
+        let kept = &mut self.cluster_records[idx].silent_track_numbers;
+        let need = kept.len() + nums.len();
+        if need > kept.capacity() {
+            self.record_budget.charge((need - kept.capacity()) * std::mem::size_of::<u64>())?;
+            kept.reserve_exact(need - kept.len());
+        }
+        self.record_budget.set_room(&mut self.recorded_offsets)?;
+        self.recorded_offsets.insert(offset);
+        kept.append(&mut nums);
+        Ok(())
     }
 
     /// Record the `EncryptedBlock` (RFC 9559 Appendix A.15) stored at
@@ -10240,22 +10431,20 @@ impl MkvDemuxer {
     /// record keyed by `body_start`. The bytes are recorded verbatim; the
     /// container never decrypts them. It is stepped over when the record is
     /// missing — see [`Self::set_cluster_position`] for the why — or already
-    /// holds it. Kept blocks share [`MAX_ENCRYPTED_BYTES`], charged before
-    /// the bytes are read; one that does not fit is invalid data.
+    /// holds it. Its body, the growth of the record's list and of the set
+    /// of recorded elements are charged to [`MAX_CLUSTER_RECORD_BYTES`]
+    /// before they are allocated; a block that does not fit is invalid data.
     fn record_cluster_encrypted_block(&mut self, body_start: u64, offset: u64, size: u64) -> Result<()> {
         let Some(&idx) = self.cluster_record_by_offset.get(&body_start) else {
             return skip(&mut *self.input, size);
         };
-        if self.encrypted_block_offsets.contains(&offset) {
+        if self.recorded_offsets.contains(&offset) {
             return skip(&mut *self.input, size);
         }
-        let cost = usize::try_from(size).map_or(usize::MAX, |s| s.saturating_add(ENCRYPTED_ENTRY_BYTES));
-        if cost > MAX_ENCRYPTED_BYTES - self.encrypted_bytes {
-            return Err(Error::invalid("MKV: EncryptedBlocks exceed their 32 MiB budget"));
-        }
-        let bytes = BlockBudget(cost).read(&mut *self.input, size)?;
-        self.encrypted_bytes += cost;
-        self.encrypted_block_offsets.insert(offset);
+        self.record_budget.room(&mut self.cluster_records[idx].encrypted_blocks)?;
+        self.record_budget.set_room(&mut self.recorded_offsets)?;
+        let bytes = self.record_budget.read(&mut *self.input, size)?;
+        self.recorded_offsets.insert(offset);
         self.cluster_records[idx].encrypted_blocks.push(bytes);
         Ok(())
     }
@@ -11835,19 +12024,16 @@ impl MkvDemuxer {
     ///
     /// UID scopes resolve against the same maps the open-time walk built,
     /// so `tag:track:N:*` / `tag:chapter:N:*` keys keep their meaning.
-    /// Best-effort by design: an unknown-size, malformed or truncated `Tags`
-    /// element is skipped without resetting anything (the reader is
-    /// repositioned past it when the size is known; a parse error inside an
-    /// unknown-size element surfaces to the caller like any other
-    /// stream-walk error, where resilient mode resynchronises). The
-    /// source's own failure reading it is returned, not skipped.
+    /// Best-effort by design: a malformed or truncated `Tags` element is
+    /// skipped without resetting anything, the reader repositioned past
+    /// it. One of unknown size (RFC 9559 permits that on a Segment and a
+    /// Cluster alone) has no end to skip to: it is invalid data, and the
+    /// walk resynchronises on the next Top-Level element as for any
+    /// damaged Cluster stream. The source's own failure reading it is
+    /// returned, not skipped.
     fn apply_mid_stream_tags(&mut self, size: u64) -> Result<()> {
         if size == VINT_UNKNOWN_SIZE {
-            // A `Tags` master may not use the unknown-size VINT (RFC 8794
-            // §6.2 — only Segment / Cluster declare unknownsizeallowed).
-            // Preserve the legacy skip behaviour.
-            skip(&mut *self.input, size)?;
-            return Ok(());
+            return Err(unknown_size_master());
         }
         if master_budget(ids::TAGS).is_some_and(|max| size > max) {
             // Larger than its budget: skipped whole, unread, as a malformed
@@ -12018,10 +12204,7 @@ impl MkvDemuxer {
                         // surfaced for inspection / re-mux on the Cluster
                         // record.
                         let st_end = self.input.stream_position()?.saturating_add(e.size);
-                        let nums = parse_silent_tracks(&mut *self.input, st_end)?;
-                        if !nums.is_empty() {
-                            self.set_cluster_silent_tracks(body_start, nums);
-                        }
+                        self.record_cluster_silent_tracks(body_start, pos, st_end)?;
                     }
                     ids::ENCRYPTED_BLOCK => {
                         // RFC 9559 Appendix A.15 — a reclaimed Cluster-level
@@ -12035,7 +12218,7 @@ impl MkvDemuxer {
                         self.record_cluster_encrypted_block(body_start, pos, e.size)?;
                     }
                     ids::SIMPLE_BLOCK => {
-                        let bytes = BlockBudget(MAX_BLOCK_BYTES).read(&mut *self.input, e.size)?;
+                        let bytes = block_budget().read(&mut *self.input, e.size)?;
                         self.queue_block_packets(bytes, cluster_timecode, pos)?;
                     }
                     ids::BLOCK_GROUP => {
@@ -12065,7 +12248,7 @@ impl MkvDemuxer {
     /// their records share the Block's budget, charged before they are
     /// read or stored.
     fn parse_block_group(&mut self, end: u64, cluster_timecode: i64, offset: u64) -> Result<()> {
-        let mut budget = BlockBudget(MAX_BLOCK_BYTES);
+        let mut budget = block_budget();
         let mut block_bytes: Option<Vec<u8>> = None;
         let mut duration: Option<i64> = None;
         let mut is_keyframe = true;
