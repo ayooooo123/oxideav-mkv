@@ -85,28 +85,36 @@ exact size. A Block waiting for room holds its stored bytes and side data
 within the same budget, and duplicate `BlockAddID`s are dropped in linear
 time. The 512 KiB startup byte threshold also counts this state; the
 bounded current/deferred Block and temporary expansion remain additional
-working memory. The `EncryptedBlock`s and `SilentTrackNumber`s kept on
-Cluster records share one 32 MiB budget for the life of the demuxer. It
-counts their lists and the set of elements already recorded, each charged
+working memory. The Cluster records share one 32 MiB budget for the life
+of the demuxer: the records themselves and the index finding them by
+offset, and the `EncryptedBlock`s and `SilentTrackNumber`s they keep. It
+counts every list and the set of elements already recorded, each charged
 before it is allocated, and an element revisited by a seek is not recorded
-again. An element past the budget is InvalidData, and the walk resumes at
-the next Cluster. Source I/O
+again. A block or `SilentTracks` past the budget is InvalidData, and the
+walk resumes at the next Cluster. A Cluster opened once the budget cannot
+hold its record gets none; playback and seeks go on, since neither reads
+the records. At most 4096 `DamageEvent`s are kept, the first in order, and
+`dropped_damage_events()` counts each one past that exactly. Source I/O
 failures propagate, including source-generated UnexpectedEof and failures
 met reading trailing Tags, Cluster `CRC-32`s or seek landings; only parser
 damage and physical truncation are recovered.
 
 The metadata read at open is bounded too. Every element in a `Tracks` or
-`Tags` tree must fit its parent, and an unknown-size `Tracks` or `Tags` is
-InvalidData: a strict open fails, and a resilient open skips it as a
-damaged master. An unknown-size `Tags` between Clusters is damage in the
-Cluster stream, so the walk resumes at the next Cluster. In `Info`,
-`SegmentUUID`, `PrevUUID` and `NextUUID` must be 16 octets, each text field
-holds at most 64 KiB, and the `Info` masters keep at most 1 MiB together.
-Sizes are checked before a read, and a `Void` is stepped over unread. The
-Cues index keeps at most 32 MiB of CuePoints, positions, references and
-seek entries. Past that, the CuePoints that fit are kept, a
-`DamagedMaster(Cues)` event is recorded on either open, and a seek past the
-last kept `CueTime` scans the Clusters as a Cues-less seek does.
+`Tags` tree must fit its parent. RFC 9559 allows the unknown size on a
+Segment and a Cluster alone, so any other Top-Level element of unknown size
+is InvalidData: a strict open fails, and a resilient open skips it as a
+damaged master. Between Clusters it is damage in the Cluster stream, so the
+walk resumes at the next Cluster; a SeekHead target of unknown size is
+ignored unread. In `Info`, `SegmentUUID`, `PrevUUID` and `NextUUID` must be
+16 octets, each text field holds at most 64 KiB, and the `Info` masters
+keep at most 1 MiB together. Sizes are checked before a read, and a `Void`
+is stepped over unread. The Cues index keeps at most 32 MiB of CuePoints,
+positions, references and seek entries. Past that, the CuePoints that fit
+are kept and a `DamagedMaster(Cues)` event is recorded on either open. A
+seek past the last `CueTime` kept for its track, or on a track with no
+kept cue, scans the Clusters as a Cues-less seek does. Known limit: that
+scan starts at the first Cluster, so on a large remote file it costs reads
+up to the target.
 
 Known network cost: an `Info`, `Cues`, `Chapters` or `Attachments` master
 whose first child is a `CRC-32` is read in full to check it, in 16 KiB
@@ -420,7 +428,8 @@ SeekPreRoll consumption remain shared AudioTrim integration work.
   `PrevSize` without re-scanning the SeekHead, or detect a live stream
   by seeing `Some(0)` `Position` values. The slice grows incrementally
   as the demuxer walks the Segment — callers wanting the full
-  per-Cluster set should drain the file via `next_packet` first.
+  per-Cluster set should drain the file via `next_packet` first. It stops
+  growing once the 32 MiB Cluster-record budget is spent.
 - **Typed `SeekHead` accessor** (RFC 9559 §5.1.1, including
   §5.1.1.1..§5.1.1.1.2): `MkvDemuxer::seek_entries() -> &[SeekEntry]`
   surfaces the MetaSeek index — the `SeekHead > Seek` rows that point each
@@ -604,12 +613,14 @@ SeekPreRoll consumption remain shared AudioTrim integration work.
   `SegmentTruncated` / `UnrecoverableTail`, each carrying the damage
   offset, resume offset, and bytes skipped) on
   `MkvDemuxer::damage_events()` — empty exactly when the file needed no
-  recovery, so strict-minded callers can reject after the fact. The
+  recovery, so strict-minded callers can reject after the fact. The first
+  4096 events are kept and `dropped_damage_events()` counts the rest. The
   strict `open` / `open_typed` behaviour is unchanged byte-for-byte.
 - **Cues-less seek**: `seek_to` on a file with no usable `Cues` (absent —
   RFC 9559 §22.1 only RECOMMENDS the element; live recordings and files
   written to a pipe have none — or damaged and skipped by a resilient
-  open), or past the last `CueTime` kept from an index cut at its budget,
+  open), or past the last `CueTime` kept for its track from an index cut at
+  its budget,
   scans the Clusters up to the target, the way FFmpeg indexes such
   a file: it walks Cluster `Timestamp`s (§5.1.3.1) to the first Cluster
   past the target, then reads Block headers in those Clusters, newest

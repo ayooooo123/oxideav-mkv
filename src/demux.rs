@@ -174,10 +174,11 @@ fn open_typed_impl(
         )));
     }
     let segment_data_start = input.stream_position()?;
-    // Damage events recorded during a resilient open (empty in strict
-    // mode), handed to the demuxer so `damage_events()` reports open-time
-    // recoveries alongside the stream-time ones.
-    let mut damage_events: Vec<DamageEvent> = Vec::new();
+    // Damage recorded during the open — a resilient open's recoveries, and
+    // a Cues index cut at its budget on either open — handed to the
+    // demuxer so `damage_events()` reports open-time recoveries alongside
+    // the stream-time ones.
+    let mut damage_events = DamageLog::default();
     let segment_data_end = if seg.size == VINT_UNKNOWN_SIZE {
         // Unknown segment size — use file end.
         let cur = input.stream_position()?;
@@ -333,51 +334,45 @@ fn open_typed_impl(
             if over_budget && e.id != ids::SEEK_HEAD {
                 return Err(Error::invalid(format!("MKV: Top-Level element 0x{:X} exceeds its budget", e.id)));
             }
+            // RFC 9559 allows the unknown size on a Segment and a Cluster
+            // alone: any other element without a declared end has no bound
+            // to parse within.
+            let end = body_end_known.ok_or_else(unknown_size_master)?;
             // Validate a leading CRC-32 child against the rest of the
-            // element when the element size is known (CRC needs a bounded
-            // body). The helper rewinds the reader to `body_start` so the
+            // element. The helper rewinds the reader to `body_start` so the
             // parse below is unaffected.
-            if let Some(end) = body_end_known {
-                if !over_quota && matches!(
-                    e.id,
-                    ids::INFO
-                        | ids::TRACKS
-                        | ids::TAGS
-                        | ids::CUES
-                        | ids::CHAPTERS
-                        | ids::ATTACHMENTS
-                        | ids::SEEK_HEAD
-                ) {
-                    if let Some(s) = validate_top_level_crc(&mut *input, e.id, body_start, end)? {
-                        crc_status.push(s);
-                    }
+            if !over_quota && matches!(
+                e.id,
+                ids::INFO
+                    | ids::TRACKS
+                    | ids::TAGS
+                    | ids::CUES
+                    | ids::CHAPTERS
+                    | ids::ATTACHMENTS
+                    | ids::SEEK_HEAD
+            ) {
+                if let Some(s) = validate_top_level_crc(&mut *input, e.id, body_start, end)? {
+                    crc_status.push(s);
                 }
             }
             match e.id {
                 ids::INFO => {
-                    let end = body_end_known.unwrap_or(segment_data_end);
                     parse_info(&mut *input, end, &mut info, &mut metadata, &mut info_budget)?;
                     have_info = true;
                 }
-                // A Tracks or Tags master has no end to parse within
-                // unless it declares one.
                 ids::TRACKS => {
-                    let end = body_end_known.ok_or_else(unknown_size_master)?;
                     parse_tracks(&mut *input, end, &mut tracks)?;
                 }
                 ids::TAGS => {
-                    let end = body_end_known.ok_or_else(unknown_size_master)?;
                     parse_tags(&mut *input, end, &mut pending_tags)?;
                 }
                 ids::CUES => {
-                    let end = body_end_known.unwrap_or(segment_data_end);
                     if let Some(stop) = parse_cues(&mut *input, end, &mut cues, &mut cue_points, &mut cue_budget)? {
                         damage_events.push(cues_cut_at(stop, end));
                         cues_cut = true;
                     }
                 }
                 ids::CHAPTERS => {
-                    let end = body_end_known.unwrap_or(segment_data_end);
                     parse_chapters_typed(
                         &mut *input,
                         end,
@@ -388,7 +383,6 @@ fn open_typed_impl(
                     )?;
                 }
                 ids::ATTACHMENTS => {
-                    let end = body_end_known.unwrap_or(segment_data_end);
                     parse_attachments(
                         &mut *input,
                         end,
@@ -399,7 +393,6 @@ fn open_typed_impl(
                 }
                 ids::SEEK_HEAD if !over_quota => {
                     seek_heads += 1;
-                    let end = body_end_known.unwrap_or(segment_data_end);
                     parse_seek_head(&mut *input, end, &mut seek_entries)?;
                 }
                 // Legacy SignatureSlot (0x1B538667, staged
@@ -411,11 +404,9 @@ fn open_typed_impl(
                 // emitted (its ID is formally unassigned in the IANA
                 // registry).
                 ids::SIGNATURE_SLOT => {
-                    let end = body_end_known.ok_or_else(unknown_size_master)?;
                     input.seek(SeekFrom::Start(end))?;
                 }
                 _ => {
-                    let end = body_end_known.ok_or_else(unknown_size_master)?;
                     input.seek(SeekFrom::Start(end))?;
                 }
             }
@@ -546,9 +537,6 @@ fn open_typed_impl(
 
     // Sort cues by (track, time) for stable lookup.
     cues.sort_by(|a, b| a.track.cmp(&b.track).then(a.time.cmp(&b.time)));
-    // A Cues index cut at its budget covers seeks up to its last kept
-    // point; past that a seek scans the Clusters instead.
-    let cues_cover = if cues_cut { cues.iter().map(|c| c.time).max() } else { None };
 
     if tracks.is_empty() {
         return Err(Error::invalid("MKV: no tracks found"));
@@ -1202,7 +1190,7 @@ fn open_typed_impl(
         duration_micros,
         cues,
         cue_points,
-        cues_cover,
+        cues_cut,
         timecode_scale_ns,
         segment_linking: info.linking,
         tags: typed_tags,
@@ -1349,6 +1337,27 @@ impl DamageEvent {
     /// an unrecoverable tail / truncated Segment).
     pub fn bytes_skipped(&self) -> u64 {
         self.bytes_skipped
+    }
+}
+
+/// Damage events a demuxer keeps; later ones are counted, not kept.
+const MAX_DAMAGE_EVENTS: usize = 4096;
+
+/// The recoveries a demux has recorded: the first [`MAX_DAMAGE_EVENTS`]
+/// in the order they happened, and an exact count of the ones past that.
+#[derive(Default)]
+struct DamageLog {
+    events: Vec<DamageEvent>,
+    dropped: u64,
+}
+
+impl DamageLog {
+    fn push(&mut self, event: DamageEvent) {
+        if self.events.len() < MAX_DAMAGE_EVENTS {
+            self.events.push(event);
+        } else {
+            self.dropped += 1;
+        }
     }
 }
 
@@ -1727,10 +1736,10 @@ const MAX_PROBE_PACKETS: usize = 1024;
 const MAX_PROBE_BYTES: usize = 512 << 10;
 /// Strong and weak reference counts in a shared side-data allocation.
 const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
-/// What the Cluster records keep besides their fixed fields, all together:
-/// `EncryptedBlock` bodies and `SilentTrackNumber`s, the lists holding them
-/// and the set of elements already recorded, each charged before it is
-/// allocated.
+/// What the Cluster records keep, all together: the records and the index
+/// finding them by offset, `EncryptedBlock` bodies and `SilentTrackNumber`s,
+/// the lists holding them and the set of elements already recorded, each
+/// charged before it is allocated.
 const MAX_CLUSTER_RECORD_BYTES: usize = 32 << 20;
 /// One `Info` text field: a filename, `Title`, `MuxingApp` or `WritingApp`.
 const MAX_INFO_TEXT_BYTES: usize = 64 << 10;
@@ -1749,7 +1758,7 @@ struct MetadataBudgets<'a> {
     info: &'a mut Budget,
     cues: &'a mut Budget,
     cues_cut: &'a mut bool,
-    damage_events: &'a mut Vec<DamageEvent>,
+    damage_events: &'a mut DamageLog,
 }
 
 /// The damage a Cues index cut at its budget records: the CuePoints from
@@ -1984,7 +1993,8 @@ impl CrcStatus {
 /// Surfaced through [`MkvDemuxer::cluster_records`] as the demuxer walks
 /// the Segment, ordered by first-encounter time. A given Cluster is
 /// recorded at most once even when a back-then-forward seek revisits it —
-/// the `body_offset` field is the dedup key.
+/// the `body_offset` field is the dedup key. Records stop once their
+/// fixed budget is spent; see [`MkvDemuxer::cluster_records`].
 ///
 /// `Position` is the Segment Position (Section 16) of the Cluster — the
 /// distance from the first octet of the Cluster's id to the byte right
@@ -8516,19 +8526,35 @@ impl Budget {
     }
 
     /// Room in `set` for one more, charging first for the table it grows
-    /// into: twice what it holds, in at most the power of two of buckets at
-    /// or above 8/7 of that (8 at least), each bucket an entry and a
-    /// control octet, plus 32 octets for the control group. The tables it
-    /// outgrows stay charged, which also covers both tables while it
-    /// rehashes.
+    /// into — see [`Self::table_charge`].
     fn set_room<T: std::hash::Hash + Eq>(&mut self, set: &mut std::collections::HashSet<T>) -> Result<()> {
         if set.len() == set.capacity() {
             let holds = (set.capacity() * 2).max(4);
-            let buckets = (holds * 8 / 7).next_power_of_two().max(8);
-            self.charge(buckets.saturating_mul(std::mem::size_of::<T>() + 1).saturating_add(32))?;
+            self.table_charge::<T>(holds)?;
             set.reserve(holds - set.len());
         }
         Ok(())
+    }
+
+    /// Room in `map` for one more, charging first for the table it grows
+    /// into — see [`Self::table_charge`].
+    fn map_room<K: std::hash::Hash + Eq, V>(&mut self, map: &mut std::collections::HashMap<K, V>) -> Result<()> {
+        if map.len() == map.capacity() {
+            let holds = (map.capacity() * 2).max(4);
+            self.table_charge::<(K, V)>(holds)?;
+            map.reserve(holds - map.len());
+        }
+        Ok(())
+    }
+
+    /// Charge a hash table of `T` entries growing to hold `holds`: at most
+    /// the power of two of buckets at or above 8/7 of that (8 at least),
+    /// each bucket an entry and a control octet, plus 32 octets for the
+    /// control group. The tables it outgrows stay charged, which also
+    /// covers both tables while it rehashes.
+    fn table_charge<T>(&mut self, holds: usize) -> Result<()> {
+        let buckets = (holds * 8 / 7).next_power_of_two().max(8);
+        self.charge(buckets.saturating_mul(std::mem::size_of::<T>() + 1).saturating_add(32))
     }
 
     /// A stored element of `size` octets, charged before any of it is held.
@@ -9276,10 +9302,10 @@ pub struct MkvDemuxer {
     /// sub-element set the denormalised `cues` seek index collapses. Empty
     /// when the file has no `Cues` element.
     cue_points: Vec<CuePoint>,
-    /// The last CueTime kept when the Cues index was cut at
-    /// [`MAX_CUE_BYTES`]: a seek past it scans the Clusters. `None` for an
-    /// index kept whole.
-    cues_cover: Option<u64>,
+    /// Whether the Cues index was cut at [`MAX_CUE_BYTES`]. A cut index
+    /// covers a track only up to the last CueTime kept for it: a seek past
+    /// that, or on a track with no kept cue, scans the Clusters.
+    cues_cut: bool,
     /// Nanoseconds per Matroska timecode tick (the Segment\Info\TimecodeScale
     /// value, defaulted to 1_000_000 when absent).
     timecode_scale_ns: u64,
@@ -9512,9 +9538,10 @@ pub struct MkvDemuxer {
     /// Cluster-stream errors recover on either path.
     resilient: bool,
     /// Every recovery performed so far — open-time master skips first,
-    /// then stream-time resyncs in the order they happened. See
+    /// then stream-time resyncs in the order they happened — up to
+    /// [`MAX_DAMAGE_EVENTS`], and a count of the rest. See
     /// [`MkvDemuxer::damage_events`].
-    damage_events: Vec<DamageEvent>,
+    damage_events: DamageLog,
     /// Progress guard for the resync scanner: the next scan starts at or
     /// after this offset, so repeated failures can never re-match the
     /// same bytes and loop.
@@ -9636,11 +9663,6 @@ impl Demuxer for MkvDemuxer {
             // none): scan the Clusters up to the target.
             return self.seek_by_cluster_scan(stream_index, pts);
         }
-        // A Cues index cut at its budget covers seeks up to its last kept
-        // CueTime; past that the Clusters are scanned as well.
-        if self.cues_cover.is_some_and(|last| self.stream_pts_to_ticks(stream_index, pts) > last) {
-            return self.seek_by_cluster_scan(stream_index, pts);
-        }
         let track_number = self.track_number_by_index[stream_index as usize];
 
         // Convert the stream's pts → Matroska ticks.
@@ -9648,6 +9670,22 @@ impl Demuxer for MkvDemuxer {
         //   ticks        = pts_seconds * 1e9 / timecode_scale_ns
         //                = pts * num * 1e9 / (den * timecode_scale_ns)
         let target_ticks: u64 = self.stream_pts_to_ticks(stream_index, pts);
+
+        // A Cues index cut at its budget covers a track up to the last
+        // CueTime kept for it. Past that, or on a track with no kept cue,
+        // the dropped CuePoints may have held the landing: scan the
+        // Clusters as a Cues-less seek does.
+        if self.cues_cut
+            && self
+                .cues
+                .iter()
+                .filter(|c| c.track == track_number)
+                .map(|c| c.time)
+                .max()
+                .map_or(true, |last| target_ticks > last)
+        {
+            return self.seek_by_cluster_scan(stream_index, pts);
+        }
 
         // Find last cue entry for this track with time <= target_ticks.
         // Cues are sorted by (track, time); use a manual scan of the
@@ -9905,16 +9943,26 @@ impl MkvDemuxer {
         self.resilient
     }
 
-    /// Every recovery a resilient demux has performed so far — open-time
-    /// master skips first, then Cluster-stream resyncs in the order they
-    /// happened (the slice grows as `next_packet` walks the file).
+    /// Every recovery the demux has performed so far — open-time master
+    /// skips first, then Cluster-stream resyncs in the order they happened
+    /// (the slice grows as `next_packet` walks the file). A Cues index cut
+    /// at its budget is recorded on either open path.
+    ///
+    /// At most 4096 events are kept: the first ones, in order. Each one
+    /// past that is counted by [`Self::dropped_damage_events`] instead.
     ///
     /// Empty for an undamaged file on either open path, so
     /// `!damage_events().is_empty()` is exactly "this file needed
     /// recovery," which strict-minded callers can use to reject it after
     /// the fact.
     pub fn damage_events(&self) -> &[DamageEvent] {
-        &self.damage_events
+        &self.damage_events.events
+    }
+
+    /// How many recoveries happened after [`Self::damage_events`] held its
+    /// 4096: exact, and `0` while fewer have happened.
+    pub fn dropped_damage_events(&self) -> u64 {
+        self.damage_events.dropped
     }
 
     /// Audit every claim the `Cues` element makes about this Segment and
@@ -10293,6 +10341,12 @@ impl MkvDemuxer {
     /// grows as more Clusters are walked, so callers that want the full
     /// per-Cluster record set should drain the file via `next_packet`
     /// (or seek to every Cluster of interest) first.
+    ///
+    /// The records share one fixed 32 MiB budget with the blocks and
+    /// numbers they hold, the records' list and their index included. A
+    /// Cluster opened once the budget cannot hold its record gets none,
+    /// and the slice stops growing. The walk, playback and seeks go on:
+    /// none of them reads the records.
     pub fn cluster_records(&self) -> &[ClusterRecord] {
         &self.cluster_records
     }
@@ -10353,9 +10407,14 @@ impl MkvDemuxer {
     /// Register a Cluster at `body_start` on the typed-record list if
     /// not already present. Idempotent across re-seeks — a back-then-
     /// forward seek that revisits the same Cluster reuses the existing
-    /// row instead of pushing a duplicate.
+    /// row instead of pushing a duplicate. The growth of the list and of
+    /// its index is charged to [`MAX_CLUSTER_RECORD_BYTES`] first; a
+    /// record that does not fit is not kept.
     fn register_cluster_record(&mut self, body_start: u64) {
-        if self.cluster_record_by_offset.contains_key(&body_start) {
+        if self.cluster_record_by_offset.contains_key(&body_start)
+            || self.record_budget.room(&mut self.cluster_records).is_err()
+            || self.record_budget.map_room(&mut self.cluster_record_by_offset).is_err()
+        {
             return;
         }
         let idx = self.cluster_records.len();
@@ -10370,11 +10429,9 @@ impl MkvDemuxer {
     }
 
     /// Attach a `Position` value (RFC 9559 §5.1.3.2) to the Cluster
-    /// record keyed by `body_start`. No-op when the record is missing —
-    /// the on-disk element ordering guarantees the record was pushed
-    /// when the Cluster's id+size header was parsed, so this only
-    /// happens if a malformed file emits `Position` outside a Cluster
-    /// the demuxer recognised.
+    /// record keyed by `body_start`. No-op when the record is missing:
+    /// the Cluster opened after the record budget ran out, or a malformed
+    /// file emits `Position` outside a Cluster the demuxer recognised.
     fn set_cluster_position(&mut self, body_start: u64, v: u64) {
         if let Some(&idx) = self.cluster_record_by_offset.get(&body_start) {
             self.cluster_records[idx].position = Some(v);
@@ -12026,15 +12083,9 @@ impl MkvDemuxer {
     /// so `tag:track:N:*` / `tag:chapter:N:*` keys keep their meaning.
     /// Best-effort by design: a malformed or truncated `Tags` element is
     /// skipped without resetting anything, the reader repositioned past
-    /// it. One of unknown size (RFC 9559 permits that on a Segment and a
-    /// Cluster alone) has no end to skip to: it is invalid data, and the
-    /// walk resynchronises on the next Top-Level element as for any
-    /// damaged Cluster stream. The source's own failure reading it is
-    /// returned, not skipped.
+    /// it. The source's own failure reading it is returned, not skipped.
+    /// The caller has already refused one of unknown size.
     fn apply_mid_stream_tags(&mut self, size: u64) -> Result<()> {
-        if size == VINT_UNKNOWN_SIZE {
-            return Err(unknown_size_master());
-        }
         if master_budget(ids::TAGS).is_some_and(|max| size > max) {
             // Larger than its budget: skipped whole, unread, as a malformed
             // one is.
@@ -12090,6 +12141,13 @@ impl MkvDemuxer {
                     return Err(Error::Eof);
                 }
                 let e = read_element_header(&mut *self.input)?;
+                // RFC 9559 allows the unknown size on a Segment and a
+                // Cluster alone. Any other element without a declared end
+                // has none to skip to: it is damage, and the walk
+                // resynchronises on the next Top-Level element.
+                if e.size == VINT_UNKNOWN_SIZE && e.id != ids::CLUSTER {
+                    return Err(unknown_size_master());
+                }
                 match e.id {
                     ids::CLUSTER => {
                         let body_start = self.input.stream_position()?;

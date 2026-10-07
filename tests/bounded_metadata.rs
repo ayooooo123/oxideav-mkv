@@ -247,6 +247,26 @@ fn only_a_cluster_may_use_the_unknown_size() {
     if packets != Ok(vec![b"a".to_vec(), b"b".to_vec()]) {
         cases.0.push(format!("Tags between Clusters: {packets:?}"));
     }
+    // Every other Top-Level master, and an unassigned one, follows the
+    // same rule.
+    let unassigned = 0x1F00_0001;
+    for (name, id, body) in [
+        ("Info", ids::INFO, uint(ids::TIMECODE_SCALE, 1_000_000)),
+        ("Cues", ids::CUES, void(4)),
+        ("Chapters", ids::CHAPTERS, void(4)),
+        ("Attachments", ids::ATTACHMENTS, void(4)),
+        ("SeekHead", ids::SEEK_HEAD, void(4)),
+        ("An unassigned master", unassigned, void(4)),
+    ] {
+        let master = [unknown_size(id), body].concat();
+        let inline = file(&[tracks(), master.clone(), cluster(0, b"a")]);
+        cases.check(&format!("{name} in line"), inline.clone(), false, Err("InvalidData"));
+        cases.check(&format!("{name} in line, resilient"), inline, true, Ok(b"a"));
+        let (packets, _, _) = measure(file(&[tracks(), cluster(0, b"a"), master, cluster(1000, b"b")]), all);
+        if packets != Ok(vec![b"a".to_vec(), b"b".to_vec()]) {
+            cases.0.push(format!("{name} between Clusters: {packets:?}"));
+        }
+    }
     assert!(cases.0.is_empty(), "{:#?}", cases.0);
 }
 
@@ -335,6 +355,63 @@ fn cues_past_their_budget_keep_what_fits_and_seek_on_by_scanning() {
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Subtitle tracks 1 and 2.
+fn two_tracks() -> Vec<u8> {
+    let second = [
+        uint(ids::TRACK_NUMBER, 2), uint(ids::TRACK_UID, 2),
+        uint(ids::TRACK_TYPE, 0x11), elem(ids::CODEC_ID, b"S_TEXT/UTF8"),
+    ].concat();
+    elem(ids::TRACKS, &[elem(ids::TRACK_ENTRY, &track_fields()), elem(ids::TRACK_ENTRY, &second)].concat())
+}
+
+/// A Cluster at `tc` holding a keyframe packet on track 2, then one on
+/// track 1.
+fn two_track_cluster(tc: u64, second: &[u8], first: &[u8]) -> Vec<u8> {
+    let block = |track: u8, payload: &[u8]| elem(ids::SIMPLE_BLOCK, &[&[0x80 | track, 0, 0, 0x80][..], payload].concat());
+    elem(ids::CLUSTER, &[uint(ids::TIMECODE, tc), block(2, second), block(1, first)].concat())
+}
+
+/// A CuePoint at `time` for track 2 only, in the Cluster at Segment
+/// Position `cluster`.
+fn track_two_cue_point(time: u64, cluster: u64) -> Vec<u8> {
+    let positions = [uint(ids::CUE_TRACK, 2), uint(ids::CUE_CLUSTER_POSITION, cluster)].concat();
+    elem(ids::CUE_POINT, &[uint(ids::CUE_TIME, time), elem(ids::CUE_TRACK_POSITIONS, &positions)].concat())
+}
+
+/// Where `d` lands seeking `stream` to `target`, and the packet it reads
+/// there.
+fn seek_and_read(d: &mut dyn Demuxer, stream: u32, target: i64) -> Result<(i64, Vec<u8>), String> {
+    let landed = d.seek_to(stream, target).map_err(kind)?;
+    Ok((landed, d.next_packet().map_err(kind)?.data))
+}
+
+/// The crowded index indexes track 1 first and track 2 only after it, so
+/// the CuePoints the budget keeps index track 1 alone. A seek on track 2,
+/// even before the last kept CueTime, scans the Clusters like a seek past
+/// it does.
+#[test]
+fn a_track_the_kept_cues_miss_seeks_by_scanning() {
+    let _serial = serial();
+    let [c0, c1, c2] = [
+        two_track_cluster(0, b"A", b"a"),
+        two_track_cluster(200_000, b"B", b"b"),
+        two_track_cluster(400_000, b"C", b"c"),
+    ];
+    let cues = |at: [u64; 3]| {
+        let mut points: Vec<u8> = (0..CROWDED).flat_map(|t| cue_point(t, at[0], false)).collect();
+        points.extend(track_two_cue_point(200_000, at[1]));
+        points.extend(track_two_cue_point(400_000, at[2]));
+        elem(ids::CUES, &points)
+    };
+    let t = two_tracks();
+    let first = (t.len() + cues([0; 3]).len()) as u64;
+    let at = [first, first + c0.len() as u64, first + (c0.len() + c1.len()) as u64];
+    let mut d = demux::open_typed(Box::new(Cursor::new(file(&[t, cues(at), c0, c1, c2]))), &NullCodecResolver).unwrap();
+    let landings = [(1, 50), (1, 400_000), (0, 50)].map(|(stream, target)| seek_and_read(&mut d, stream, target));
+    let expected = [Ok((0, b"A".to_vec())), Ok((400_000, b"C".to_vec())), Ok((50, b"A".to_vec()))];
+    assert_eq!(landings, expected);
 }
 
 /// Forty thousand Clusters a second apart, each indexed by a CuePoint and
