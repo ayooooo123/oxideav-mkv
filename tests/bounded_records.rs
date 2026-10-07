@@ -1,7 +1,9 @@
 //! The records the open builds from a `Tags` or `Tracks` master, tag
 //! resolution and the per-stream views included, stay within the master's
 //! 32 MiB limit at their peak and once the open is done, measured on
-//! masters at that full limit.
+//! masters at that full limit. A CodecPrivate replaced by its decoded form
+//! gives its room back, and so do the flat entries of a Tags master
+//! replaced between Clusters, in one pass.
 //!
 //! The heap is measured by a counting global allocator that refuses to go
 //! past 512 MiB live, so an unbounded parse aborts the test binary instead
@@ -12,9 +14,10 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use oxideav_core::{Demuxer, Error, NullCodecResolver};
-use oxideav_mkv::demux::{self, DamageKind, MkvDemuxer};
+use oxideav_mkv::demux::{self, DamageKind, MkvDemuxer, SimpleTagValue};
 use oxideav_mkv::ebml::{write_element_id, write_vint};
 use oxideav_mkv::ids;
 
@@ -269,5 +272,120 @@ fn an_lzo_codec_private_stays_within_the_tracks_limit() {
         outcome == Err("InvalidData") && peak <= LIMIT + SLACK,
         "{} bytes of LZO: {outcome:?}, peak {peak} heap bytes",
         packed.len(),
+    );
+}
+
+/// Four CodecPrivates of 4 MiB less one octet, each restored to 4 MiB by
+/// header stripping, make up the 16 MiB CodecPrivate total exactly: a
+/// stored buffer gives its room back once its decoded form replaces it, so
+/// all four open, byte for byte, in either open. Two octets more are past
+/// the total.
+#[test]
+fn codec_privates_restored_to_their_16_mib_total_open() {
+    let _serial = serial();
+    let stripping = |prefix: &[u8]| {
+        let compression = elem(ids::CONTENT_COMPRESSION, &[
+            uint(ids::CONTENT_COMP_ALGO, ids::CONTENT_COMP_ALGO_HEADER_STRIPPING), elem(ids::CONTENT_COMP_SETTINGS, prefix),
+        ].concat());
+        let encoding = elem(ids::CONTENT_ENCODING, &[uint(ids::CONTENT_ENCODING_SCOPE, ids::CONTENT_ENCODING_SCOPE_PRIVATE), compression].concat());
+        elem(ids::CONTENT_ENCODINGS, &encoding)
+    };
+    let entry = |n: u64, private: &[u8]| {
+        elem(ids::TRACK_ENTRY, &[track_fields(n), stripping(&[n as u8]), elem(ids::CODEC_PRIVATE, private)].concat())
+    };
+    let stored: Vec<u8> = (0..(4u32 << 20) - 1).map(|i| (i % 251) as u8).collect();
+    let four: Vec<u8> = (1..=4u64).flat_map(|n| entry(n, &stored)).collect();
+    let mut failures = Vec::new();
+    for resilient in [false, true] {
+        let (d, _, _) = opened(file(&[elem(ids::TRACKS, &four), cluster()]), resilient);
+        let exact = d.as_ref().map(|d| {
+            d.streams().iter().zip(1u8..).all(|(s, n)| s.params.extradata.first() == Some(&n) && s.params.extradata.get(1..) == Some(&stored[..]))
+        });
+        if exact != Ok(true) {
+            failures.push(format!("four restored CodecPrivates, resilient {resilient}: {exact:?}"));
+        }
+    }
+    let five = [four, entry(5, &[5])].concat();
+    let (d, _, _) = opened(file(&[elem(ids::TRACKS, &five), cluster()]), false);
+    if d.as_ref().err().map(String::as_str) != Some("InvalidData") {
+        failures.push(format!("a fifth past the 16 MiB total: {:?}", d.as_ref().map(|_| ())));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A Cluster at `tc` holding packet `payload` on track 1.
+fn cluster_at(tc: u64, payload: &[u8]) -> Vec<u8> {
+    let block = elem(ids::SIMPLE_BLOCK, &[&[0x81, 0, 0, 0x80][..], payload].concat());
+    elem(ids::CLUSTER, &[uint(ids::TIMECODE, tc), block].concat())
+}
+
+/// A SimpleTag naming `name` with the TagString or TagBinary `value`.
+fn simple_tag(name: &[u8], value: Vec<u8>) -> Vec<u8> {
+    elem(ids::SIMPLE_TAG, &[elem(ids::TAG_NAME, name), value].concat())
+}
+
+/// Every packet of `d` to the end.
+fn drained(d: &mut MkvDemuxer) -> Vec<Vec<u8>> {
+    let mut packets = Vec::new();
+    loop {
+        match d.next_packet() {
+            Ok(p) => packets.push(p.data),
+            Err(Error::Eof) => return packets,
+            Err(e) => panic!("unexpected error after {} packets: {e}", packets.len()),
+        }
+    }
+}
+
+/// A Tags master replacing another between Clusters gives back the room
+/// the old one's flat entries held before their charge is released: after
+/// forty thousand entries, an empty Tags and then one 31.5 MiB value, the
+/// tags hold no more than their 32 MiB limit.
+#[test]
+fn replaced_tags_give_back_the_room_their_entries_held() {
+    let _serial = serial();
+    let many = elem(ids::TAGS, &elem(ids::TAG, &simple_tag(b"x", elem(ids::TAG_STRING, b"y")).repeat(64)).repeat(625));
+    let value = vec![7u8; (63 << 20) / 2];
+    let large = elem(ids::TAGS, &elem(ids::TAG, &simple_tag(b"BLOB", elem(ids::TAG_BINARY, &value))));
+    let bytes = file(&[
+        tracks(), cluster_at(0, b"a"), many, cluster_at(1000, b"b"), elem(ids::TAGS, &[]),
+        cluster_at(2000, b"c"), large, cluster_at(3000, b"d"),
+    ]);
+    let mut d = opened(bytes, false).0.unwrap();
+    let base = LIVE.load(Ordering::SeqCst);
+    let packets = drained(&mut d);
+    let held = LIVE.load(Ordering::SeqCst).saturating_sub(base);
+    let kept = d.tags().first().and_then(|t| t.simple_tags.first()).map(|s| match &s.value {
+        SimpleTagValue::Binary(b) => b.len(),
+        _ => 0,
+    });
+    let order = [b"a", b"b", b"c", b"d"].map(|p| p.to_vec());
+    assert!(
+        packets == order && kept == Some(value.len()) && held <= LIMIT,
+        "{} packets, kept a value of {kept:?} octets, held {held} heap bytes",
+        packets.len(),
+    );
+}
+
+/// Replacing fifty thousand flat tag entries takes one pass, not one per
+/// entry, and keeps exactly the Info entry they duplicate.
+#[test]
+fn a_tags_reset_replaces_its_entries_in_one_pass() {
+    let _serial = serial();
+    let info = elem(ids::INFO, &[uint(ids::TIMECODE_SCALE, 1_000_000), elem(ids::TITLE, b"y")].concat());
+    let many = elem(ids::TAGS, &elem(ids::TAG, &simple_tag(b"TITLE", elem(ids::TAG_STRING, b"y")).repeat(50)).repeat(1000));
+    let one = elem(ids::TAGS, &elem(ids::TAG, &simple_tag(b"Z", elem(ids::TAG_STRING, b"w"))));
+    let bytes = file(&[info, tracks(), cluster_at(0, b"a"), many, cluster_at(1000, b"b"), one, cluster_at(2000, b"c")]);
+    let mut d = opened(bytes, false).0.unwrap();
+    let first = [d.next_packet(), d.next_packet()].map(|p| p.map(|p| p.data).ok());
+    let titles_before = d.metadata().iter().filter(|(k, v)| k == "title" && v == "y").count();
+    let started = Instant::now();
+    let last = d.next_packet().map(|p| p.data).ok();
+    let took = started.elapsed();
+    let count = |key: &str, value: &str| d.metadata().iter().filter(|(k, v)| k == key && v == value).count();
+    let (titles, zs) = (count("title", "y"), count("z", "w"));
+    assert!(
+        first == [Some(b"a".to_vec()), Some(b"b".to_vec())] && last == Some(b"c".to_vec())
+            && titles_before == 50_001 && titles == 1 && zs == 1 && took < Duration::from_secs(1),
+        "packets {first:?} {last:?}; title entries {titles_before} then {titles}, z entries {zs}; the reset took {took:?}"
     );
 }

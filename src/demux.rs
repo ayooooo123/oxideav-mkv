@@ -25,7 +25,7 @@ use oxideav_core::{Demuxer, ReadSeek};
 use crate::codec_id::from_matroska;
 use crate::ebml::{
     crc32_ieee, crc32_ieee_update, into_string, read_bytes, read_element_header, read_float,
-    read_int, read_string, read_uint, read_vint, skip, VINT_UNKNOWN_SIZE,
+    read_int, read_uint, read_vint, skip, VINT_UNKNOWN_SIZE,
 };
 use crate::ids;
 
@@ -128,9 +128,18 @@ fn open_typed_impl(
     let mut doc_type_read_version: u64 = 1;
     // DocTypeExtension masters (RFC 8794 §11.2.9), in document order.
     let mut doc_type_extensions: Vec<DocTypeExtension> = Vec::new();
+    // Every child must fit the header, and its strings and extension
+    // records are charged before they are read or kept — see
+    // `MAX_EBML_HEADER_BYTES`. A header of unknown size has no end to
+    // check its children against.
+    if hdr.size == VINT_UNKNOWN_SIZE {
+        return Err(Error::invalid("MKV: EBML header of unknown size"));
+    }
+    let mut header_budget = Budget::new(MAX_EBML_HEADER_BYTES, "MKV: EBML header exceeds its 16 MiB budget");
     let ebml_end = input.stream_position()?.saturating_add(hdr.size);
     while input.stream_position()? < ebml_end {
         let e = read_element_header(&mut *input)?;
+        let e_end = child_end(&mut *input, e.size, ebml_end)?;
         match e.id {
             ids::EBML_VERSION => {
                 ebml_version = read_uint(&mut *input, e.size as usize)?;
@@ -145,7 +154,7 @@ fn open_typed_impl(
                 ebml_max_size_length = read_uint(&mut *input, e.size as usize)?;
             }
             ids::EBML_DOC_TYPE => {
-                doc_type = read_string(&mut *input, e.size as usize)?;
+                doc_type = into_string(header_budget.read(&mut *input, e.size)?)?;
             }
             ids::EBML_DOC_TYPE_VERSION => {
                 doc_type_version = read_uint(&mut *input, e.size as usize)?;
@@ -154,8 +163,8 @@ fn open_typed_impl(
                 doc_type_read_version = read_uint(&mut *input, e.size as usize)?;
             }
             ids::DOC_TYPE_EXTENSION => {
-                let ext_end = input.stream_position()?.saturating_add(e.size);
-                if let Some(ext) = parse_doc_type_extension(&mut *input, ext_end)? {
+                if let Some(ext) = parse_doc_type_extension(&mut *input, e_end, &mut header_budget)? {
+                    header_budget.room(&mut doc_type_extensions)?;
                     doc_type_extensions.push(ext);
                 }
             }
@@ -269,8 +278,10 @@ fn open_typed_impl(
     let mut seek_entries: Vec<SeekEntry> = Vec::new();
     // Per-element CRC-32 validation results (RFC 8794 §11.3.1, RFC 9559
     // §6.2). Populated as each Top-Level master with a leading CRC-32
-    // child is walked; surfaced via `MkvDemuxer::crc_status`.
-    let mut crc_status: Vec<CrcStatus> = Vec::new();
+    // child is walked; surfaced via `MkvDemuxer::crc_status`. They share
+    // the Cluster-record budget with what the demuxer keeps for Clusters.
+    let mut crc_log = CrcLog::default();
+    let mut record_budget = Budget::new(MAX_CLUSTER_RECORD_BYTES, "MKV: Cluster records exceed their 32 MiB budget");
     // What the Info, Chapters, Attachments, Tags and Tracks masters and the
     // Cues index may keep, each together over the walk below and the
     // SeekHead chase after it — see [`MAX_INFO_BYTES`],
@@ -351,19 +362,19 @@ fn open_typed_impl(
             break;
         }
         // A master larger than its budget (see `master_budget`) is refused
-        // before any of it is read, its CRC-32 included: a SeekHead is
-        // skipped below like one past the two RFC 9559 §5.1.1 allows; a
-        // Tracks or Tags master is invalid data, as contents over their
-        // budgets are.
+        // before any of it is read, its CRC-32 included, as invalid data
+        // like contents over their budgets: a damaged master, so an
+        // optional SeekHead or Tags is skipped with a damage event. A
+        // SeekHead past the two RFC 9559 §5.1.1 allows is skipped unread.
         let over_budget = e.size != VINT_UNKNOWN_SIZE && master_budget(e.id).is_some_and(|max| e.size > max);
-        let over_quota = e.id == ids::SEEK_HEAD && (seek_heads >= MAX_SEEK_HEADS || over_budget);
+        let over_quota = e.id == ids::SEEK_HEAD && seek_heads >= MAX_SEEK_HEADS;
         // Parse the Top-Level master. Damage in it is recoverable when the
         // master is optional (anything but Info and Tracks), in either open,
         // and in any master in resilient mode: whatever the parser lifted
         // before an error is kept, the rest of the element is skipped, and
         // the walk resumes at the next Top-Level element.
         let parse_result: Result<()> = (|| {
-            if over_budget && e.id != ids::SEEK_HEAD {
+            if over_budget {
                 return Err(Error::invalid(format!("MKV: Top-Level element 0x{:X} exceeds its budget", e.id)));
             }
             // RFC 9559 allows the unknown size on a Segment and a Cluster
@@ -389,7 +400,7 @@ fn open_typed_impl(
                     | ids::SEEK_HEAD
             ) {
                 if let Some(s) = validate_top_level_crc(&mut *input, e.id, body_start, end)? {
-                    crc_status.push(s);
+                    crc_log.record(&mut record_budget, body_start, s);
                 }
             }
             match e.id {
@@ -545,7 +556,7 @@ fn open_typed_impl(
                 id,
                 abs,
                 segment_data_end,
-                &mut crc_status,
+                &mut crc_log,
                 &mut info,
                 &mut have_info,
                 &mut tracks,
@@ -567,6 +578,7 @@ fn open_typed_impl(
                     tracks: &mut track_budget,
                     cues: &mut cue_budget,
                     cues_cut: &mut cues_cut,
+                    records: &mut record_budget,
                     damage_events: &mut damage_events,
                 },
             );
@@ -598,7 +610,9 @@ fn open_typed_impl(
     // reads it; one that fails to decompress is dropped, as FFmpeg does.
     // Output past the CodecPrivate budget, or past half of what the Tracks
     // records may still keep (an output buffer can double as it grows), is
-    // invalid data instead.
+    // invalid data instead. The stored form, charged at its length when it
+    // was read and freed once decoded, gives its room back after the
+    // decoded form is charged.
     let mut private_total: usize = tracks.iter().map(|t| t.codec_private.len()).sum();
     for t in &mut tracks {
         let chain = t
@@ -608,7 +622,8 @@ fn open_typed_impl(
         if let Some(chain) = chain {
             if !t.codec_private.is_empty() {
                 let stored = std::mem::take(&mut t.codec_private);
-                private_total -= stored.len();
+                let stored_len = stored.len();
+                private_total -= stored_len;
                 let budget = MAX_CODEC_PRIVATE
                     .min(MAX_CODEC_PRIVATE_TOTAL.saturating_sub(private_total))
                     .min(track_budget.left() / 2);
@@ -620,6 +635,7 @@ fn open_typed_impl(
                     }
                 };
                 track_budget.charge(t.codec_private.capacity())?;
+                track_budget.release(stored_len);
                 track_budget.reserve_scratch(t.codec_private.len())?;
                 private_total += t.codec_private.len();
             }
@@ -860,12 +876,12 @@ fn open_typed_impl(
         &mut metadata,
         &mut typed_tags,
     );
-    // Remember exactly which flat-metadata entries the Tags element
-    // contributed, so a mid-stream `Tags` (RFC 9559 §23.2 live tagging:
-    // "the new Tags element MUST reset the previously encountered Tags
-    // elements and use the new values instead") can swap them without
-    // touching Info- / Chapters- / Attachments-derived entries.
-    let tag_metadata_entries: Vec<(String, String)> = metadata[metadata_len_before_tags..].to_vec();
+    // The flat-metadata entries the Tags element contributed are the last
+    // ones, and stay last, so a mid-stream `Tags` (RFC 9559 §23.2 live
+    // tagging: "the new Tags element MUST reset the previously encountered
+    // Tags elements and use the new values instead") can swap them in one
+    // cut without touching Info- / Chapters- / Attachments-derived entries.
+    let tag_metadata_len = metadata.len() - metadata_len_before_tags;
 
     // Resolve each track's `TrackOperation` (RFC 9559 §5.1.4.1.30): map the
     // raw `TrackPlaneUID` / `TrackJoinUID` references onto stream indices via
@@ -1260,8 +1276,7 @@ fn open_typed_impl(
         editions,
         attachments,
         seek_entries,
-        crc_status,
-        validated_cluster_starts: std::collections::HashSet::new(),
+        crc_log,
         track_operations,
         apply_track_operations: false,
         virtual_consumers,
@@ -1299,7 +1314,7 @@ fn open_typed_impl(
         track_identity,
         cluster_records: Vec::new(),
         cluster_record_by_offset: std::collections::HashMap::new(),
-        record_budget: Budget::new(MAX_CLUSTER_RECORD_BYTES, "MKV: Cluster records exceed their 32 MiB budget"),
+        record_budget,
         recorded_offsets: std::collections::HashSet::new(),
         resilient,
         damage_events,
@@ -1309,7 +1324,7 @@ fn open_typed_impl(
         chapter_uid_to_index,
         attachment_uid_to_index,
         edition_uid_to_index,
-        tag_metadata_entries,
+        tag_metadata_len,
         tags_charge: MAX_TAGS_BYTES as usize - tag_budget.left(),
     })
 }
@@ -1422,6 +1437,34 @@ impl DamageLog {
         } else {
             self.dropped += 1;
         }
+    }
+}
+
+/// The CRC-32 statuses a demux keeps (see [`MkvDemuxer::crc_status`]): one
+/// per master, however often the master is read, and only while the
+/// Cluster-record budget holds them. Past it, statuses are no longer kept;
+/// the checks themselves go on, and so does playback.
+#[derive(Default)]
+struct CrcLog {
+    statuses: Vec<CrcStatus>,
+    /// Body offsets of the masters whose status is kept.
+    kept: std::collections::HashSet<u64>,
+}
+
+impl CrcLog {
+    /// Whether the master whose body starts at `body_start` has a status.
+    fn has(&self, body_start: u64) -> bool {
+        self.kept.contains(&body_start)
+    }
+
+    /// Keep `status` for the master whose body starts at `body_start`,
+    /// once, charging `budget` for the room it takes first.
+    fn record(&mut self, budget: &mut Budget, body_start: u64, status: CrcStatus) {
+        if self.has(body_start) || budget.room(&mut self.statuses).is_err() || budget.set_room(&mut self.kept).is_err() {
+            return;
+        }
+        self.kept.insert(body_start);
+        self.statuses.push(status);
     }
 }
 
@@ -1802,9 +1845,15 @@ const MAX_PROBE_BYTES: usize = 512 << 10;
 const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
 /// What the Cluster records keep, all together: the records and the index
 /// finding them by offset, `EncryptedBlock` bodies and `SilentTrackNumber`s,
-/// the lists holding them and the set of elements already recorded, each
+/// the lists holding them and the set of elements already recorded, and
+/// the CRC-32 statuses kept with the set of masters that have one, each
 /// charged before it is allocated.
 const MAX_CLUSTER_RECORD_BYTES: usize = 32 << 20;
+/// Everything the EBML header keeps: its `DocType` and `DocTypeExtension`
+/// records with their names and the list holding them. One string may use
+/// all of it: FFmpeg allows an EBML string 16 MiB (`max_lengths` in
+/// libavformat/matroskadec.c).
+const MAX_EBML_HEADER_BYTES: usize = 16 << 20;
 /// One text field of an `Info`, `Chapters` or `Attachments` master: a title,
 /// filename, language, MIME type or the like.
 const MAX_TEXT_BYTES: usize = 64 << 10;
@@ -1845,6 +1894,8 @@ struct MetadataBudgets<'a> {
     tracks: &'a mut Budget,
     cues: &'a mut Budget,
     cues_cut: &'a mut bool,
+    /// The Cluster-record budget, which the CRC-32 statuses share.
+    records: &'a mut Budget,
     damage_events: &'a mut DamageLog,
 }
 
@@ -1952,8 +2003,9 @@ fn cut_short(err: Error, budget: &mut Budget) -> Result<()> {
 /// first child must itself parse and carry one of these IDs (RFC 9559
 /// §5.1.3.1 usage note — `Timestamp` SHOULD be the first child, or the
 /// second after a `CRC-32`; the rest covers writers that put `Position` /
-/// `PrevSize` / a block first anyway).
-const CLUSTER_FIRST_CHILD_IDS: [u32; 8] = [
+/// `PrevSize` / a block first anyway, and a `Void`, which RFC 8794 §11.3.2
+/// allows anywhere).
+const CLUSTER_FIRST_CHILD_IDS: [u32; 9] = [
     ids::TIMECODE,
     ids::CRC32,
     ids::POSITION,
@@ -1962,6 +2014,7 @@ const CLUSTER_FIRST_CHILD_IDS: [u32; 8] = [
     ids::SIMPLE_BLOCK,
     ids::BLOCK_GROUP,
     ids::ENCRYPTED_BLOCK,
+    ids::VOID,
 ];
 
 /// Scan `[from, end)` for the next plausible Top-Level element and return
@@ -3269,13 +3322,13 @@ fn resolved_tag_bytes(t: &RawTag) -> usize {
 
 /// What resolving a `SimpleTag` adds besides the strings it holds, which
 /// resolution moves: its typed record and, for a named string value
-/// directly under a `Tag` (`flat`), its flat entry and the copy of that
-/// entry kept to undo it — the key (scope prefix and lowercase name) and
-/// the value twice, and four list slots.
+/// directly under a `Tag` (`flat`), its flat entry — the key (scope prefix
+/// and lowercase name) and a copy of the value — with four list slots, room
+/// for the lists the entry passes through as they grow.
 fn resolved_simple_tag_bytes(s: &RawSimpleTag, flat: bool) -> usize {
     let entry = match &s.value {
         SimpleTagValue::String(v) if flat && !s.name.is_empty() && !v.is_empty() => {
-            2 * (MAX_TAG_KEY_PREFIX + s.name.len() + v.len()) + 4 * std::mem::size_of::<(String, String)>()
+            MAX_TAG_KEY_PREFIX + s.name.len() + v.len() + 4 * std::mem::size_of::<(String, String)>()
         }
         _ => 0,
     };
@@ -7820,6 +7873,12 @@ fn parse_attachments(
         let kept = (metadata.len(), idx);
         let parsed = read_element_header(r).and_then(|e| match e.id {
             ids::ATTACHED_FILE => {
+                // Only a Segment or a Cluster may leave its size open; a
+                // finite AttachedFile ends with its Attachments at the
+                // latest.
+                if e.size == VINT_UNKNOWN_SIZE {
+                    return Err(unknown_size_master());
+                }
                 let af_end = r.stream_position()?.saturating_add(e.size).min(end);
                 idx += 1;
                 parse_attached_file(r, af_end, metadata, idx, attachment_uid_to_index, attachments, budget)
@@ -7870,7 +7929,10 @@ fn parse_attached_file(
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         // A payload is checked against its parent when it is fetched;
-        // every other child must fit now.
+        // every other child must fit now, and none may leave its size open.
+        if e.size == VINT_UNKNOWN_SIZE {
+            return Err(unknown_size_master());
+        }
         if e.id != ids::FILE_DATA {
             child_end(r, e.size, end)?;
         }
@@ -8314,13 +8376,13 @@ fn parse_cue_reference(r: &mut dyn ReadSeek, end: u64) -> Result<CueReference> {
 ///
 /// Trust-but-verify: the element header at the target must carry exactly
 /// the ID the `SeekID` promised and a bounded body inside the Segment,
-/// or the entry is ignored. The parse lands in *temporary* collections
-/// that are merged only when the whole parse succeeds — a hostile or
-/// stale SeekPosition can never leave partially-parsed state behind. A
-/// Cues, Chapters or Attachments master cut at its budget or by damage is
-/// the one exception: the records that fit are kept and the cut is a
-/// [`DamageEvent`], as in the walk. Any other target whose parse finds
-/// damage merges nothing and is noted as a damaged master.
+/// or the entry is ignored. A target larger than its budget is refused
+/// unread and noted as a damaged master. An `Info` or `Tracks` target
+/// lands in *temporary* collections merged only when the whole parse
+/// succeeds. The optional masters keep what they lifted before damage or
+/// their budget cut them short, as in the walk: Cues, Chapters and
+/// Attachments the records that fit, Tags the complete `Tag`s, a SeekHead
+/// the complete `Seek`s. Damage is noted as one damaged master or cut.
 /// The caller restores the reader position afterwards.
 #[allow(clippy::too_many_arguments)]
 fn follow_seek_target(
@@ -8328,7 +8390,7 @@ fn follow_seek_target(
     id: u32,
     abs: u64,
     segment_data_end: u64,
-    crc_status: &mut Vec<CrcStatus>,
+    crc_log: &mut CrcLog,
     info: &mut SegmentInfo,
     have_info: &mut bool,
     tracks: &mut Vec<TrackEntry>,
@@ -8357,9 +8419,15 @@ fn follow_seek_target(
     if end > segment_data_end {
         return Ok(());
     }
-    // Larger than its budget, the target is ignored unread, like a stale
-    // one.
+    // Larger than its budget, the target is refused unread, and noted as a
+    // damaged master.
     if master_budget(e.id).is_some_and(|max| e.size > max) {
+        budgets.damage_events.push(DamageEvent {
+            kind: DamageKind::DamagedMaster(id),
+            offset: abs,
+            resumed_at: Some(end),
+            bytes_skipped: end - abs,
+        });
         return Ok(());
     }
     let parsed = (|| -> Result<()> {
@@ -8381,11 +8449,13 @@ fn follow_seek_target(
                 merge(tracks, tmp);
             }
             ids::SEEK_HEAD => {
+                // The complete Seeks before any damage are kept, as in line.
                 let mut tmp = Vec::new();
-                parse_seek_head(r, end, &mut tmp)?;
+                let parsed = parse_seek_head(r, end, &mut tmp);
                 for entry in tmp {
                     push_seek_entry(seek_entries, entry);
                 }
+                parsed?;
             }
             ids::CUES => {
                 if let Some(stop) = parse_cues(r, end, cues, cue_points, budgets.cues)? {
@@ -8394,9 +8464,11 @@ fn follow_seek_target(
                 }
             }
             ids::TAGS => {
+                // The complete Tags before any damage are kept, as in line.
                 let mut tmp = Vec::new();
-                parse_tags(r, end, &mut tmp, budgets.tags)?;
+                let parsed = parse_tags(r, end, &mut tmp, budgets.tags);
                 merge(pending_tags, tmp);
+                parsed?;
             }
             ids::CHAPTERS => {
                 // The chase only runs when no `Chapters` was parsed yet, so
@@ -8438,7 +8510,7 @@ fn follow_seek_target(
             _ => return Ok(()),
         }
         if let Some(status) = crc {
-            crc_status.push(status);
+            crc_log.record(budgets.records, body_start, status);
         }
         Ok(())
     })();
@@ -9089,6 +9161,11 @@ impl Budget {
     fn left(&self) -> usize {
         self.left
     }
+
+    /// Give back `bytes` charged for a buffer that has since been freed.
+    fn release(&mut self, bytes: usize) {
+        self.left += bytes;
+    }
 }
 
 /// `size` octets of `r` in a buffer that grows in steps only as they
@@ -9328,14 +9405,16 @@ fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry, budget: &mut 
 /// carrying an empty name / zero version — is dropped rather than surfaced,
 /// since the spec makes both load-bearing (the name is the lookup key, the
 /// version selects the element set). Unknown children are skipped
-/// (forward-compat).
-fn parse_doc_type_extension(r: &mut dyn ReadSeek, end: u64) -> Result<Option<DocTypeExtension>> {
+/// (forward-compat). Each child must fit the extension, and the name is
+/// charged to the header's `budget` before it is read.
+fn parse_doc_type_extension(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<Option<DocTypeExtension>> {
     let mut name: Option<String> = None;
     let mut version: Option<u64> = None;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
+        child_end(r, e.size, end)?;
         match e.id {
-            ids::DOC_TYPE_EXTENSION_NAME => name = Some(read_string(r, e.size as usize)?),
+            ids::DOC_TYPE_EXTENSION_NAME => name = Some(into_string(budget.read(r, e.size)?)?),
             ids::DOC_TYPE_EXTENSION_VERSION => version = Some(read_uint(r, e.size as usize)?),
             _ => skip(r, e.size)?,
         }
@@ -9613,8 +9692,8 @@ struct ClusterReader {
 
 /// A Cluster `CRC-32` computed as the walk reads the Cluster body.
 struct RunningCrc {
-    /// Body offset of the Cluster — its key in
-    /// [`MkvDemuxer::validated_cluster_starts`].
+    /// Body offset of the Cluster — its key in the demuxer's CRC log, which
+    /// records its status once.
     body_start: u64,
     stored: u32,
     /// CRC of the bytes from the end of the `CRC-32` element to `next`.
@@ -9860,19 +9939,13 @@ pub struct MkvDemuxer {
     /// statuses captured for `Info` / `Tracks` / `Tags` / `Cues` /
     /// `Chapters` / `Attachments` / `SeekHead` at open time **and** the
     /// statuses captured per `Cluster` once the walk through
-    /// [`MkvDemuxer::next_packet`] / [`Demuxer::seek_to`] has read it. The
-    /// element id distinguishes the two (e.g. [`ids::CLUSTER`] for the
-    /// per-Cluster checks).
-    crc_status: Vec<CrcStatus>,
-    /// Body-start offsets of Cluster elements whose `CRC-32` child has
-    /// already been validated and recorded in [`Self::crc_status`]. Used
-    /// to dedup the per-Cluster check across the multiple code paths that
-    /// open a Cluster (the legacy `advance()` walk and the Cue-driven
-    /// [`Self::apply_cue_relative_position`]) and across repeated visits
-    /// to the same Cluster (a back-then-forward seek lands on the same
-    /// Cluster more than once). Membership keyed by the absolute file
-    /// offset of the Cluster's *body* (the byte after its id+size header).
-    validated_cluster_starts: std::collections::HashSet<u64>,
+    /// [`MkvDemuxer::next_packet`] / [`Demuxer::seek_to`] has read it, or
+    /// per `Tags` read between Clusters. The element id distinguishes them
+    /// (e.g. [`ids::CLUSTER`] for the per-Cluster checks). Each master has
+    /// one status, keyed by the absolute offset of its body, however often
+    /// a seek leads the walk back to it, and the statuses are kept only
+    /// while [`Self::record_budget`] holds them.
+    crc_log: CrcLog,
     /// Per-stream `TrackOperation` (RFC 9559 §5.1.4.1.30), indexed by
     /// stream index. `None` for tracks that aren't virtual tracks — see
     /// [`MkvDemuxer::track_operations`].
@@ -10051,8 +10124,8 @@ pub struct MkvDemuxer {
     /// open finds the record already present and reuses it instead of
     /// pushing a duplicate row).
     cluster_record_by_offset: std::collections::HashMap<u64, usize>,
-    /// What the Cluster records may still keep — see
-    /// [`MAX_CLUSTER_RECORD_BYTES`].
+    /// What the Cluster records and the CRC-32 statuses may still keep —
+    /// see [`MAX_CLUSTER_RECORD_BYTES`].
     record_budget: Budget,
     /// Element offsets of the `EncryptedBlock`s and `SilentTracks` already
     /// on a record, so a revisit does not record one twice.
@@ -10087,10 +10160,11 @@ pub struct MkvDemuxer {
     attachment_uid_to_index: std::collections::HashMap<u64, u32>,
     /// `EditionUID` → 1-based edition-index map (see above).
     edition_uid_to_index: std::collections::HashMap<u64, u32>,
-    /// The flat-metadata entries contributed by the most recent `Tags`
-    /// element — removed and re-added when a mid-stream `Tags` resets
-    /// the tag state per RFC 9559 §23.2.
-    tag_metadata_entries: Vec<(String, String)>,
+    /// How many of the last flat-metadata entries the most recent `Tags`
+    /// element contributed. Nothing else adds to the metadata after the
+    /// open, so they stay last, and a mid-stream `Tags` replaces them in one
+    /// cut per RFC 9559 §23.2.
+    tag_metadata_len: usize,
     /// What the current tag state was charged when it was parsed and
     /// resolved. A mid-stream `Tags` may use the rest of
     /// [`MAX_TAGS_BYTES`], since both states are held until the swap.
@@ -10445,11 +10519,13 @@ impl MkvDemuxer {
     /// `advance` loop, or after a [`Demuxer::seek_to`] lands inside the
     /// Cluster — and its status is appended once the walk has read the
     /// whole Cluster; a Cluster the walk leaves early (a seek away, a
-    /// damaged child) gets none. A Cluster is recorded at most once even
-    /// if a back-then-forward seek revisits it. The element id on a
-    /// Cluster status is [`ids::CLUSTER`]; Cluster bodies declared with
-    /// the unknown-size VINT can't be CRC-checked (the spec requires a
-    /// bounded body) and produce no status.
+    /// damaged child) gets none. A Cluster, or a `Tags` read between
+    /// Clusters, is recorded at most once even if a back-then-forward seek
+    /// revisits it. The element id on a Cluster status is [`ids::CLUSTER`];
+    /// Cluster bodies declared with the unknown-size VINT can't be
+    /// CRC-checked (the spec requires a bounded body) and produce no
+    /// status. The statuses share the Cluster records' 32 MiB budget: past
+    /// it, no more are kept, though every packet still plays.
     ///
     /// Validation is informational: a mismatching CRC does **not** stop
     /// the demuxer from returning packets (the spec only says a reader
@@ -10461,7 +10537,7 @@ impl MkvDemuxer {
     /// masters in Segment order at open time, then each Cluster in the
     /// order the walk finished reading it.
     pub fn crc_status(&self) -> &[CrcStatus] {
-        &self.crc_status
+        &self.crc_log.statuses
     }
 
     /// `true` when this demuxer was constructed via [`open_resilient`] /
@@ -10733,7 +10809,7 @@ impl MkvDemuxer {
         };
         // Leading-children walk for the Timestamp (§5.1.3.1 — SHOULD be
         // the first child; tolerate CRC-32 / Position / PrevSize /
-        // SilentTracks in front, mirroring the Cues-less scan).
+        // SilentTracks / Void in front, mirroring the Cues-less scan).
         let limit = declared_end
             .unwrap_or(self.segment_data_end)
             .min(self.segment_data_end);
@@ -10747,7 +10823,7 @@ impl MkvDemuxer {
                     timestamp = recoverable(read_uint(&mut *self.input, c.size as usize))?;
                     break;
                 }
-                ids::CRC32 | ids::POSITION | ids::PREV_SIZE | ids::SILENT_TRACKS => {
+                ids::CRC32 | ids::POSITION | ids::PREV_SIZE | ids::SILENT_TRACKS | ids::VOID => {
                     if recoverable(skip(&mut *self.input, c.size))?.is_none() {
                         break;
                     }
@@ -12130,7 +12206,7 @@ impl MkvDemuxer {
         if is_unknown_size {
             return Ok(());
         }
-        if self.validated_cluster_starts.contains(&body_start) {
+        if self.crc_log.has(body_start) {
             return Ok(());
         }
         // A CRC-32 element is fixed at 4 bytes; any other size is
@@ -12166,12 +12242,12 @@ impl MkvDemuxer {
             return;
         }
         if let Some(c) = self.input.crc.take() {
-            self.validated_cluster_starts.insert(c.body_start);
-            self.crc_status.push(CrcStatus {
+            let status = CrcStatus {
                 element_id: ids::CLUSTER,
                 stored: c.stored,
                 computed: c.crc,
-            });
+            };
+            self.crc_log.record(&mut self.record_budget, c.body_start, status);
         }
     }
 
@@ -12349,8 +12425,9 @@ impl MkvDemuxer {
                         }
                         // §5.1.3.1 usage note: Timestamp SHOULD be first,
                         // or second after a CRC-32 — tolerate Position /
-                        // PrevSize / SilentTracks in front too.
-                        ids::CRC32 | ids::POSITION | ids::PREV_SIZE | ids::SILENT_TRACKS => {
+                        // PrevSize / SilentTracks in front too, and a Void,
+                        // which RFC 8794 §11.3.2 allows anywhere.
+                        ids::CRC32 | ids::POSITION | ids::PREV_SIZE | ids::SILENT_TRACKS | ids::VOID => {
                             if recoverable(skip(&mut *self.input, c.size))?.is_none() {
                                 break;
                             }
@@ -12637,7 +12714,7 @@ impl MkvDemuxer {
         // for Top-Level masters (RFC 9559 §6.2); informational.
         let crc = recoverable(validate_top_level_crc(&mut *self.input, ids::TAGS, body_start, end))?;
         if let Some(Some(status)) = crc {
-            self.crc_status.push(status);
+            self.crc_log.record(&mut self.record_budget, body_start, status);
         }
         let allowance = (MAX_TAGS_BYTES as usize).saturating_sub(self.tags_charge);
         let mut budget = Budget::new(allowance, TAGS_OVER_BUDGET);
@@ -12659,16 +12736,16 @@ impl MkvDemuxer {
             &mut new_entries,
             &mut new_typed,
         );
-        // §23.2 reset: drop exactly the entries the previous Tags element
-        // contributed (one occurrence each, so an identical Info-derived
-        // pair survives), then append the new ones.
-        for old_entry in self.tag_metadata_entries.drain(..) {
-            if let Some(pos) = self.metadata.iter().position(|e| *e == old_entry) {
-                self.metadata.remove(pos);
-            }
-        }
-        self.metadata.extend(new_entries.iter().cloned());
-        self.tag_metadata_entries = new_entries;
+        // §23.2 reset: the previous Tags element's entries are the last
+        // `tag_metadata_len` ones, so they go in one cut and an identical
+        // Info-derived pair before them survives. The room they held is
+        // freed before their charge is released below, then the new
+        // entries are moved in.
+        let kept = self.metadata.len() - self.tag_metadata_len;
+        self.metadata.truncate(kept);
+        self.metadata.shrink_to(kept + new_entries.len());
+        self.tag_metadata_len = new_entries.len();
+        self.metadata.extend(new_entries);
         self.tags = new_typed;
         self.tags_charge = allowance - budget.left();
         Ok(())
@@ -12685,10 +12762,17 @@ impl MkvDemuxer {
                 let e = read_element_header(&mut *self.input)?;
                 // RFC 9559 allows the unknown size on a Segment and a
                 // Cluster alone. Any other element without a declared end
-                // has none to skip to: it is damage, and the walk
-                // resynchronises on the next Top-Level element.
-                if e.size == VINT_UNKNOWN_SIZE && e.id != ids::CLUSTER {
-                    return Err(unknown_size_master());
+                // has none to skip to, and one whose end runs past the
+                // Segment would be skipped past the Clusters after it: each
+                // is damage, and the walk resynchronises on the next
+                // Top-Level element.
+                if e.id != ids::CLUSTER {
+                    if e.size == VINT_UNKNOWN_SIZE {
+                        return Err(unknown_size_master());
+                    }
+                    if self.input.stream_position()?.saturating_add(e.size) > self.segment_data_end {
+                        return Err(Error::invalid(format!("MKV: Top-Level element 0x{:X} runs past its Segment", e.id)));
+                    }
                 }
                 match e.id {
                     ids::CLUSTER => {

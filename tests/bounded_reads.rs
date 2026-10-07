@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use oxideav_core::{Demuxer, Error, NullCodecResolver, ReadSeek};
-use oxideav_mkv::demux::{self, CrcStatus, MkvDemuxer};
+use oxideav_mkv::demux::{self, CrcStatus, DamageKind, MkvDemuxer};
 use oxideav_mkv::ebml::{crc32_ieee, write_element_id, write_vint};
 use oxideav_mkv::ids;
 
@@ -373,25 +373,30 @@ fn duplicate_block_addition_ids_are_dropped_in_linear_time() {
     );
 }
 
-/// The first packet of `input`, or `None` when the open is invalid data.
-fn opened(input: Box<dyn ReadSeek>, resilient: bool) -> Option<Vec<u8>> {
+/// The damage the open of `input` noted and its first packet, or `None`
+/// when the open is invalid data.
+fn opened(input: Box<dyn ReadSeek>, resilient: bool) -> Option<(Vec<DamageKind>, Vec<u8>)> {
     let opened = if resilient {
         demux::open_resilient_typed(input, &NullCodecResolver)
     } else {
         demux::open_typed(input, &NullCodecResolver)
     };
     match opened {
-        Ok(mut d) => Some(d.next_packet().unwrap().data),
+        Ok(mut d) => {
+            let damage = d.damage_events().iter().map(|e| e.kind()).collect();
+            Some((damage, d.next_packet().unwrap().data))
+        }
         Err(Error::InvalidData(_)) => None,
         Err(e) => panic!("unexpected error: {e}"),
     }
 }
 
 /// A master larger than its budget is refused before it is read, even for
-/// its CRC-32: a SeekHead is skipped like a third one, a Tracks master is
-/// invalid data like contents over their budgets, and a Tags master,
-/// optional, is dropped as damage in either open, as a followed or trailing
-/// one is passed over. A master within its budget is still checked.
+/// its CRC-32: a Tracks master is invalid data like contents over their
+/// budgets, and an optional SeekHead or Tags master is dropped by either
+/// open with one damage event, in line or followed through the SeekHead,
+/// as a trailing one is passed over. A master within its budget is still
+/// checked.
 #[test]
 fn masters_over_their_budget_are_refused_unread() {
     let _serial = serial();
@@ -409,25 +414,26 @@ fn masters_over_their_budget_are_refused_unread() {
     };
     let first = cluster(0, &[simple(1, 0, b"a")]);
     let entry = track(1, 0x11, "S_TEXT/UTF8", &[]);
-    let a = Some(b"a".to_vec());
+    // Packet "a" after one damage event for the master `id`.
+    let a = |id: u32| Some((vec![DamageKind::DamagedMaster(id)], b"a".to_vec()));
     let mut failures = Vec::new();
-    let mut check = |case: &str, bytes: Vec<u8>, resilient: bool, expected: Option<Vec<u8>>| {
+    let mut check = |case: &str, bytes: Vec<u8>, resilient: bool, expected: Option<(Vec<DamageKind>, Vec<u8>)>| {
         let (outcome, read, _) = measure(bytes, |input| opened(input, resilient));
         if outcome != expected || read >= SMALL {
-            failures.push(format!("{case}: first packet {outcome:?} after reading {read} bytes"));
+            failures.push(format!("{case}, resilient {resilient}: damage and first packet {outcome:?} after reading {read} bytes"));
         }
     };
-    check("SeekHead", file(&[padded(ids::SEEK_HEAD, &[]), subtitle_tracks(), first.clone()]), false, a.clone());
-    for resilient in [false, true] {
-        let tags = file(&[subtitle_tracks(), padded(ids::TAGS, &[]), first.clone()]);
-        check(&format!("Tags, resilient {resilient}"), tags, resilient, a.clone());
-        let tracks = file(&[padded(ids::TRACKS, &entry), first.clone()]);
-        check(&format!("Tracks, resilient {resilient}"), tracks, resilient, None);
-    }
     let tracks = subtitle_tracks();
     let at = (index(ids::TAGS, 0).len() + tracks.len() + first.len()) as u64;
-    let followed = file(&[index(ids::TAGS, at), tracks, first.clone(), padded(ids::TAGS, &[])]);
-    check("Tags followed", followed, false, a.clone());
+    for resilient in [false, true] {
+        check("SeekHead", file(&[padded(ids::SEEK_HEAD, &[]), subtitle_tracks(), first.clone()]), resilient, a(ids::SEEK_HEAD));
+        let tags = file(&[subtitle_tracks(), padded(ids::TAGS, &[]), first.clone()]);
+        check("Tags", tags, resilient, a(ids::TAGS));
+        let tracks_over = file(&[padded(ids::TRACKS, &entry), first.clone()]);
+        check("Tracks", tracks_over, resilient, None);
+        let followed = file(&[index(ids::TAGS, at), tracks.clone(), first.clone(), padded(ids::TAGS, &[])]);
+        check("Tags followed", followed, resilient, a(ids::TAGS));
+    }
     let trailing = file(&[subtitle_tracks(), first.clone(), padded(ids::TAGS, &[])]);
     let (packets, read, _) = measure(trailing, drain);
     if packets != [b"a".to_vec()] || read >= SMALL {
@@ -550,4 +556,29 @@ fn silent_tracks_share_the_cluster_record_budget() {
         "played {played}, kept {kept:?}, {} damage events, lists {lists} bytes, held {held} heap bytes",
         d.damage_events().len()
     );
+}
+
+/// An 8 MiB AV1 frame of four million empty frame OBUs is read for its key
+/// frame flag without listing them: the packet costs no more than its
+/// Block budget, with or without a sequence header in the CodecPrivate.
+#[test]
+fn an_av1_frame_of_empty_obus_is_read_within_its_block_budget() {
+    let _serial = serial();
+    let frame = [0x32u8, 0x00].repeat(4 << 20);
+    let mut failures = Vec::new();
+    // An `av1C` record whose configOBUs hold a sequence header.
+    let config = elem(ids::CODEC_PRIVATE, &[0x81, 0, 0, 0, 0x0a, 0x01, 0x00]);
+    for (case, private) in [("with a sequence header", config), ("without one", vec![])] {
+        let tracks = elem(ids::TRACKS, &track(1, 1, "V_AV1", &private));
+        let bytes = file(&[tracks, cluster(0, &[simple(1, 0, &frame)])]);
+        let mut d = demux::open_typed(Box::new(Cursor::new(bytes)), &NullCodecResolver).unwrap();
+        let base = LIVE.load(Ordering::SeqCst);
+        PEAK.store(base, Ordering::SeqCst);
+        let packet = d.next_packet().map(|p| p.data.len()).map_err(|e| format!("{e}"));
+        let peak = PEAK.load(Ordering::SeqCst) - base;
+        if packet != Ok(frame.len()) || peak >= 32 << 20 {
+            failures.push(format!("{case}: packet {packet:?}, peak {peak} heap bytes"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

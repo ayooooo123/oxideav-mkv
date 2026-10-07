@@ -346,28 +346,33 @@ fn av1_config_sequence_header(extradata: &[u8]) -> Option<bool> {
 
 /// av1_parser.c over a temporal unit: the key frame flag and picture type
 /// of the last frame it shows (spatial layer 0); `(-1, None)` when it
-/// shows none or can't be read.
-fn av1_temporal_unit(mut data: &[u8], seq: &mut Option<bool>) -> (i8, PictType) {
-    let mut frames = Vec::new();
-    while !data.is_empty() {
-        let Some(((obu_type, spatial_id, payload), rest)) = av1_obu(data) else {
+/// shows none or can't be read. Two passes over the OBUs, holding none of
+/// them: the first checks they all parse and takes the last sequence
+/// header, the second reads the frame headers against it.
+fn av1_temporal_unit(data: &[u8], seq: &mut Option<bool>) -> (i8, PictType) {
+    let mut obus = data;
+    while !obus.is_empty() {
+        let Some(((obu_type, _, payload), rest)) = av1_obu(obus) else {
             return (-1, PictType::None);
         };
-        match obu_type {
-            AV1_OBU_SEQUENCE_HEADER => match payload.first() {
+        if obu_type == AV1_OBU_SEQUENCE_HEADER {
+            match payload.first() {
                 Some(b) => *seq = Some(b & 0x08 != 0),
                 None => return (-1, PictType::None),
-            },
-            AV1_OBU_FRAME_HEADER | AV1_OBU_FRAME if spatial_id == 0 => frames.push(payload),
-            _ => {}
+            }
         }
-        data = rest;
+        obus = rest;
     }
     let Some(reduced_still_picture_header) = *seq else {
         return (-1, PictType::None);
     };
     let (mut key_frame, mut pict_type) = (-1, PictType::None);
-    for header in frames {
+    let mut obus = data;
+    while let Some(((obu_type, spatial_id, header), rest)) = av1_obu(obus) {
+        obus = rest;
+        if !matches!(obu_type, AV1_OBU_FRAME_HEADER | AV1_OBU_FRAME) || spatial_id != 0 {
+            continue;
+        }
         // §5.9.2 uncompressed_header(): a reduced still picture is a shown
         // key frame; otherwise show_existing_frame, frame_type and
         // show_frame lead the header.

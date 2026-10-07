@@ -1,6 +1,7 @@
 //! What the demuxer keeps for each Cluster it walks stays within a fixed
-//! budget however many Clusters a file holds: past the budget no new
-//! Cluster record is kept, while playback and seeking go on.
+//! budget however many Clusters a file holds, CRC-32 statuses included:
+//! past the budget no new Cluster record or status is kept, while playback
+//! and seeking go on. A master read again keeps one status.
 //!
 //! The heap is measured by a counting global allocator. The test holds one
 //! lock, so nothing else allocates while it measures.
@@ -121,4 +122,70 @@ fn cluster_records_stop_at_their_budget() {
             && near == Some((1000, 100u32.to_be_bytes().to_vec())),
         "played {played} in order {in_order}, held {held} heap bytes, {recorded} records, far {far:?}, near {near:?}"
     );
+}
+
+/// A Cluster at `tc` led by a CRC-32 child, holding one keyframe packet.
+/// The stored CRC-32 is zero: the status records the mismatch, which does
+/// not stop playback.
+fn crc_cluster(tc: u64, payload: &[u8]) -> Vec<u8> {
+    let block = elem(ids::SIMPLE_BLOCK, &[&[0x81, 0, 0, 0x80][..], payload].concat());
+    elem(ids::CLUSTER, &[elem(ids::CRC32, &[0; 4]), uint(ids::TIMECODE, tc), block].concat())
+}
+
+/// CRC-32-led Clusters in the file below: their statuses and the set
+/// finding them would hold about 22 MB beyond the Cluster records.
+const CRC_CLUSTERS: u32 = 600_000;
+
+/// The CRC-32 statuses kept for Clusters, and the set that records which
+/// Clusters have one, share the Cluster-record budget: past it no status
+/// is kept, while every packet still plays in order.
+#[test]
+fn cluster_crc_statuses_share_the_cluster_record_budget() {
+    let _serial = serial();
+    let mut segment = vec![tracks()];
+    segment.extend((0..CRC_CLUSTERS).map(|i| crc_cluster(u64::from(i) * 10, &i.to_be_bytes())));
+    let bytes = file(&segment);
+    drop(segment);
+    let base = LIVE.load(Ordering::SeqCst);
+    let mut d = demux::open_typed(Box::new(Cursor::new(bytes)), &NullCodecResolver).unwrap();
+    let mut played = 0u32;
+    let mut in_order = true;
+    loop {
+        match d.next_packet() {
+            Ok(p) => {
+                in_order &= p.data == played.to_be_bytes();
+                played += 1;
+            }
+            Err(Error::Eof) => break,
+            Err(e) => panic!("unexpected error after {played} packets: {e}"),
+        }
+    }
+    let held = LIVE.load(Ordering::SeqCst).saturating_sub(base);
+    let statuses = d.crc_status().len();
+    assert!(
+        played == CRC_CLUSTERS && in_order && held < (32 << 20) + (1 << 20) && statuses > 0 && statuses < CRC_CLUSTERS as usize,
+        "played {played} in order {in_order}, held {held} heap bytes, {statuses} CRC-32 statuses"
+    );
+}
+
+/// A Tags master between Clusters is read again on every pass over it, but
+/// its CRC-32 status is kept once.
+#[test]
+fn a_tags_crc_status_is_kept_once_however_often_it_is_read() {
+    let _serial = serial();
+    let tag = elem(ids::TAG, &elem(ids::SIMPLE_TAG, &[elem(ids::TAG_NAME, b"T"), elem(ids::TAG_STRING, b"v")].concat()));
+    let tags = elem(ids::TAGS, &[elem(ids::CRC32, &[0; 4]), tag].concat());
+    let bytes = file(&[tracks(), cluster(0, b"a"), tags, cluster(1000, b"b")]);
+    let mut d = demux::open_typed(Box::new(Cursor::new(bytes)), &NullCodecResolver).unwrap();
+    let mut passes = 0;
+    for _ in 0..1000 {
+        let mut packets = Vec::new();
+        while let Ok(p) = d.next_packet() {
+            packets.push(p.data);
+        }
+        passes += usize::from(packets == [b"a".to_vec(), b"b".to_vec()]);
+        d.seek_to(0, 0).unwrap();
+    }
+    let kept = d.crc_status().iter().filter(|s| s.element_id == ids::TAGS).count();
+    assert!(passes == 1000 && kept == 1, "{passes} full passes, {kept} Tags CRC-32 statuses");
 }

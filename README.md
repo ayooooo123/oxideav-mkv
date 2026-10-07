@@ -87,13 +87,17 @@ time. The 512 KiB startup byte threshold also counts this state; the
 bounded current/deferred Block and temporary expansion remain additional
 working memory. The Cluster records share one 32 MiB budget for the life
 of the demuxer: the records themselves and the index finding them by
-offset, and the `EncryptedBlock`s and `SilentTrackNumber`s they keep. It
-counts every list and the set of elements already recorded, each charged
-before it is allocated, and an element revisited by a seek is not recorded
-again. A block or `SilentTracks` past the budget is InvalidData, and the
-walk resumes at the next Cluster. A Cluster opened once the budget cannot
-hold its record gets none; playback and seeks go on, since neither reads
-the records. At most 4096 `DamageEvent`s are kept, the first in order, and
+offset, the `EncryptedBlock`s and `SilentTrackNumber`s they keep, and the
+CRC-32 statuses with the set of masters that have one. It counts every
+list and the set of elements already recorded, each charged before it is
+allocated, and an element revisited by a seek is not recorded again, nor
+is a master's CRC-32 status. A block or `SilentTracks` past the budget is
+InvalidData, and the walk resumes at the next Cluster. A Cluster opened
+once the budget cannot hold its record gets none, and past it no CRC-32
+status is kept; playback and seeks go on, since neither reads them. A
+Cluster may start with a `Void` (RFC 8794 §11.3.2 allows one anywhere):
+recovery and the Cluster scans accept one. At most 4096 `DamageEvent`s are
+kept, the first in order, and
 `dropped_damage_events()` counts each one past that exactly. Source I/O
 failures propagate, including source-generated UnexpectedEof and failures
 met reading trailing Tags, Cluster `CRC-32`s or seek landings; only parser
@@ -116,14 +120,21 @@ included. A strict open fails when a scan ends without a Top-Level
 element, its budget spent or the Segment over; a resilient one drops the
 rest of the Segment. Every element in a `Tracks`, `Tags`, `Chapters`,
 `Cues` or `SeekHead` tree must fit its parent, as in `Info`; in
-`Attachments`, an `AttachedFile` ends with its parent at the latest and
-its fields must fit it. RFC 9559 allows the unknown size on a Segment and a
-Cluster alone, so any other Top-Level element of unknown size is damage,
-and so is one whose declared end runs past its Segment: the walk rescans
-from the end of its header, within the same budget. Between Clusters such
-an element is damage in the Cluster stream, so the walk resumes at the
-next Cluster; a SeekHead target of unknown size is ignored unread, and a
-target whose parse finds damage is noted as a damaged master. In `Info`,
+`Attachments`, an `AttachedFile` ends with its parent at the latest, its
+fields must fit it, and neither it nor its `FileData` may have the unknown
+size. In the EBML header, every child must fit the header, and its
+`DocType` and `DocTypeExtension` records keep at most 16 MiB together,
+FFmpeg's limit for one EBML string; past either, both opens fail. RFC 9559
+allows the unknown size on a Segment and a Cluster alone, so any other
+Top-Level element of unknown size is damage, and so is one whose declared
+end runs past its Segment: the walk rescans from the end of its header,
+within the same budget. Between Clusters such an element is damage in the
+Cluster stream, so the walk resumes at the next Cluster; a SeekHead target
+of unknown size is ignored unread. A target whose parse finds damage, or a
+master larger than its budget, in line or found through the SeekHead, is
+noted as a damaged master; a `Tags` or `SeekHead` found through the
+SeekHead keeps its complete records before the damage, as one in line
+does. In `Info`,
 `SegmentUUID`, `PrevUUID` and `NextUUID` must be
 16 octets, each text field holds at most 64 KiB, and the `Info` masters
 keep at most 1 MiB together. `Chapters` and `Attachments` text fields hold
@@ -142,10 +153,13 @@ per-stream views, tag resolution with its flat entries, and working room
 for parsing a codec configuration. The per-stream views take the parsed
 data instead of copying it, and a stream's extradata takes its
 CodecPrivate bytes; a compressed CodecPrivate is decompressed only as far
-as its budget allows. An `Info` or `Tracks` master past its budget is
+as its budget allows, and its stored form gives its room back once the
+decoded form replaces it. An `Info` or `Tracks` master past its budget is
 InvalidData: a strict open fails and a resilient open skips it. A `Tags`
 master past its budget is dropped, or cut to the Tags that fit. A
-mid-stream `Tags` may use what the current tag state leaves of the 32 MiB.
+mid-stream `Tags` may use what the current tag state leaves of the 32 MiB;
+it replaces the previous Tags' flat entries in one cut, freeing their room
+before their charge is released.
 `Chapters` and `Attachments` past theirs keep the chapters or attachments
 that fit, in order and with their flat entries. A chapter cut short, by its
 budget or by damage, is kept only when it holds kept chapters of its own.

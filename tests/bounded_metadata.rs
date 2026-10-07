@@ -337,19 +337,52 @@ fn attachments_named(name: &[u8]) -> Vec<u8> {
     elem(ids::ATTACHMENTS, &attached_file(1, name, b"d"))
 }
 
+/// What an open keeps of one text field: its length, the damage noted and
+/// the first packet.
+type KeptText = (Option<usize>, Vec<DamageKind>, Vec<u8>);
+
+/// Builds a master holding the text it is given.
+type TextMaster = fn(&[u8]) -> Vec<u8>;
+
+/// The length of the one chapter title or attachment file name an open of
+/// `bytes` keeps, the damage it noted and its first packet.
+fn kept_text(bytes: Vec<u8>, resilient: bool) -> Result<KeptText, String> {
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut d = if resilient {
+        demux::open_resilient_typed(input, &NullCodecResolver)
+    } else {
+        demux::open_typed(input, &NullCodecResolver)
+    }.map_err(kind)?;
+    let title = d.chapters().first().and_then(|e| e.chapters.first()).and_then(|c| c.displays.first()).map(|t| t.string.len());
+    let text = title.or_else(|| d.attachments().first().map(|a| a.filename.len()));
+    let damage = d.damage_events().iter().map(|e| e.kind()).collect();
+    Ok((text, damage, d.next_packet().map(|p| p.data).map_err(kind)?))
+}
+
 /// A Chapters or Attachments text field holds at most 64 KiB, checked
 /// before it is read. A longer one is damage: the chapter or attachment is
-/// dropped and the open goes on, strict or resilient.
+/// dropped with one damage event, even where the master's 1 MiB budget
+/// would hold it, and the open goes on, strict or resilient.
 #[test]
 fn chapter_and_attachment_text_fields_hold_64_kib() {
     let _serial = serial();
     let mut cases = Cases::default();
     let with = |master: Vec<u8>| file(&[tracks(), master, cluster(0, b"a")]);
-    for (field, master) in [("ChapString", chapters_titled as fn(&[u8]) -> Vec<u8>), ("FileName", attachments_named)] {
-        cases.check(&format!("64 KiB {field}"), with(master(&vec![b'x'; 64 << 10])), false, Ok(b"a"));
+    let builders: [(&str, u32, TextMaster); 2] =
+        [("ChapString", ids::CHAPTERS, chapters_titled), ("FileName", ids::ATTACHMENTS, attachments_named)];
+    for (field, id, master) in builders {
+        let at_limit = with(master(&vec![b'x'; 64 << 10]));
         let over = with(master(&vec![b'x'; (64 << 10) + 1]));
-        cases.check(&format!("64 KiB + 1 {field}"), over.clone(), false, Ok(b"a"));
-        cases.check(&format!("64 KiB + 1 {field}, resilient"), over, true, Ok(b"a"));
+        for resilient in [false, true] {
+            let kept = kept_text(at_limit.clone(), resilient);
+            if kept != Ok((Some(64 << 10), vec![], b"a".to_vec())) {
+                cases.0.push(format!("64 KiB {field}, resilient {resilient}: {kept:?}"));
+            }
+            let dropped = kept_text(over.clone(), resilient);
+            if dropped != Ok((None, vec![DamageKind::DamagedMaster(id)], b"a".to_vec())) {
+                cases.0.push(format!("64 KiB + 1 {field}, resilient {resilient}: {dropped:?}"));
+            }
+        }
         cases.check(&format!("48 MiB {field}"), with(master(&vec![b'x'; BIG])), false, Ok(b"a"));
     }
     // A 48 MiB payload stays on disk at open and is read on request.
@@ -895,6 +928,208 @@ fn an_optional_master_past_its_segment_does_not_hide_the_clusters() {
                 failures.push(format!("{name}, resilient {resilient}: {got:?}"));
             }
         }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The four optional masters of the Segment-end tests: name, ID and the ID
+/// of a child each may hold.
+const OPTIONAL: [(&str, u32, u32); 4] = [
+    ("Cues", ids::CUES, ids::CUE_POINT),
+    ("Chapters", ids::CHAPTERS, ids::EDITION_ENTRY),
+    ("Attachments", ids::ATTACHMENTS, ids::ATTACHED_FILE),
+    ("Tags", ids::TAGS, ids::TAG),
+];
+
+/// Between Clusters too, an optional master whose declared end runs past
+/// its Segment is damage: the walk resynchronises on the next Cluster
+/// instead of skipping past the end of the Segment.
+#[test]
+fn an_optional_master_past_its_segment_between_clusters_is_damage() {
+    let _serial = serial();
+    let mut failures = Vec::new();
+    for (name, id, child) in OPTIONAL {
+        let master = [header(id, 4096), header(child, 8192)].concat();
+        let bytes = file(&[tracks(), cluster(0, b"a"), master, cluster(1000, b"b")]);
+        for resilient in [false, true] {
+            let got = played(bytes.clone(), resilient).map(|got| (got.packets, got.damage.len()));
+            if got != Ok((vec![b"a".to_vec(), b"b".to_vec()], 1)) {
+                failures.push(format!("{name}, resilient {resilient}: {got:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A Cluster `tc` whose first child is a Void, holding packet `payload`.
+fn void_led_cluster(tc: u64, payload: &[u8]) -> Vec<u8> {
+    let block = elem(ids::SIMPLE_BLOCK, &[&[0x81, 0, 0, 0x80][..], payload].concat());
+    elem(ids::CLUSTER, &[void(2), uint(ids::TIMECODE, tc), block].concat())
+}
+
+/// RFC 8794 §11.3.2 allows a Void anywhere, so a Cluster may start with
+/// one: recovery past junk and a seek by scanning the Clusters still find
+/// it.
+#[test]
+fn a_cluster_led_by_a_void_is_found_by_recovery_and_seeks() {
+    let _serial = serial();
+    let mut failures = Vec::new();
+    let recovered = file(&[tracks(), vec![0; 1000], void_led_cluster(0, b"a"), cluster(1000, b"b")]);
+    for resilient in [false, true] {
+        let got = played(recovered.clone(), resilient).map(|got| (got.packets, got.damage));
+        if got != Ok((vec![b"a".to_vec(), b"b".to_vec()], vec![DamageKind::GarbageData])) {
+            failures.push(format!("junk, then a Void-led Cluster, resilient {resilient}: {got:?}"));
+        }
+    }
+    // No Cues: a seek to 500 ms scans the Clusters and lands on the first.
+    let seeking = file(&[tracks(), void_led_cluster(0, b"a"), cluster(1000, b"b")]);
+    let mut d = demux::open_typed(Box::new(Cursor::new(seeking)), &NullCodecResolver).unwrap();
+    let landed = seek_and_read(&mut d, 0, 500);
+    if landed != Ok((0, b"a".to_vec())) {
+        failures.push(format!("seek to 500 ms: {landed:?}"));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A one-Seek SeekHead pointing at `id` at Segment Position `position`.
+fn seek(id: u32, position: u64) -> Vec<u8> {
+    elem(ids::SEEK, &[elem(ids::SEEK_ID, &write_element_id(id)), uint(ids::SEEK_POSITION, position)].concat())
+}
+
+/// What an open keeps straight away: how many Tags, the damage it noted and
+/// the first packet.
+fn tags_kept(bytes: Vec<u8>, resilient: bool) -> Result<(usize, Vec<DamageKind>, Vec<u8>), String> {
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut d = if resilient {
+        demux::open_resilient_typed(input, &NullCodecResolver)
+    } else {
+        demux::open_typed(input, &NullCodecResolver)
+    }.map_err(kind)?;
+    let tags = d.tags().len();
+    let damage = d.damage_events().iter().map(|e| e.kind()).collect();
+    Ok((tags, damage, d.next_packet().map(|p| p.data).map_err(kind)?))
+}
+
+/// A Tags master or a SeekHead found through the SeekHead keeps the
+/// complete records before its damage, as one in line does, and a Seek
+/// kept that way is still followed.
+#[test]
+fn seekhead_followed_tags_and_seekheads_keep_their_complete_records() {
+    let _serial = serial();
+    let mut failures = Vec::new();
+    let (t, c) = (tracks(), cluster(0, b"a"));
+    let tag = |value: Vec<u8>| elem(ids::TAG, &elem(ids::SIMPLE_TAG, &[elem(ids::TAG_NAME, b"T"), value].concat()));
+    let good = tag(elem(ids::TAG_STRING, b"v"));
+    // A complete Tag, then one whose TagString runs past its SimpleTag.
+    let damaged = elem(ids::TAGS, &[good.clone(), tag(header(ids::TAG_STRING, 1 << 20))].concat());
+    let tags_at = (index(ids::TAGS, 0).len() + t.len() + c.len()) as u64;
+    // A second SeekHead whose first Seek leads to the Tags after it and
+    // whose second Seek's SeekPosition runs past it.
+    let first_len = index(ids::SEEK_HEAD, 0).len();
+    let second_at = (first_len + t.len() + c.len()) as u64;
+    let second_len = elem(ids::SEEK_HEAD, &[seek(ids::TAGS, 0), elem(ids::SEEK, &header(ids::SEEK_POSITION, 1 << 20))].concat()).len();
+    let second = elem(ids::SEEK_HEAD, &[
+        seek(ids::TAGS, second_at + second_len as u64),
+        elem(ids::SEEK, &header(ids::SEEK_POSITION, 1 << 20)),
+    ].concat());
+    let layouts = [
+        ("Tags in line", file(&[t.clone(), damaged.clone(), c.clone()]), ids::TAGS),
+        ("Tags followed", file(&[index(ids::TAGS, tags_at), t.clone(), c.clone(), damaged]), ids::TAGS),
+        (
+            "SeekHead followed",
+            file(&[index(ids::SEEK_HEAD, second_at), t, c, second, elem(ids::TAGS, &good)]),
+            ids::SEEK_HEAD,
+        ),
+    ];
+    for (layout, bytes, id) in layouts {
+        for resilient in [false, true] {
+            let got = tags_kept(bytes.clone(), resilient);
+            if got != Ok((1, vec![DamageKind::DamagedMaster(id)], b"a".to_vec())) {
+                failures.push(format!("{layout}, resilient {resilient}: {got:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Only a Segment or a Cluster may leave its size open: an AttachedFile or
+/// a FileData of unknown size is damage, so the Attachments keep the
+/// attachments before it and the open goes on.
+#[test]
+fn unknown_size_attached_files_and_payloads_are_damage() {
+    let _serial = serial();
+    let mut failures = Vec::new();
+    let valid = attached_file(1, b"one.ttf", b"d");
+    let unsized_file = [unknown_size(ids::ATTACHED_FILE), elem(ids::FILE_NAME, b"two.ttf"), uint(ids::FILE_UID, 2)].concat();
+    let unsized_data = elem(ids::ATTACHED_FILE, &[
+        elem(ids::FILE_NAME, b"two.ttf"), uint(ids::FILE_UID, 2), unknown_size(ids::FILE_DATA), b"dd".to_vec(),
+    ].concat());
+    for (case, broken) in [("AttachedFile", unsized_file), ("FileData", unsized_data)] {
+        let bytes = file(&[tracks(), elem(ids::ATTACHMENTS, &[valid.clone(), broken].concat()), cluster(0, b"a")]);
+        for resilient in [false, true] {
+            let got = played(bytes.clone(), resilient).map(|got| (got.packets, got.attachments, got.damage));
+            let expected = (vec![b"a".to_vec()], vec![(1, 1)], vec![DamageKind::DamagedMaster(ids::ATTACHMENTS)]);
+            if got.as_ref() != Ok(&expected) {
+                failures.push(format!("{case} of unknown size, resilient {resilient}: {got:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The EBML header keeps its strings and DocTypeExtensions within 16 MiB,
+/// FFmpeg's limit for one EBML string, and each of its children must fit
+/// its parent: past either, both opens fail after a bounded read, holding
+/// little. An ordinary header keeps its extension.
+#[test]
+fn the_ebml_header_keeps_its_strings_and_extensions_within_16_mib() {
+    let _serial = serial();
+    let mut failures = Vec::new();
+    // The Segment carries 2 MiB of Void, so a header child running past
+    // its parent has bytes to read.
+    let with_header = |children: Vec<u8>| {
+        let mut out = elem(ids::EBML_HEADER, &children);
+        let segment = [tracks(), cluster(0, b"a"), void(2 << 20)].concat();
+        out.extend(header(ids::SEGMENT, segment.len()));
+        out.extend(segment);
+        out
+    };
+    let doc_type = elem(ids::EBML_DOC_TYPE, b"matroska");
+    let extension = |name: &[u8]| {
+        elem(ids::DOC_TYPE_EXTENSION, &[elem(ids::DOC_TYPE_EXTENSION_NAME, name), uint(ids::DOC_TYPE_EXTENSION_VERSION, 1)].concat())
+    };
+    let padded = elem(ids::EBML_DOC_TYPE, &[&b"matroska"[..], &vec![0; BIG]].concat());
+    let long_name = [doc_type.clone(), extension(&vec![b'x'; BIG])].concat();
+    // A million extensions of one-octet names: 11 MB on disk.
+    let many = [doc_type.clone(), extension(b"x").repeat(1_000_000)].concat();
+    // A DocType declaring 1 MiB in a header that holds its first 8 octets.
+    let short = [header(ids::EBML_DOC_TYPE, 1 << 20), b"matroska".to_vec()].concat();
+    // Each case with the most the open may read: what is refused is not
+    // read at all, and of the million extensions (18 MB on disk) only those
+    // read before their budget runs out, about a quarter.
+    let unread = 64 << 10;
+    let cases = [
+        ("a 48 MiB padded DocType", padded, unread),
+        ("a 48 MiB extension name", long_name, unread),
+        ("a million extensions", many, 8 << 20),
+        ("a DocType past its header", short, unread),
+    ];
+    for (case, children, bound) in cases {
+        let bytes = with_header(children);
+        for resilient in [false, true] {
+            let (outcome, read, peak) = measure(bytes.clone(), |input| first(input, resilient));
+            if outcome != Err("InvalidData".to_string()) || read >= bound || peak >= (16 << 20) + (1 << 20) {
+                failures.push(format!("{case}, resilient {resilient}: {outcome:?} after reading {read} bytes, peak {peak} heap bytes"));
+            }
+        }
+    }
+    let ordinary = with_header([doc_type, extension(b"ext")].concat());
+    let opened = demux::open_typed(Box::new(Cursor::new(ordinary)), &NullCodecResolver).map_err(kind);
+    let extensions = opened.map(|d| {
+        d.ebml_header().doc_type_extensions.iter().map(|e| (e.name.clone(), e.version)).collect::<Vec<_>>()
+    });
+    if extensions != Ok(vec![("ext".to_string(), 1)]) {
+        failures.push(format!("an ordinary header: {extensions:?}"));
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
