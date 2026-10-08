@@ -13225,12 +13225,17 @@ impl MkvDemuxer {
         let own_trim = trims.and_then(|t| t.padding(meta.as_ref().and_then(|m| m.discard_padding())));
         let mut pending = self.start_trims[si];
         let n_frames = sizes.len().max(1) as i128;
-        // FFmpeg 9 computes the whole Block duration in segment ticks first,
-        // then distributes the integer remainder between laces.
+        // FFmpeg 2da55bf (libavformat/matroskadec.c 4383–4386) computes the
+        // whole Block's duration first: `av_rescale_q(default_duration *
+        // laces, 1/1000000000, st->time_base)`, rounded to the nearest tick
+        // of the stream's time base, which includes the TrackTimestampScale.
+        // The laces then share it, the integer remainder distributed
+        // between them (4392–4393).
         let block_duration = explicit_duration.filter(|&d| d > 0)
             .map(i128::from)
-            .or_else(|| self.track_timing[si].default_duration.map(|ns| {
-                ns as i128 * n_frames / self.timecode_scale_ns as i128
+            .or_else(|| self.track_timing[si].default_duration.and_then(|ns| {
+                let tb = time_base.as_rational();
+                timing::rescale_near(i128::from(ns) * n_frames, tb.den.into(), i128::from(tb.num) * 1_000_000_000)
             })).unwrap_or(0);
         let mut frame_at = body_start + data_start;
         for (lace, &size) in sizes.iter().enumerate() {

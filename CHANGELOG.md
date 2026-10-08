@@ -158,8 +158,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before it, and a seek past the last `CueTime` kept for its track, or on
   a track with none kept, scans the Clusters from the first one.
 - Laces advance by their per-frame durations rather than repeating the
-  first timestamp. BlockDuration and DefaultDuration use FFmpeg 9's integer
-  remainder distribution; duration-less Vorbis, Opus, FLAC, WavPack, MP3,
+  first timestamp. BlockDuration and DefaultDuration use FFmpeg's integer
+  remainder distribution; a Block's DefaultDuration rounds to the nearest
+  tick of the track's time base, TrackTimestampScale included, as FFmpeg
+  2da55bf does (`matroskadec.c` 4383–4386); duration-less Vorbis, Opus, FLAC, WavPack, MP3,
   AC-3/E-AC-3 and 16-bit DTS core frames use codec header durations.
   AAC/HE-AAC use the core frame size/rate with stable rational accumulation,
   including FFmpeg 9's absent first duration and repeated second-lace PTS.
