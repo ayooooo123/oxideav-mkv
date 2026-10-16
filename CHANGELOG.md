@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `A_PCM/*` tracks take their codec id from the track's `BitDepth`, as
+  FFmpeg's demuxer does: 8-bit is `pcm_u8`, 24- and 32-bit integer PCM is
+  `pcm_s24*`/`pcm_s32*` in the track's byte order, and 64-bit float is
+  `pcm_f64le`. Other depths, or none, keep `pcm_s16*`/`pcm_f32le`. The
+  codec registry no longer decides these ids, and 24-bit PCM no longer
+  decodes as 16-bit noise.
 - Demuxing is incremental: a file arriving over a network plays after its
   first kilobytes instead of after a Cluster — or, without Cues, the whole
   file — has been read.
