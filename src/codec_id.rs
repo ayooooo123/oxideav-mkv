@@ -66,14 +66,6 @@ pub fn pcm_from_matroska(s: &str, bit_depth: u64) -> Option<CodecId> {
     }))
 }
 
-/// Variant of [`from_matroska`] that takes `bit_depth` for `A_PCM/*` tracks.
-pub fn from_matroska_with_bit_depth(s: &str, codec_private: &[u8], bit_depth: u64) -> CodecId {
-    if let Some(id) = pcm_from_matroska(s, bit_depth) {
-        return id;
-    }
-    from_matroska(s, codec_private)
-}
-
 /// Best-effort mapping from a Matroska codec id string (e.g. `"A_FLAC"`) to
 /// the oxideav codec id we use internally.
 ///
