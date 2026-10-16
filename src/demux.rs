@@ -23,7 +23,7 @@ use oxideav_core::{
 };
 use oxideav_core::{Demuxer, ReadSeek};
 
-use crate::codec_id::from_matroska;
+use crate::codec_id::{from_matroska, pcm_from_matroska};
 use crate::ebml::{
     crc32_ieee, crc32_ieee_update, into_string, read_bytes, read_element_header, read_float,
     read_int, read_uint, read_vint, skip, VINT_UNKNOWN_SIZE,
@@ -663,55 +663,60 @@ fn open_typed_impl(
     for t in &mut tracks {
         let idx = streams.len() as u32;
         track_index_by_number.insert(t.number, idx);
-        // Ask the CodecResolver registry first (codec crates can claim
-        // Matroska CodecID strings). Fall back to the static `from_matroska`
-        // table when no crate owns this id — keeps PCM, legacy MS/VFW
-        // FourCC tracks, WebM-specific VP tags, etc. working unchanged.
-        let tag = CodecTag::matroska(t.codec_id_string.clone());
-        let mut ctx = ProbeContext::new(&tag);
-        if !t.codec_private.is_empty() {
-            ctx = ctx.header(&t.codec_private);
-        }
-        if t.bit_depth > 0 {
-            ctx = ctx.bits(t.bit_depth as u16);
-        }
-        if t.channels > 0 {
-            ctx = ctx.channels(t.channels as u16);
-        }
-        let sr = t.sample_rate.round() as u32;
-        if sr > 0 {
-            ctx = ctx.sample_rate(sr);
-        }
-        if t.width > 0 {
-            ctx = ctx.width(t.width as u32);
-        }
-        if t.height > 0 {
-            ctx = ctx.height(t.height as u32);
-        }
-        let mut codec_id = codecs.resolve_tag(&ctx);
-        // V_MS/VFW/FOURCC tunnels a BITMAPINFOHEADER in CodecPrivate. The
-        // registry has no "Matroska" tag for this case (every codec claims
-        // the inner FourCC directly — that's how AVI resolves the same
-        // stream). Extract the FourCC from CodecPrivate bytes 16..20 and
-        // retry via the Fourcc tag path.
-        if codec_id.is_none()
-            && t.codec_id_string == "V_MS/VFW/FOURCC"
-            && t.codec_private.len() >= 20
-        {
-            let mut fcc = [0u8; 4];
-            fcc.copy_from_slice(&t.codec_private[16..20]);
-            let fcc_tag = CodecTag::fourcc(&fcc);
-            let mut fcc_ctx = ProbeContext::new(&fcc_tag).header(&t.codec_private);
+        // For Matroska A_PCM/* tracks, the codec id must follow BitDepth
+        // even when an external registry claims the Matroska tag.
+        let codec_id = if let Some(pcm_id) = pcm_from_matroska(&t.codec_id_string, t.bit_depth) {
+            pcm_id
+        } else {
+            // Ask the CodecResolver registry first (codec crates can claim
+            // Matroska CodecID strings). Fall back to the static `from_matroska`
+            // table when no crate owns this id — keeps legacy MS/VFW FourCC
+            // tracks, WebM-specific VP tags, etc. working unchanged.
+            let tag = CodecTag::matroska(t.codec_id_string.clone());
+            let mut ctx = ProbeContext::new(&tag);
+            if !t.codec_private.is_empty() {
+                ctx = ctx.header(&t.codec_private);
+            }
+            if t.bit_depth > 0 {
+                ctx = ctx.bits(t.bit_depth as u16);
+            }
+            if t.channels > 0 {
+                ctx = ctx.channels(t.channels as u16);
+            }
+            let sr = t.sample_rate.round() as u32;
+            if sr > 0 {
+                ctx = ctx.sample_rate(sr);
+            }
             if t.width > 0 {
-                fcc_ctx = fcc_ctx.width(t.width as u32);
+                ctx = ctx.width(t.width as u32);
             }
             if t.height > 0 {
-                fcc_ctx = fcc_ctx.height(t.height as u32);
+                ctx = ctx.height(t.height as u32);
             }
-            codec_id = codecs.resolve_tag(&fcc_ctx);
-        }
-        let codec_id =
-            codec_id.unwrap_or_else(|| from_matroska(&t.codec_id_string, &t.codec_private));
+            let mut codec_id = codecs.resolve_tag(&ctx);
+            // V_MS/VFW/FOURCC tunnels a BITMAPINFOHEADER in CodecPrivate. The
+            // registry has no "Matroska" tag for this case (every codec claims
+            // the inner FourCC directly — that's how AVI resolves the same
+            // stream). Extract the FourCC from CodecPrivate bytes 16..20 and
+            // retry via the Fourcc tag path.
+            if codec_id.is_none()
+                && t.codec_id_string == "V_MS/VFW/FOURCC"
+                && t.codec_private.len() >= 20
+            {
+                let mut fcc = [0u8; 4];
+                fcc.copy_from_slice(&t.codec_private[16..20]);
+                let fcc_tag = CodecTag::fourcc(&fcc);
+                let mut fcc_ctx = ProbeContext::new(&fcc_tag).header(&t.codec_private);
+                if t.width > 0 {
+                    fcc_ctx = fcc_ctx.width(t.width as u32);
+                }
+                if t.height > 0 {
+                    fcc_ctx = fcc_ctx.height(t.height as u32);
+                }
+                codec_id = codecs.resolve_tag(&fcc_ctx);
+            }
+            codec_id.unwrap_or_else(|| from_matroska(&t.codec_id_string, &t.codec_private))
+        };
         let mut params = match t.track_type {
             ids::TRACK_TYPE_VIDEO => CodecParameters::video(codec_id.clone()),
             ids::TRACK_TYPE_AUDIO => CodecParameters::audio(codec_id.clone()),
@@ -784,9 +789,12 @@ fn open_typed_impl(
                 }
             }
             params.sample_format = match (params.codec_id.as_str(), t.bit_depth) {
-                ("pcm_s16le", _) => Some(SampleFormat::S16),
-                ("pcm_s16be", _) => Some(SampleFormat::S16),
+                ("pcm_u8", _) => Some(SampleFormat::U8),
+                ("pcm_s16le" | "pcm_s16be", _) => Some(SampleFormat::S16),
+                ("pcm_s24le" | "pcm_s24be", _) => Some(SampleFormat::S24),
+                ("pcm_s32le" | "pcm_s32be", _) => Some(SampleFormat::S32),
                 ("pcm_f32le", _) => Some(SampleFormat::F32),
+                ("pcm_f64le", _) => Some(SampleFormat::F64),
                 ("flac", 8) => Some(SampleFormat::U8),
                 ("flac", 16) => Some(SampleFormat::S16),
                 ("flac", 24) => Some(SampleFormat::S24),

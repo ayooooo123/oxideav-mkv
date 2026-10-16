@@ -30,6 +30,50 @@ pub fn is_webm_codec(id: &CodecId) -> bool {
     matches!(id.as_str(), "vp8" | "vp9" | "av1" | "vorbis" | "opus")
 }
 
+/// Map a Matroska `A_PCM/*` codec id string and `bit_depth` to the appropriate
+/// oxideav PCM codec id (RFC 9559 / Matroska codec specs and FFmpeg matroskadec).
+///
+/// Returns `Some(CodecId)` if `s` is one of the `A_PCM/*` identifiers:
+/// - `A_PCM/INT/LIT`: 8 -> `pcm_u8`, 16 -> `pcm_s16le`, 24 -> `pcm_s24le`, 32 -> `pcm_s32le`
+/// - `A_PCM/INT/BIG`: 8 -> `pcm_u8`, 16 -> `pcm_s16be`, 24 -> `pcm_s24be`, 32 -> `pcm_s32be`
+/// - `A_PCM/FLOAT/IEEE`: 32 -> `pcm_f32le`, 64 -> `pcm_f64le`
+///
+/// When `bit_depth` is 0 (omitted on-wire) or any other value, falls back to the
+/// standard 16-bit signed / 32-bit float defaults (`pcm_s16le`, `pcm_s16be`, `pcm_f32le`).
+/// Returns `None` if `s` is not an `A_PCM/*` identifier.
+pub fn pcm_from_matroska(s: &str, bit_depth: u64) -> Option<CodecId> {
+    Some(CodecId::new(match s {
+        "A_PCM/INT/LIT" => match bit_depth {
+            8 => "pcm_u8",
+            16 => "pcm_s16le",
+            24 => "pcm_s24le",
+            32 => "pcm_s32le",
+            _ => "pcm_s16le",
+        },
+        "A_PCM/INT/BIG" => match bit_depth {
+            8 => "pcm_u8",
+            16 => "pcm_s16be",
+            24 => "pcm_s24be",
+            32 => "pcm_s32be",
+            _ => "pcm_s16be",
+        },
+        "A_PCM/FLOAT/IEEE" => match bit_depth {
+            32 => "pcm_f32le",
+            64 => "pcm_f64le",
+            _ => "pcm_f32le",
+        },
+        _ => return None,
+    }))
+}
+
+/// Variant of [`from_matroska`] that takes `bit_depth` for `A_PCM/*` tracks.
+pub fn from_matroska_with_bit_depth(s: &str, codec_private: &[u8], bit_depth: u64) -> CodecId {
+    if let Some(id) = pcm_from_matroska(s, bit_depth) {
+        return id;
+    }
+    from_matroska(s, codec_private)
+}
+
 /// Best-effort mapping from a Matroska codec id string (e.g. `"A_FLAC"`) to
 /// the oxideav codec id we use internally.
 ///
@@ -37,14 +81,14 @@ pub fn is_webm_codec(id: &CodecId) -> bool {
 /// BITMAPINFOHEADER's `biCompression` field carries the actual codec. For
 /// other codec ids it is ignored.
 pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
+    if let Some(id) = pcm_from_matroska(s, 0) {
+        return id;
+    }
     let id = match s {
         "A_FLAC" => "flac",
         "A_OPUS" => "opus",
         "A_VORBIS" => "vorbis",
         "A_WAVPACK4" => "wavpack",
-        "A_PCM/INT/LIT" => "pcm_s16le",
-        "A_PCM/INT/BIG" => "pcm_s16be",
-        "A_PCM/FLOAT/IEEE" => "pcm_f32le",
         "A_AAC" => "aac",
         // The deprecated profile-specific AAC ids (Matroska codec
         // mappings) — all AAC; the profile feeds a synthesised
@@ -129,9 +173,15 @@ pub fn to_matroska(id: &CodecId) -> Option<&'static str> {
         "flac" => "A_FLAC",
         "opus" => "A_OPUS",
         "vorbis" => "A_VORBIS",
+        "pcm_u8" => "A_PCM/INT/LIT",
         "pcm_s16le" => "A_PCM/INT/LIT",
+        "pcm_s24le" => "A_PCM/INT/LIT",
+        "pcm_s32le" => "A_PCM/INT/LIT",
         "pcm_s16be" => "A_PCM/INT/BIG",
+        "pcm_s24be" => "A_PCM/INT/BIG",
+        "pcm_s32be" => "A_PCM/INT/BIG",
         "pcm_f32le" => "A_PCM/FLOAT/IEEE",
+        "pcm_f64le" => "A_PCM/FLOAT/IEEE",
         "aac" => "A_AAC",
         "mp3" => "A_MPEG/L3",
         "ac3" => "A_AC3",
@@ -231,5 +281,27 @@ mod tests {
             Some("A_PCM/INT/BIG")
         );
         assert_eq!(from_matroska("A_PCM/INT/BIG", &[]).as_str(), "pcm_s16be");
+    }
+
+    #[test]
+    fn pcm_codec_ids_map_with_bit_depth() {
+        assert_eq!(pcm_from_matroska("A_PCM/INT/LIT", 8).unwrap().as_str(), "pcm_u8");
+        assert_eq!(pcm_from_matroska("A_PCM/INT/LIT", 16).unwrap().as_str(), "pcm_s16le");
+        assert_eq!(pcm_from_matroska("A_PCM/INT/LIT", 24).unwrap().as_str(), "pcm_s24le");
+        assert_eq!(pcm_from_matroska("A_PCM/INT/LIT", 32).unwrap().as_str(), "pcm_s32le");
+        assert_eq!(pcm_from_matroska("A_PCM/INT/LIT", 0).unwrap().as_str(), "pcm_s16le");
+        assert_eq!(pcm_from_matroska("A_PCM/INT/LIT", 48).unwrap().as_str(), "pcm_s16le");
+
+        assert_eq!(pcm_from_matroska("A_PCM/INT/BIG", 8).unwrap().as_str(), "pcm_u8");
+        assert_eq!(pcm_from_matroska("A_PCM/INT/BIG", 16).unwrap().as_str(), "pcm_s16be");
+        assert_eq!(pcm_from_matroska("A_PCM/INT/BIG", 24).unwrap().as_str(), "pcm_s24be");
+        assert_eq!(pcm_from_matroska("A_PCM/INT/BIG", 32).unwrap().as_str(), "pcm_s32be");
+        assert_eq!(pcm_from_matroska("A_PCM/INT/BIG", 0).unwrap().as_str(), "pcm_s16be");
+
+        assert_eq!(pcm_from_matroska("A_PCM/FLOAT/IEEE", 32).unwrap().as_str(), "pcm_f32le");
+        assert_eq!(pcm_from_matroska("A_PCM/FLOAT/IEEE", 64).unwrap().as_str(), "pcm_f64le");
+        assert_eq!(pcm_from_matroska("A_PCM/FLOAT/IEEE", 0).unwrap().as_str(), "pcm_f32le");
+
+        assert!(pcm_from_matroska("A_VORBIS", 16).is_none());
     }
 }
