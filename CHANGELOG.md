@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`A_MS/ACM` audio tracks resolve through their WAVEFORMATEX.** The
+  `wFormatTag` (for `WAVE_FORMAT_EXTENSIBLE`, the legacy tag inside a
+  `DEFINE_WAVEFORMATEX_GUID` SubFormat) is offered to the codec
+  registry as `CodecTag::wave_format`, the way the AVI demuxer
+  resolves the same header — e.g. ffmpeg's `wmav2`-in-Matroska now
+  opens as `wma2` and decodes. `extradata` is the codec's `cbSize`
+  bytes (header and EXTENSIBLE extension stripped); a channel count /
+  rate the Audio element left unset is filled from the header, and
+  `nAvgBytesPerSec` gives `bit_rate`. Registry-less fallback maps the
+  PCM family depth-aware (`pcm_u8` / `pcm_s16le` / `pcm_s24le` /
+  `pcm_s32le` / `pcm_f32le` / `pcm_f64le`) plus `pcm_alaw` /
+  `pcm_mulaw`. New public `codec_id::AcmFormat` (`#[non_exhaustive]`),
+  `codec_id::vfw_fourcc`, `codec_id::strip_compat_header`,
+  `VFW_CODEC_ID` / `ACM_CODEC_ID`.
+- `V_MS/VFW/FOURCC` and `A_MS/ACM` streams carry their wire identity
+  in `params.tag` (`CodecTag::fourcc` / `CodecTag::wave_format`).
 ### Changed
 - A huge `Cues` index no longer strands late playback in a damn
   from-the-start Cluster scan: single-position CuePoints reserve one slot

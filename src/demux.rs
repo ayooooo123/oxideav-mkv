@@ -23,7 +23,7 @@ use oxideav_core::{
 };
 use oxideav_core::{Demuxer, ReadSeek};
 
-use crate::codec_id::{from_matroska, pcm_from_matroska};
+use crate::codec_id::{from_matroska, pcm_from_matroska, AcmFormat, ACM_CODEC_ID, VFW_CODEC_ID};
 use crate::ebml::{
     crc32_ieee, crc32_ieee_update, into_string, read_bytes, read_element_header, read_float,
     read_int, read_uint, read_vint, skip, VINT_UNKNOWN_SIZE,
@@ -663,6 +663,11 @@ fn open_typed_impl(
     for t in &mut tracks {
         let idx = streams.len() as u32;
         track_index_by_number.insert(t.number, idx);
+        let mut acm = if t.codec_id_string == ACM_CODEC_ID {
+            AcmFormat::parse(&t.codec_private)
+        } else {
+            None
+        };
         // For Matroska A_PCM/* tracks, the codec id must follow BitDepth
         // even when an external registry claims the Matroska tag.
         let codec_id = if let Some(pcm_id) = pcm_from_matroska(&t.codec_id_string, t.bit_depth) {
@@ -694,26 +699,32 @@ fn open_typed_impl(
                 ctx = ctx.height(t.height as u32);
             }
             let mut codec_id = codecs.resolve_tag(&ctx);
-            // V_MS/VFW/FOURCC tunnels a BITMAPINFOHEADER in CodecPrivate. The
-            // registry has no "Matroska" tag for this case (every codec claims
-            // the inner FourCC directly — that's how AVI resolves the same
-            // stream). Extract the FourCC from CodecPrivate bytes 16..20 and
-            // retry via the Fourcc tag path.
-            if codec_id.is_none()
-                && t.codec_id_string == "V_MS/VFW/FOURCC"
-                && t.codec_private.len() >= 20
-            {
-                let mut fcc = [0u8; 4];
-                fcc.copy_from_slice(&t.codec_private[16..20]);
-                let fcc_tag = CodecTag::fourcc(&fcc);
-                let mut fcc_ctx = ProbeContext::new(&fcc_tag).header(&t.codec_private);
-                if t.width > 0 {
-                    fcc_ctx = fcc_ctx.width(t.width as u32);
+            if codec_id.is_none() && t.codec_id_string == VFW_CODEC_ID {
+                if let Some(fcc) = crate::codec_id::vfw_fourcc(&t.codec_private) {
+                    let fcc_tag = CodecTag::fourcc(&fcc);
+                    let mut fcc_ctx = ProbeContext::new(&fcc_tag).header(&t.codec_private);
+                    if t.width > 0 {
+                        fcc_ctx = fcc_ctx.width(t.width as u32);
+                    }
+                    if t.height > 0 {
+                        fcc_ctx = fcc_ctx.height(t.height as u32);
+                    }
+                    codec_id = codecs.resolve_tag(&fcc_ctx);
                 }
-                if t.height > 0 {
-                    fcc_ctx = fcc_ctx.height(t.height as u32);
+            }
+            if codec_id.is_none() {
+                if let Some(f) = &acm {
+                    let wf_tag = CodecTag::wave_format(f.effective_tag);
+                    let mut wf_ctx = ProbeContext::new(&wf_tag)
+                        .header(&t.codec_private)
+                        .bits(f.bits_per_sample)
+                        .channels(f.channels)
+                        .sample_rate(f.samples_per_sec);
+                    if f.channels == 0 && t.channels > 0 {
+                        wf_ctx = wf_ctx.channels(t.channels as u16);
+                    }
+                    codec_id = codecs.resolve_tag(&wf_ctx);
                 }
-                codec_id = codecs.resolve_tag(&fcc_ctx);
             }
             codec_id.unwrap_or_else(|| from_matroska(&t.codec_id_string, &t.codec_private))
         };
@@ -743,8 +754,17 @@ fn open_typed_impl(
         //     config record.
         //   * `A_FLAC`: the CodecPrivate sometimes has a leading `"fLaC"`
         //     magic; our FLAC decoder expects metadata blocks only.
+        if t.codec_id_string == VFW_CODEC_ID {
+            if let Some(fcc) = crate::codec_id::vfw_fourcc(&t.codec_private) {
+                params.tag = Some(CodecTag::fourcc(&fcc));
+            }
+        } else if let Some(f) = &acm {
+            params.tag = Some(CodecTag::wave_format(f.format_tag));
+        }
         let mut extradata = std::mem::take(&mut t.codec_private);
-        if t.codec_id_string == "V_MS/VFW/FOURCC" && extradata.len() >= 40 {
+        if let Some(f) = acm.as_mut() {
+            extradata = std::mem::take(&mut f.extradata);
+        } else if t.codec_id_string == VFW_CODEC_ID && extradata.len() >= 40 {
             extradata.drain(..40);
         }
         params.extradata = match codec_id.as_str() {
@@ -758,6 +778,20 @@ fn open_typed_impl(
         if t.track_type == ids::TRACK_TYPE_AUDIO {
             params.sample_rate = Some(t.sample_rate.round() as u32);
             params.channels = Some(t.channels as u16);
+            // An ACM track's WAVEFORMATEX is the codec's own view of the
+            // stream; it fills whatever the Audio element left at its
+            // default and gives the nominal bit rate.
+            if let Some(f) = &acm {
+                if params.sample_rate == Some(0) && f.samples_per_sec > 0 {
+                    params.sample_rate = Some(f.samples_per_sec);
+                }
+                if params.channels == Some(0) && f.channels > 0 {
+                    params.channels = Some(f.channels);
+                }
+                if f.avg_bytes_per_sec > 0 {
+                    params.bit_rate = Some(f.avg_bytes_per_sec as u64 * 8);
+                }
+            }
             if codec_id.as_str() == "aac" {
                 let osf = t
                     .audio_raw
