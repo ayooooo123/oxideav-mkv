@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- A huge `Cues` index no longer strands late playback in a damn
+  from-the-start Cluster scan: single-position CuePoints reserve one slot
+  instead of four, and the bounded index budget is 48 MiB. The 132,884
+  entries of a multi-track 76 GB remux now retain their last seek points;
+  truly oversized indexes still cut safely.
 
 - `A_PCM/*` tracks take their codec id from the track's `BitDepth`, as
   FFmpeg's demuxer does: 8-bit is `pcm_u8`, 24- and 32-bit integer PCM is

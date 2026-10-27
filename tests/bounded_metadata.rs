@@ -566,8 +566,8 @@ fn cue_point(time: u64, cluster: u64, reference: bool) -> Vec<u8> {
 }
 
 /// CuePoints in the first Cluster this many milliseconds apart, before one
-/// for each later Cluster: more than the 32 MiB index budget keeps.
-const CROWDED: u64 = 100_000;
+/// for each later Cluster: more than the 48 MiB index budget keeps.
+const CROWDED: u64 = 270_000;
 
 fn crowded_cues(clusters: [u64; 3]) -> Vec<u8> {
     let mut points: Vec<u8> = (0..CROWDED).flat_map(|t| cue_point(t, clusters[0], false)).collect();
@@ -601,7 +601,7 @@ fn cues_past_their_budget_keep_what_fits_and_seek_on_by_scanning() {
         // index lands.
         let far = d.seek_to(0, 400_000).ok().zip(d.next_packet().ok().map(|p| p.data));
         let near = d.seek_to(0, 50).ok().zip(d.next_packet().ok().map(|p| p.data));
-        let ok = held < (32 << 20) + (1 << 20)
+        let ok = held < (48 << 20) + (1 << 20)
             && damaged == 1
             && kept > 0
             && kept < CROWDED as usize
@@ -673,18 +673,22 @@ fn a_track_the_kept_cues_miss_seeks_by_scanning() {
     assert_eq!(landings, expected);
 }
 
-/// Forty thousand Clusters a second apart, each indexed by a CuePoint and
-/// every hundredth point with a CueReference: a large index within budget,
-/// whose points still decide where a seek lands.
+/// Avatar's large seek index must retain late Cues, not strand the player
+/// scanning thousands of Clusters from the beginning after a budget cut.
+/// Repeated points model the 132,884 Cues in the 76 GB remux.
 #[test]
-fn a_large_valid_cues_index_still_seeks_by_its_points() {
+fn a_full_length_cues_index_seeks_beyond_old_budget() {
     let _serial = serial();
     const CLUSTERS: u16 = 40_000;
+    const CUE_POINTS: u32 = 132_884;
     let clusters: Vec<Vec<u8>> = (0..CLUSTERS).map(|i| cluster(u64::from(i) * 1000, &i.to_be_bytes())).collect();
     let step = clusters[0].len() as u64;
     let cues = |first: u64| {
-        let points: Vec<u8> = (0..CLUSTERS)
-            .flat_map(|i| cue_point(u64::from(i) * 1000, first + u64::from(i) * step, i % 100 == 0))
+        let points: Vec<u8> = (0..CUE_POINTS)
+            .flat_map(|i| {
+                let at = u64::from(i) * u64::from(CLUSTERS) / u64::from(CUE_POINTS);
+                cue_point(at * 1000, first + at * step, i % 100 == 0)
+            })
             .collect();
         elem(ids::CUES, &points)
     };
@@ -692,6 +696,8 @@ fn a_large_valid_cues_index_still_seeks_by_its_points() {
     let first = (t.len() + cues(0).len()) as u64;
     let segment = [vec![t, cues(first)], clusters].concat();
     let mut d = demux::open_typed(Box::new(Cursor::new(file(&segment))), &NullCodecResolver).unwrap();
+    assert_eq!(d.cue_points().len(), CUE_POINTS as usize, "late seek index must survive");
+    assert!(d.damage_events().is_empty(), "{:?}", d.damage_events());
     let mut landings = Vec::new();
     for target in [500, 12_345_678, 39_999_999] {
         let landed = d.seek_to(0, target).ok();
@@ -700,8 +706,6 @@ fn a_large_valid_cues_index_still_seeks_by_its_points() {
     let expected = [(0u16, 0u64), (12_345, 12_345_000), (39_999, 39_999_000)]
         .map(|(i, at)| (Some(at as i64), Some(i.to_be_bytes().to_vec())));
     assert_eq!(landings, expected);
-    assert_eq!(d.cue_points().len(), CLUSTERS as usize);
-    assert!(d.damage_events().is_empty(), "{:?}", d.damage_events());
 }
 
 /// What an open of `bytes` plays and keeps: every packet, the damage it

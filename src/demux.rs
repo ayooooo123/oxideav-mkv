@@ -296,7 +296,7 @@ fn open_typed_impl(
     let mut attachment_budget = Budget::new(MAX_ATTACHMENT_BYTES, "MKV: Attachments exceed their 1 MiB budget");
     let mut tag_budget = Budget::new(MAX_TAGS_BYTES as usize, TAGS_OVER_BUDGET);
     let mut track_budget = Budget::new(MAX_TRACKS_BYTES as usize, "MKV: Tracks records exceed their 32 MiB budget");
-    let mut cue_budget = Budget::new(MAX_CUE_BYTES, "MKV: Cues exceed their 32 MiB budget");
+    let mut cue_budget = Budget::new(MAX_CUE_BYTES, "MKV: Cues exceed their 48 MiB budget");
     let mut cues_cut = false;
 
     let mut seek_heads = 0usize;
@@ -1921,10 +1921,11 @@ const TRACK_OVERHEAD_BYTES: usize = 16 << 10;
 /// `tag:attachment:4294967295:`.
 const MAX_TAG_KEY_PREFIX: usize = 26;
 /// The `Cues` index the demuxer keeps: its CuePoints, CueTrackPositions,
-/// CueReferences and flat seek entries, with their lists. The CuePoints
-/// past it are dropped, and a seek past the last kept one scans the
-/// Clusters as a Cues-less seek does.
-const MAX_CUE_BYTES: usize = 32 << 20;
+/// CueReferences and flat seek entries, with their lists. Its bounded
+/// 48 MiB accommodates large multi-track remuxes without turning a late
+/// indexed seek into a scan of the whole movie from the first Cluster.
+/// CuePoints past the budget are dropped; seeks beyond them still scan.
+const MAX_CUE_BYTES: usize = 48 << 20;
 const TAGS_OVER_BUDGET: &str = "MKV: Tags records exceed their 32 MiB budget";
 
 /// The budgets the open shares between its walk and the SeekHead chase,
@@ -8395,7 +8396,7 @@ fn parse_cue_track_positions(
             block_number,
         });
     }
-    budget.room(typed)?;
+    budget.room_with_initial(typed, 1)?;
     typed.push(tp);
     Ok(())
 }
@@ -9150,8 +9151,13 @@ impl Budget {
 
     /// Room in `records` for one more, charging its growth first.
     fn room<T>(&mut self, records: &mut Vec<T>) -> Result<()> {
+        self.room_with_initial(records, 4)
+    }
+
+    /// Most CuePoints have one track position; do not pay for four.
+    fn room_with_initial<T>(&mut self, records: &mut Vec<T>, initial: usize) -> Result<()> {
         if records.len() == records.capacity() {
-            let more = records.capacity().max(4);
+            let more = records.capacity().max(initial);
             self.charge(more.saturating_mul(std::mem::size_of::<T>()))?;
             records.reserve_exact(more);
         }
