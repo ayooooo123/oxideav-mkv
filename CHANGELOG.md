@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep the compact seek index when the optional typed CuePoint tree reaches
+  its memory limit. Each now has 24 MiB of the existing 48 MiB total budget,
+  and the compact index spends its final allocation without doubling past
+  that limit. Interstellar's 304,612 cues no longer force late seeks into a
+  whole-movie Cluster scan; Avatar's 132,884-point typed tree stays intact.
+  Regression coverage bounds both retained heap and bytes read per seek.
+
 ### Added
 
 - **Video stream parameters filled from what the file states.**

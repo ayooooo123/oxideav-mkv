@@ -2,8 +2,8 @@
 //! their children are sized: every child in a `Tracks` or `Tags` tree must
 //! fit its parent, no Top-Level master but a Cluster may use the unknown
 //! size, `Info` fields keep their lengths, Chapters, Attachments and the
-//! Cues index keep what fits their budgets, seeks past the kept Cues scan
-//! the Clusters, and an attachment payload is read only from inside its
+//! Cues index keep what fits their budgets, the compact seek index outlives
+//! the optional cue tree, and an attachment payload is read only inside its
 //! parents.
 //!
 //! Bytes read are counted and the heap is measured by a counting global
@@ -566,7 +566,7 @@ fn cue_point(time: u64, cluster: u64, reference: bool) -> Vec<u8> {
 }
 
 /// CuePoints in the first Cluster this many milliseconds apart, before one
-/// for each later Cluster: more than the 48 MiB index budget keeps.
+/// for each later Cluster: more than the typed CuePoint budget keeps.
 const CROWDED: u64 = 270_000;
 
 fn crowded_cues(clusters: [u64; 3]) -> Vec<u8> {
@@ -577,7 +577,7 @@ fn crowded_cues(clusters: [u64; 3]) -> Vec<u8> {
 }
 
 #[test]
-fn cues_past_their_budget_keep_what_fits_and_seek_on_by_scanning() {
+fn cue_details_past_their_budget_keep_seek_entries() {
     let _serial = serial();
     let [c0, c1, c2] = [cluster(0, b"a"), cluster(200_000, b"b"), cluster(400_000, b"c")];
     let at = |first: u64| [first, first + c0.len() as u64, first + (c0.len() + c1.len()) as u64];
@@ -597,8 +597,7 @@ fn cues_past_their_budget_keep_what_fits_and_seek_on_by_scanning() {
         let held = LIVE.load(Ordering::SeqCst).saturating_sub(base);
         let damaged = d.damage_events().iter().filter(|e| e.kind() == DamageKind::DamagedMaster(ids::CUES)).count();
         let kept = d.cue_points().len();
-        // Past the kept points the Clusters are scanned; within them the
-        // index lands.
+        // The compact index still lands after the typed tree is truncated.
         let far = d.seek_to(0, 400_000).ok().zip(d.next_packet().ok().map(|p| p.data));
         let near = d.seek_to(0, 50).ok().zip(d.next_packet().ok().map(|p| p.data));
         let ok = held < (48 << 20) + (1 << 20)
@@ -646,12 +645,9 @@ fn seek_and_read(d: &mut dyn Demuxer, stream: u32, target: i64) -> Result<(i64, 
     Ok((landed, d.next_packet().map_err(kind)?.data))
 }
 
-/// The crowded index indexes track 1 first and track 2 only after it, so
-/// the CuePoints the budget keeps index track 1 alone. A seek on track 2,
-/// even before the last kept CueTime, scans the Clusters like a seek past
-/// it does.
+/// The compact index must still retain tracks after the typed tree fills up.
 #[test]
-fn a_track_the_kept_cues_miss_seeks_by_scanning() {
+fn a_track_beyond_the_typed_cue_prefix_keeps_its_seek_entries() {
     let _serial = serial();
     let [c0, c1, c2] = [
         two_track_cluster(0, b"A", b"a"),
@@ -669,7 +665,7 @@ fn a_track_the_kept_cues_miss_seeks_by_scanning() {
     let at = [first, first + c0.len() as u64, first + (c0.len() + c1.len()) as u64];
     let mut d = demux::open_typed(Box::new(Cursor::new(file(&[t, cues(at), c0, c1, c2]))), &NullCodecResolver).unwrap();
     let landings = [(1, 50), (1, 400_000), (0, 50)].map(|(stream, target)| seek_and_read(&mut d, stream, target));
-    let expected = [Ok((0, b"A".to_vec())), Ok((400_000, b"C".to_vec())), Ok((50, b"A".to_vec()))];
+    let expected = [Ok((200_000, b"B".to_vec())), Ok((400_000, b"C".to_vec())), Ok((50, b"A".to_vec()))];
     assert_eq!(landings, expected);
 }
 
@@ -706,6 +702,39 @@ fn a_full_length_cues_index_seeks_beyond_old_budget() {
     let expected = [(0u16, 0u64), (12_345, 12_345_000), (39_999, 39_999_000)]
         .map(|(i, at)| (Some(at as i64), Some(i.to_be_bytes().to_vec())));
     assert_eq!(landings, expected);
+}
+
+/// Interstellar's 304,612 CuePoints must not make a late seek scan the movie.
+#[test]
+fn a_large_index_keeps_late_seek_entries_within_the_heap_budget() {
+    let _serial = serial();
+    const CLUSTERS: u16 = 20_000;
+    const POINTS: u64 = 304_612;
+    let clusters: Vec<Vec<u8>> = (0..CLUSTERS)
+        .map(|i| cluster(u64::from(i) * 1000, &i.to_be_bytes())).collect();
+    let step = clusters[0].len() as u64;
+    let cues = |first: u64| {
+        let points: Vec<u8> = (0..POINTS).flat_map(|i| {
+            let at = i * u64::from(CLUSTERS) / POINTS;
+            cue_point(at * 1000, first + at * step, false)
+        }).collect();
+        elem(ids::CUES, &points)
+    };
+    let t = tracks();
+    let first = (t.len() + cues(0).len()) as u64;
+    let bytes = file(&[vec![t, cues(first)], clusters].concat());
+    let reads = Arc::new(AtomicUsize::new(0));
+    let input = Counted { inner: Cursor::new(bytes), read: reads.clone() };
+    let base = LIVE.load(Ordering::SeqCst);
+    let mut d = demux::open_typed(Box::new(input), &NullCodecResolver).unwrap();
+    let held = LIVE.load(Ordering::SeqCst).saturating_sub(base);
+    assert!(held < (48 << 20) + (1 << 20), "index held {held} bytes");
+    for target in [19_600u16, 400, 10_000] {
+        reads.store(0, Ordering::SeqCst);
+        let at = i64::from(target) * 1000;
+        assert_eq!(seek_and_read(&mut d, 0, at), Ok((at, target.to_be_bytes().to_vec())));
+        assert!(reads.load(Ordering::SeqCst) < 512, "seek to {target} scanned Clusters");
+    }
 }
 
 /// What an open of `bytes` plays and keeps: every packet, the damage it

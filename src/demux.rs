@@ -296,7 +296,10 @@ fn open_typed_impl(
     let mut attachment_budget = Budget::new(MAX_ATTACHMENT_BYTES, "MKV: Attachments exceed their 1 MiB budget");
     let mut tag_budget = Budget::new(MAX_TAGS_BYTES as usize, TAGS_OVER_BUDGET);
     let mut track_budget = Budget::new(MAX_TRACKS_BYTES as usize, "MKV: Tracks records exceed their 32 MiB budget");
-    let mut cue_budget = Budget::new(MAX_CUE_BYTES, "MKV: Cues exceed their 48 MiB budget");
+    let mut cue_budget = CueBudgets {
+        index: Budget::new(MAX_CUE_BYTES / 2, "MKV: seek entries exceed their 24 MiB budget"),
+        details: Budget::new(MAX_CUE_BYTES / 2, "MKV: CuePoints exceed their 24 MiB budget"),
+    };
     let mut cues_cut = false;
 
     let mut seek_heads = 0usize;
@@ -1978,12 +1981,15 @@ const TRACK_OVERHEAD_BYTES: usize = 16 << 10;
 /// The longest scope prefix a resolved tag's flat key carries,
 /// `tag:attachment:4294967295:`.
 const MAX_TAG_KEY_PREFIX: usize = 26;
-/// The `Cues` index the demuxer keeps: its CuePoints, CueTrackPositions,
-/// CueReferences and flat seek entries, with their lists. Its bounded
-/// 48 MiB accommodates large multi-track remuxes without turning a late
-/// indexed seek into a scan of the whole movie from the first Cluster.
-/// CuePoints past the budget are dropped; seeks beyond them still scan.
+/// The compact seek index and the typed CuePoint tree each get half this
+/// budget, so optional cue details cannot force indexed playback to scan
+/// the movie. Only exhaustion of the compact index limits seek coverage.
 const MAX_CUE_BYTES: usize = 48 << 20;
+
+struct CueBudgets {
+    index: Budget,
+    details: Budget,
+}
 const TAGS_OVER_BUDGET: &str = "MKV: Tags records exceed their 32 MiB budget";
 
 /// The budgets the open shares between its walk and the SeekHead chase,
@@ -1994,7 +2000,7 @@ struct MetadataBudgets<'a> {
     attachments: &'a mut Budget,
     tags: &'a mut Budget,
     tracks: &'a mut Budget,
-    cues: &'a mut Budget,
+    cues: &'a mut CueBudgets,
     cues_cut: &'a mut bool,
     /// The Cluster-record budget, which the CRC-32 statuses share.
     records: &'a mut Budget,
@@ -8349,23 +8355,22 @@ pub struct CueReference {
     pub ref_codec_state: Option<u64>,
 }
 
-/// Parse the `Cues` master ending at `end` into the flat seek index `out`
-/// and the CuePoints `typed`, charging every record and list to `budget`
-/// before it is stored — see [`MAX_CUE_BYTES`]. Every element must fit its
-/// parent. When the budget runs out or the data is damaged, the CuePoint
-/// being read is dropped with every one after it, the reader is left at
-/// `end`, and the offset of that first dropped element is returned.
+/// Parse Cues into independently bounded seek entries and typed CuePoints.
+/// Keep reading seek entries after the optional typed tree fills up.
+/// Return the first omitted record's offset, or stop there on damaged data
+/// or an exhausted seek index. Every element must fit its parent.
 fn parse_cues(
     r: &mut dyn ReadSeek,
     end: u64,
     out: &mut Vec<CueEntry>,
     typed: &mut Vec<CuePoint>,
-    budget: &mut Budget,
+    budget: &mut CueBudgets,
 ) -> Result<Option<u64>> {
+    let mut cut = None;
     loop {
         let at = r.stream_position()?;
         if at >= end {
-            return Ok(None);
+            return Ok(cut);
         }
         let kept = (out.len(), typed.len());
         let parsed = read_element_header(r).and_then(|e| {
@@ -8379,11 +8384,14 @@ fn parse_cues(
             }
         });
         if let Err(err) = parsed {
-            cut_short(err, budget)?;
+            cut_short(err, &mut budget.index)?;
             out.truncate(kept.0);
             typed.truncate(kept.1);
             r.seek(SeekFrom::Start(end))?;
-            return Ok(Some(at));
+            return Ok(Some(cut.unwrap_or(at)));
+        }
+        if budget.details.spent {
+            cut.get_or_insert(at);
         }
     }
 }
@@ -8393,7 +8401,7 @@ fn parse_cue_point(
     end: u64,
     out: &mut Vec<CueEntry>,
     typed: &mut Vec<CuePoint>,
-    budget: &mut Budget,
+    budget: &mut CueBudgets,
 ) -> Result<()> {
     let mut time: u64 = 0;
     let mut point = CuePoint::default();
@@ -8411,8 +8419,9 @@ fn parse_cue_point(
             _ => skip(r, e.size)?,
         }
     }
-    budget.room(typed)?;
-    typed.push(point);
+    if !budget.details.spent && budget.details.room(typed).is_ok() {
+        typed.push(point);
+    }
     Ok(())
 }
 
@@ -8422,7 +8431,7 @@ fn parse_cue_track_positions(
     time: u64,
     out: &mut Vec<CueEntry>,
     typed: &mut Vec<CueTrackPositions>,
-    budget: &mut Budget,
+    budget: &mut CueBudgets,
 ) -> Result<()> {
     let mut track: u64 = 0;
     let mut cluster_offset: Option<u64> = None;
@@ -8454,16 +8463,23 @@ fn parse_cue_track_positions(
                 tp.block_number = Some(v);
             }
             ids::CUE_CODEC_STATE => tp.codec_state = read_uint(r, e.size as usize)?,
-            ids::CUE_REFERENCE => {
+            ids::CUE_REFERENCE if !budget.details.spent => {
                 let reference = parse_cue_reference(r, e_end)?;
-                budget.room(&mut tp.references)?;
-                tp.references.push(reference);
+                if budget.details.room(&mut tp.references).is_ok() {
+                    tp.references.push(reference);
+                }
             }
             _ => skip(r, e.size)?,
         }
     }
     if let Some(off) = cluster_offset {
-        budget.room(out)?;
+        if out.len() == out.capacity() {
+            // Spend the remaining index budget instead of failing a doubling allocation.
+            let size = std::mem::size_of::<CueEntry>();
+            let more = out.capacity().max(4).min(budget.index.left / size);
+            budget.index.charge(more.max(1) * size)?;
+            out.reserve_exact(more);
+        }
         out.push(CueEntry {
             track,
             time,
@@ -8472,8 +8488,9 @@ fn parse_cue_track_positions(
             block_number,
         });
     }
-    budget.room_with_initial(typed, 1)?;
-    typed.push(tp);
+    if !budget.details.spent && budget.details.room_with_initial(typed, 1).is_ok() {
+        typed.push(tp);
+    }
     Ok(())
 }
 
@@ -10044,9 +10061,9 @@ pub struct MkvDemuxer {
     /// sub-element set the denormalised `cues` seek index collapses. Empty
     /// when the file has no `Cues` element.
     cue_points: Vec<CuePoint>,
-    /// Whether the Cues index was cut at [`MAX_CUE_BYTES`]. A cut index
-    /// covers a track only up to the last CueTime kept for it: a seek past
-    /// that, or on a track with no kept cue, scans the Clusters.
+    /// Whether any Cues records were omitted at their budget or on damage.
+    /// Seek coverage follows the compact entries, not the typed tree: a seek
+    /// past the last kept entry on its track scans the Clusters.
     cues_cut: bool,
     /// Nanoseconds per Matroska timecode tick (the Segment\Info\TimecodeScale
     /// value, defaulted to 1_000_000 when absent).
@@ -11144,8 +11161,10 @@ impl MkvDemuxer {
     /// the file's `TimestampScale`, not microseconds) with one or more
     /// [`CueTrackPositions`]. The index is populated whether the `Cues`
     /// element sits before the first Cluster or after the last (the late
-    /// best-effort rescan path feeds the same typed collector). Returns an
-    /// empty slice when the file has no `Cues` element.
+    /// best-effort rescan path feeds the same typed collector). The typed
+    /// tree retains a prefix within 24 MiB independently of the seek index;
+    /// a truncation is reported through `damage_events`. Returns an empty
+    /// slice when the file has no `Cues` element.
     pub fn cue_points(&self) -> &[CuePoint] {
         &self.cue_points
     }
