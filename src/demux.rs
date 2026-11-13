@@ -1384,6 +1384,7 @@ fn open_typed_impl(
         first_blocks,
         walk_from_start: Some(true),
         timestamps_primed: false,
+        active_stream_mask: None,
         timestamp_probe_bytes: 0,
         deferred_block: None,
         webvtt_tracks: tracks.iter().map(|t| t.codec_id_string.starts_with("D_WEBVTT/")).collect(),
@@ -10145,6 +10146,7 @@ pub struct MkvDemuxer {
     /// track's first; `None` until the walk after a seek starts.
     walk_from_start: Option<bool>,
     timestamps_primed: bool,
+    active_stream_mask: Option<Vec<bool>>,
     timestamp_probe_bytes: usize,
     /// The Block waiting for queue room — see [`DeferredBlock`].
     deferred_block: Option<DeferredBlock>,
@@ -10335,13 +10337,43 @@ impl Demuxer for MkvDemuxer {
         &self.streams
     }
 
+    fn set_active_streams(&mut self, stream_indices: &[u32]) {
+        let mut mask = vec![false; self.streams.len()];
+        for &idx in stream_indices {
+            if let Some(slot) = mask.get_mut(idx as usize) {
+                *slot = true;
+            }
+        }
+        if self.apply_track_operations {
+            for (si, consumers) in self.virtual_consumers.iter().enumerate() {
+                if consumers
+                    .iter()
+                    .any(|c| stream_indices.contains(&c.virtual_stream))
+                {
+                    if let Some(slot) = mask.get_mut(si) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+        self.out_queue
+            .retain(|q| mask.get(q.packet.stream_index as usize).copied().unwrap_or(false));
+        self.active_stream_mask = Some(mask);
+    }
+
     fn next_packet(&mut self) -> Result<Packet> {
         self.last_metadata = PacketMetadata::default();
         loop {
             if !self.timestamps_primed
                 && (self.timestamp_probe_bytes >= MAX_PROBE_BYTES
                     || self.out_queue.len() >= MAX_PROBE_PACKETS
-                    || self.decode_orders.iter().flatten().all(|o| !o.needs_probe()))
+                    || self.decode_orders.iter().enumerate().all(|(si, o)| {
+                        let needed = self
+                            .active_stream_mask
+                            .as_ref()
+                            .map_or(true, |m| m.get(si).copied().unwrap_or(false));
+                        !needed || o.as_ref().is_none_or(|ord| !ord.needs_probe())
+                    }))
             {
                 self.finish_timestamp_probe();
             }
@@ -13186,8 +13218,10 @@ impl MkvDemuxer {
                         self.record_cluster_encrypted_block(body_start, pos, e.size)?;
                     }
                     ids::SIMPLE_BLOCK => {
-                        let bytes = block_budget().read(&mut *self.input, e.size)?;
-                        self.queue_block_packets(bytes, cluster_timecode, pos)?;
+                        let mut budget = block_budget();
+                        if let Some(bytes) = self.read_block_if_active(&mut budget, e.size)? {
+                            self.queue_block_packets(bytes, cluster_timecode, pos)?;
+                        }
                     }
                     ids::BLOCK_GROUP => {
                         let bg_end = self.input.stream_position()?.saturating_add(e.size);
@@ -13227,7 +13261,7 @@ impl MkvDemuxer {
             let e_end = child_end(&mut *self.input, e.size, end)?;
             match e.id {
                 ids::BLOCK => {
-                    block_bytes = Some(budget.read(&mut *self.input, e.size)?);
+                    block_bytes = self.read_block_if_active(&mut budget, e.size)?;
                 }
                 ids::BLOCK_DURATION => {
                     duration = Some(read_uint(&mut *self.input, e.size as usize)? as i64);
@@ -13297,6 +13331,57 @@ impl MkvDemuxer {
         }
         Ok(())
     }
+    fn read_block_if_active(&mut self, budget: &mut Budget, size: u64) -> Result<Option<Vec<u8>>> {
+        let Some(mask) = self.active_stream_mask.as_ref() else {
+            return budget.read(&mut *self.input, size).map(Some);
+        };
+        if size < 4 || size > MAX_BLOCK_BYTES as u64 {
+            return budget.read(&mut *self.input, size).map(Some);
+        }
+        let mut first = [0u8; 1];
+        self.input.read_exact(&mut first)?;
+        let b0 = first[0];
+        if b0 == 0 {
+            self.input.seek(SeekFrom::Current(-1))?;
+            return budget.read(&mut *self.input, size).map(Some);
+        }
+        let w = (b0.leading_zeros() as usize) + 1;
+        if (size as usize) < w + 3 {
+            self.input.seek(SeekFrom::Current(-1))?;
+            return budget.read(&mut *self.input, size).map(Some);
+        }
+        let mut hdr = [0u8; 8];
+        hdr[0] = b0;
+        if w > 1 {
+            self.input.read_exact(&mut hdr[1..w])?;
+        }
+        let mut track_num = u64::from(b0 & (0xFFu8 >> w));
+        for &b in &hdr[1..w] {
+            track_num = (track_num << 8) | u64::from(b);
+        }
+        let keep = self
+            .track_index_by_number
+            .get(&track_num)
+            .is_some_and(|&si| mask.get(si as usize).copied().unwrap_or(false));
+        if !keep {
+            skip(&mut *self.input, size - w as u64)?;
+            return Ok(None);
+        }
+        let total = size as usize;
+        budget.charge(total)?;
+        let mut stored = Vec::new();
+        stored.reserve_exact(total.min(64 << 10));
+        stored.extend_from_slice(&hdr[..w]);
+        while stored.len() < total {
+            let start = stored.len();
+            let more = (total - start).min(start.max(64 << 10));
+            stored.reserve_exact(more);
+            stored.resize(start + more, 0);
+            self.input.read_exact(&mut stored[start..])?;
+        }
+        Ok(Some(stored))
+    }
+
 
     fn queue_block_packets(&mut self, bytes: Vec<u8>, cluster_timecode: i64, offset: u64) -> Result<()> {
         // A SimpleBlock's keyframe bit is bit 7 of its flags byte. A
