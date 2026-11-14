@@ -23,10 +23,10 @@ use oxideav_core::{
 };
 use oxideav_core::{Demuxer, ReadSeek};
 
-use crate::codec_id::{from_matroska, pcm_from_matroska, AcmFormat, ACM_CODEC_ID, VFW_CODEC_ID};
+use crate::codec_id::{ACM_CODEC_ID, AcmFormat, VFW_CODEC_ID, from_matroska, pcm_from_matroska};
 use crate::ebml::{
-    crc32_ieee, crc32_ieee_update, into_string, read_bytes, read_element_header, read_float,
-    read_int, read_uint, read_vint, skip, VINT_UNKNOWN_SIZE,
+    VINT_UNKNOWN_SIZE, crc32_ieee, crc32_ieee_update, into_string, read_bytes, read_element_header,
+    read_float, read_int, read_uint, read_vint, skip,
 };
 use crate::ids;
 
@@ -136,7 +136,10 @@ fn open_typed_impl(
     if hdr.size == VINT_UNKNOWN_SIZE {
         return Err(Error::invalid("MKV: EBML header of unknown size"));
     }
-    let mut header_budget = Budget::new(MAX_EBML_HEADER_BYTES, "MKV: EBML header exceeds its 16 MiB budget");
+    let mut header_budget = Budget::new(
+        MAX_EBML_HEADER_BYTES,
+        "MKV: EBML header exceeds its 16 MiB budget",
+    );
     let ebml_end = input.stream_position()?.saturating_add(hdr.size);
     while input.stream_position()? < ebml_end {
         let e = read_element_header(&mut *input)?;
@@ -164,7 +167,8 @@ fn open_typed_impl(
                 doc_type_read_version = read_uint(&mut *input, e.size as usize)?;
             }
             ids::DOC_TYPE_EXTENSION => {
-                if let Some(ext) = parse_doc_type_extension(&mut *input, e_end, &mut header_budget)? {
+                if let Some(ext) = parse_doc_type_extension(&mut *input, e_end, &mut header_budget)?
+                {
                     header_budget.room(&mut doc_type_extensions)?;
                     doc_type_extensions.push(ext);
                 }
@@ -282,7 +286,10 @@ fn open_typed_impl(
     // child is walked; surfaced via `MkvDemuxer::crc_status`. They share
     // the Cluster-record budget with what the demuxer keeps for Clusters.
     let mut crc_log = CrcLog::default();
-    let mut record_budget = Budget::new(MAX_CLUSTER_RECORD_BYTES, "MKV: Cluster records exceed their 32 MiB budget");
+    let mut record_budget = Budget::new(
+        MAX_CLUSTER_RECORD_BYTES,
+        "MKV: Cluster records exceed their 32 MiB budget",
+    );
     // What the Info, Chapters, Attachments, Tags and Tracks masters and the
     // Cues index may keep, each together over the walk below and the
     // SeekHead chase after it — see [`MAX_INFO_BYTES`],
@@ -292,10 +299,17 @@ fn open_typed_impl(
     // index cut at its budget keeps the CuePoints that fit; seeks past them
     // scan the Clusters.
     let mut info_budget = Budget::new(MAX_INFO_BYTES, "MKV: Info exceeds its 1 MiB budget");
-    let mut chapter_budget = Budget::new(MAX_CHAPTER_BYTES, "MKV: Chapters exceed their 1 MiB budget");
-    let mut attachment_budget = Budget::new(MAX_ATTACHMENT_BYTES, "MKV: Attachments exceed their 1 MiB budget");
+    let mut chapter_budget =
+        Budget::new(MAX_CHAPTER_BYTES, "MKV: Chapters exceed their 1 MiB budget");
+    let mut attachment_budget = Budget::new(
+        MAX_ATTACHMENT_BYTES,
+        "MKV: Attachments exceed their 1 MiB budget",
+    );
     let mut tag_budget = Budget::new(MAX_TAGS_BYTES as usize, TAGS_OVER_BUDGET);
-    let mut track_budget = Budget::new(MAX_TRACKS_BYTES as usize, "MKV: Tracks records exceed their 32 MiB budget");
+    let mut track_budget = Budget::new(
+        MAX_TRACKS_BYTES as usize,
+        "MKV: Tracks records exceed their 32 MiB budget",
+    );
     let mut cue_budget = Budget::new(MAX_CUE_BYTES, "MKV: Cues exceed their 48 MiB budget");
     let mut cues_cut = false;
 
@@ -367,7 +381,8 @@ fn open_typed_impl(
         // like contents over their budgets: a damaged master, so an
         // optional SeekHead or Tags is skipped with a damage event. A
         // SeekHead past the two RFC 9559 §5.1.1 allows is skipped unread.
-        let over_budget = e.size != VINT_UNKNOWN_SIZE && master_budget(e.id).is_some_and(|max| e.size > max);
+        let over_budget =
+            e.size != VINT_UNKNOWN_SIZE && master_budget(e.id).is_some_and(|max| e.size > max);
         let over_quota = e.id == ids::SEEK_HEAD && seek_heads >= MAX_SEEK_HEADS;
         // Parse the Top-Level master. Damage in it is recoverable when the
         // master is optional (anything but Info and Tracks), in either open,
@@ -376,7 +391,10 @@ fn open_typed_impl(
         // the walk resumes at the next Top-Level element.
         let parse_result: Result<()> = (|| {
             if over_budget {
-                return Err(Error::invalid(format!("MKV: Top-Level element 0x{:X} exceeds its budget", e.id)));
+                return Err(Error::invalid(format!(
+                    "MKV: Top-Level element 0x{:X} exceeds its budget",
+                    e.id
+                )));
             }
             // RFC 9559 allows the unknown size on a Segment and a Cluster
             // alone: any other element without a declared end has no bound
@@ -385,24 +403,28 @@ fn open_typed_impl(
             // rescans from the end of its header.
             let end = body_end_known.ok_or_else(unknown_size_master)?;
             if end > segment_data_end {
-                return Err(Error::invalid(format!("MKV: Top-Level element 0x{:X} runs past its Segment", e.id)));
+                return Err(Error::invalid(format!(
+                    "MKV: Top-Level element 0x{:X} runs past its Segment",
+                    e.id
+                )));
             }
             // Validate a leading CRC-32 child against the rest of the
             // element. The helper rewinds the reader to `body_start` so the
             // parse below is unaffected.
-            if !over_quota && matches!(
-                e.id,
-                ids::INFO
-                    | ids::TRACKS
-                    | ids::TAGS
-                    | ids::CUES
-                    | ids::CHAPTERS
-                    | ids::ATTACHMENTS
-                    | ids::SEEK_HEAD
-            ) {
-                if let Some(s) = validate_top_level_crc(&mut *input, e.id, body_start, end)? {
-                    crc_log.record(&mut record_budget, body_start, s);
-                }
+            if !over_quota
+                && matches!(
+                    e.id,
+                    ids::INFO
+                        | ids::TRACKS
+                        | ids::TAGS
+                        | ids::CUES
+                        | ids::CHAPTERS
+                        | ids::ATTACHMENTS
+                        | ids::SEEK_HEAD
+                )
+                && let Some(s) = validate_top_level_crc(&mut *input, e.id, body_start, end)?
+            {
+                crc_log.record(&mut record_budget, body_start, s);
             }
             match e.id {
                 ids::INFO => {
@@ -416,7 +438,13 @@ fn open_typed_impl(
                     parse_tags(&mut *input, end, &mut pending_tags, &mut tag_budget)?;
                 }
                 ids::CUES => {
-                    if let Some(stop) = parse_cues(&mut *input, end, &mut cues, &mut cue_points, &mut cue_budget)? {
+                    if let Some(stop) = parse_cues(
+                        &mut *input,
+                        end,
+                        &mut cues,
+                        &mut cue_points,
+                        &mut cue_budget,
+                    )? {
                         damage_events.push(cut_at(ids::CUES, stop, end));
                         cues_cut = true;
                     }
@@ -483,7 +511,12 @@ fn open_typed_impl(
             // when it runs out.
             let resume = match body_end_known {
                 Some(end) if end <= segment_data_end => Resync::At(end),
-                _ => scan_top_level_within(&mut *input, body_start, segment_data_end, &mut resync_left)?,
+                _ => scan_top_level_within(
+                    &mut *input,
+                    body_start,
+                    segment_data_end,
+                    &mut resync_left,
+                )?,
             };
             match resume {
                 Resync::At(off) => {
@@ -585,10 +618,10 @@ fn open_typed_impl(
             );
             // A stale target is ignored and a damaged one noted inside; a
             // transport failure is returned.
-            if let Err(e) = followed_target {
-                if !is_damage(&e) {
-                    return Err(e);
-                }
+            if let Err(e) = followed_target
+                && !is_damage(&e)
+            {
+                return Err(e);
             }
         }
         input.seek(SeekFrom::Start(resume_pos))?;
@@ -596,8 +629,12 @@ fn open_typed_impl(
 
     // Cues that neither precede the first Cluster nor are reachable through
     // the SeekHead are not searched for: finding them means walking every
-    // Cluster to the end of the Segment before the first packet. A seek
-    // without Cues scans the Clusters up to its target instead.
+    // Cluster to the end of the Segment before the first packet (one
+    // positioned read per Cluster, which a byte-range transport bills as
+    // one request each). A seek without Cues bisects the Cluster run
+    // instead (`MkvDemuxer::seek_cueless`), and a caller with cheap local
+    // I/O that wants the index anyway can opt in through
+    // `MkvDemuxer::scan_for_cues`.
 
     // Sort cues by (track, time) for stable lookup.
     cues.sort_by(|a, b| a.track.cmp(&b.track).then(a.time.cmp(&b.time)));
@@ -622,26 +659,26 @@ fn open_typed_impl(
             .content_encodings
             .as_ref()
             .and_then(|enc| content::decompression_chain(enc, true));
-        if let Some(chain) = chain {
-            if !t.codec_private.is_empty() {
-                let stored = std::mem::take(&mut t.codec_private);
-                let stored_len = stored.len();
-                private_total -= stored_len;
-                let budget = MAX_CODEC_PRIVATE
-                    .min(MAX_CODEC_PRIVATE_TOTAL.saturating_sub(private_total))
-                    .min(track_budget.working_room() / 2);
-                t.codec_private = match content::decompress(&chain, stored, budget) {
-                    Ok(data) => data,
-                    Err(content::Undo::Corrupt(_)) => Vec::new(),
-                    Err(content::Undo::OverBudget) => {
-                        return Err(Error::invalid("MKV: CodecPrivate exceeds its budget"));
-                    }
-                };
-                track_budget.release(stored_len);
-                track_budget.charge(t.codec_private.capacity())?;
-                track_budget.reserve_scratch(t.codec_private.len())?;
-                private_total += t.codec_private.len();
-            }
+        if let Some(chain) = chain
+            && !t.codec_private.is_empty()
+        {
+            let stored = std::mem::take(&mut t.codec_private);
+            let stored_len = stored.len();
+            private_total -= stored_len;
+            let budget = MAX_CODEC_PRIVATE
+                .min(MAX_CODEC_PRIVATE_TOTAL.saturating_sub(private_total))
+                .min(track_budget.working_room() / 2);
+            t.codec_private = match content::decompress(&chain, stored, budget) {
+                Ok(data) => data,
+                Err(content::Undo::Corrupt(_)) => Vec::new(),
+                Err(content::Undo::OverBudget) => {
+                    return Err(Error::invalid("MKV: CodecPrivate exceeds its budget"));
+                }
+            };
+            track_budget.release(stored_len);
+            track_budget.charge(t.codec_private.capacity())?;
+            track_budget.reserve_scratch(t.codec_private.len())?;
+            private_total += t.codec_private.len();
         }
     }
 
@@ -699,32 +736,33 @@ fn open_typed_impl(
                 ctx = ctx.height(t.height as u32);
             }
             let mut codec_id = codecs.resolve_tag(&ctx);
-            if codec_id.is_none() && t.codec_id_string == VFW_CODEC_ID {
-                if let Some(fcc) = crate::codec_id::vfw_fourcc(&t.codec_private) {
-                    let fcc_tag = CodecTag::fourcc(&fcc);
-                    let mut fcc_ctx = ProbeContext::new(&fcc_tag).header(&t.codec_private);
-                    if t.width > 0 {
-                        fcc_ctx = fcc_ctx.width(t.width as u32);
-                    }
-                    if t.height > 0 {
-                        fcc_ctx = fcc_ctx.height(t.height as u32);
-                    }
-                    codec_id = codecs.resolve_tag(&fcc_ctx);
+            if codec_id.is_none()
+                && t.codec_id_string == VFW_CODEC_ID
+                && let Some(fcc) = crate::codec_id::vfw_fourcc(&t.codec_private)
+            {
+                let fcc_tag = CodecTag::fourcc(&fcc);
+                let mut fcc_ctx = ProbeContext::new(&fcc_tag).header(&t.codec_private);
+                if t.width > 0 {
+                    fcc_ctx = fcc_ctx.width(t.width as u32);
                 }
+                if t.height > 0 {
+                    fcc_ctx = fcc_ctx.height(t.height as u32);
+                }
+                codec_id = codecs.resolve_tag(&fcc_ctx);
             }
-            if codec_id.is_none() {
-                if let Some(f) = &acm {
-                    let wf_tag = CodecTag::wave_format(f.effective_tag);
-                    let mut wf_ctx = ProbeContext::new(&wf_tag)
-                        .header(&t.codec_private)
-                        .bits(f.bits_per_sample)
-                        .channels(f.channels)
-                        .sample_rate(f.samples_per_sec);
-                    if f.channels == 0 && t.channels > 0 {
-                        wf_ctx = wf_ctx.channels(t.channels as u16);
-                    }
-                    codec_id = codecs.resolve_tag(&wf_ctx);
+            if codec_id.is_none()
+                && let Some(f) = &acm
+            {
+                let wf_tag = CodecTag::wave_format(f.effective_tag);
+                let mut wf_ctx = ProbeContext::new(&wf_tag)
+                    .header(&t.codec_private)
+                    .bits(f.bits_per_sample)
+                    .channels(f.channels)
+                    .sample_rate(f.samples_per_sec);
+                if f.channels == 0 && t.channels > 0 {
+                    wf_ctx = wf_ctx.channels(t.channels as u16);
                 }
+                codec_id = codecs.resolve_tag(&wf_ctx);
             }
             codec_id.unwrap_or_else(|| from_matroska(&t.codec_id_string, &t.codec_private))
         };
@@ -775,6 +813,16 @@ fn open_typed_impl(
             "wavpack" if extradata.len() < 2 => 0x410u16.to_le_bytes().to_vec(),
             _ => extradata,
         };
+        // Stamp the compatibility-mode wire identity (the FourCC / the
+        // wFormatTag as written), the way the AVI demuxer does, so a
+        // consumer can tell which tunnelled codec an unclaimed track is.
+        if t.codec_id_string == VFW_CODEC_ID
+            && let Some(fcc) = crate::codec_id::vfw_fourcc(&t.codec_private)
+        {
+            params.tag = Some(CodecTag::fourcc(&fcc));
+        } else if let Some(f) = &acm {
+            params.tag = Some(CodecTag::wave_format(f.format_tag));
+        }
         if t.track_type == ids::TRACK_TYPE_AUDIO {
             params.sample_rate = Some(t.sample_rate.round() as u32);
             params.channels = Some(t.channels as u16);
@@ -800,17 +848,16 @@ fn open_typed_impl(
                 // Legacy profile CodecIDs carry no CodecPrivate: build the
                 // AudioSpecificConfig they imply (SBR output rate from
                 // OutputSamplingFrequency, else twice the core rate).
-                if params.extradata.is_empty() {
-                    if let Some((aot, sbr)) =
+                if params.extradata.is_empty()
+                    && let Some((aot, sbr)) =
                         crate::aac::legacy_codec_id_profile(&t.codec_id_string)
+                {
+                    let core = t.sample_rate.round() as u32;
+                    let out = osf.filter(|&o| o != core).unwrap_or(core * 2);
+                    if let Some(asc) =
+                        crate::aac::legacy_asc(aot, sbr, core, out, t.channels as u16)
                     {
-                        let core = t.sample_rate.round() as u32;
-                        let out = osf.filter(|&o| o != core).unwrap_or(core * 2);
-                        if let Some(asc) =
-                            crate::aac::legacy_asc(aot, sbr, core, out, t.channels as u16)
-                        {
-                            params.extradata = asc;
-                        }
+                        params.extradata = asc;
                     }
                 }
                 // SamplingFrequency is the AAC *core* rate; the decoded
@@ -907,18 +954,26 @@ fn open_typed_impl(
             params,
         });
     }
-    let packet_clocks = streams.iter().map(|s| timing::PacketClock::new(&s.params)).collect();
-    let decode_orders = streams.iter().enumerate().map(|(i, stream)| match track_codecs[i] {
-        parser::Codec::H264 => frame_parsers[i].as_ref().map(|parser| {
-            timing::DecodeOrder::h264(
-                parser.reorder_delay().unwrap_or(0), parser.has_reorder_restriction(),
-            )
-        }),
-        parser::Codec::Hevc => Some(timing::DecodeOrder::new(
-            video_config::hevc_reorder_frames(&stream.params.extradata).unwrap_or(0),
-        )),
-        _ => None,
-    }).collect();
+    let packet_clocks = streams
+        .iter()
+        .map(|s| timing::PacketClock::new(&s.params))
+        .collect();
+    let decode_orders = streams
+        .iter()
+        .enumerate()
+        .map(|(i, stream)| match track_codecs[i] {
+            parser::Codec::H264 => frame_parsers[i].as_ref().map(|parser| {
+                timing::DecodeOrder::h264(
+                    parser.reorder_delay().unwrap_or(0),
+                    parser.has_reorder_restriction(),
+                )
+            }),
+            parser::Codec::Hevc => Some(timing::DecodeOrder::new(
+                video_config::hevc_reorder_frames(&stream.params.extradata).unwrap_or(0),
+            )),
+            _ => None,
+        })
+        .collect();
 
     // Resolve `Tags.Targets.Tag*UID` references now that the full segment
     // has been walked. Tags appearing before Tracks in segment order are
@@ -982,8 +1037,10 @@ fn open_typed_impl(
     // This and the per-stream views below take their data from the track
     // records rather than copying it, so they cost no more than the records
     // were charged.
-    let content_encodings: Vec<Option<ContentEncodings>> =
-        tracks.iter_mut().map(|t| t.content_encodings.take()).collect();
+    let content_encodings: Vec<Option<ContentEncodings>> = tracks
+        .iter_mut()
+        .map(|t| t.content_encodings.take())
+        .collect();
 
     // Per-stream `BlockAdditionMapping`s (RFC 9559 §5.1.4.1.17), indexed by
     // stream index. Each entry is one mapping master in on-disk order;
@@ -996,8 +1053,10 @@ fn open_typed_impl(
     // Per-stream `TrackTranslate` lists (RFC 9559 §5.1.4.1.27), indexed by
     // stream index. Empty for tracks with no chapter-codec mapping (the
     // common case).
-    let track_translates: Vec<Vec<TrackTranslate>> =
-        tracks.iter_mut().map(|t| std::mem::take(&mut t.track_translates)).collect();
+    let track_translates: Vec<Vec<TrackTranslate>> = tracks
+        .iter_mut()
+        .map(|t| std::mem::take(&mut t.track_translates))
+        .collect();
 
     // Per-stream reclaimed Appendix-A `TrackLegacy` records (RFC 9559
     // Appendix A.19..A.23 + A.28..A.32), indexed by stream index. `None` for
@@ -1116,15 +1175,31 @@ fn open_typed_impl(
         .zip(&track_codec_timing)
         .map(|((s, t), timing)| {
             let raw = t.audio_raw.unwrap_or_default();
-            let rate = audio_trim::track_rate(raw.sampling_frequency, raw.output_sampling_frequency);
+            let rate =
+                audio_trim::track_rate(raw.sampling_frequency, raw.output_sampling_frequency);
             let opus = s.params.codec_id.as_str() == "opus";
             (s.params.media_type == MediaType::Audio)
-                .then(|| audio_trim::TrackTrims::new(timing.codec_delay(), timing.seek_pre_roll(), rate, opus))
+                .then(|| {
+                    audio_trim::TrackTrims::new(
+                        timing.codec_delay(),
+                        timing.seek_pre_roll(),
+                        rate,
+                        opus,
+                    )
+                })
                 .flatten()
         })
         .collect();
-    let start_trims =
-        track_trims.iter().map(|t| if t.is_some() { audio_trim::Pending::Open } else { audio_trim::Pending::None }).collect();
+    let start_trims = track_trims
+        .iter()
+        .map(|t| {
+            if t.is_some() {
+                audio_trim::Pending::Open
+            } else {
+                audio_trim::Pending::None
+            }
+        })
+        .collect();
     let first_blocks = vec![None; track_trims.len()];
 
     // Per-stream `TrackIdentity` (RFC 9559 §5.1.4.1.18 / .19 / .20 / .23 / .4 /
@@ -1264,7 +1339,11 @@ fn open_typed_impl(
     // `CodecID == "V_UNCOMPRESSED"` and there is no spec default).
     let video_uncompressed_fourccs: Vec<Option<UncompressedFourCC>> = tracks
         .iter_mut()
-        .map(|t| t.uncompressed_fourcc_raw.take().map(|bytes| UncompressedFourCC { bytes }))
+        .map(|t| {
+            t.uncompressed_fourcc_raw
+                .take()
+                .map(|bytes| UncompressedFourCC { bytes })
+        })
         .collect();
 
     let video_geometries: Vec<Option<VideoGeometry>> = tracks
@@ -1358,6 +1437,8 @@ fn open_typed_impl(
         out_queue: std::collections::VecDeque::new(),
         metadata,
         duration_micros,
+        segment_duration_ticks: (info.duration.is_finite() && info.duration > 0.0)
+            .then_some(info.duration as u64),
         cues,
         cue_points,
         cues_cut,
@@ -1387,7 +1468,10 @@ fn open_typed_impl(
         active_stream_mask: None,
         timestamp_probe_bytes: 0,
         deferred_block: None,
-        webvtt_tracks: tracks.iter().map(|t| t.codec_id_string.starts_with("D_WEBVTT/")).collect(),
+        webvtt_tracks: tracks
+            .iter()
+            .map(|t| t.codec_id_string.starts_with("D_WEBVTT/"))
+            .collect(),
         last_metadata: PacketMetadata::default(),
         video_interlacings,
         video_geometries,
@@ -1417,6 +1501,7 @@ fn open_typed_impl(
         damage_events,
         resync_floor: 0,
         first_cluster_offset,
+        last_seek_strategy: None,
         track_uid_to_index,
         chapter_uid_to_index,
         attachment_uid_to_index,
@@ -1428,12 +1513,39 @@ fn open_typed_impl(
     Ok(demuxer)
 }
 
-/// Limit optional VP9 layout discovery at open to four MiB.
+/// How the most recent [`Demuxer::seek_to`] located the Cluster it landed
+/// on — see [`MkvDemuxer::seek_strategy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SeekStrategy {
+    /// A `Cues` lookup (RFC 9559 §22): one jump to the
+    /// `CueClusterPosition` of the last `CuePoint` at or before the target.
+    Cues,
+    /// No usable `Cues`: a byte-offset search over the Cluster run. Each
+    /// probe reads one bounded window inside the unexplored byte range,
+    /// resynchronises on the next vetted `Cluster` header inside it and
+    /// reads that Cluster's `Timestamp`. The probe point is interpolated
+    /// from the bracketing Timestamps (the Segment `Duration` standing in
+    /// for the Segment end until a later Cluster is seen), falling back
+    /// to the midpoint whenever an interpolated probe fails to halve the
+    /// range — a handful of positioned reads on a steady-bitrate file,
+    /// never more than ~2·log2(clusters), instead of one per Cluster.
+    Bisection,
+    /// No usable `Cues` and the bisection premise failed — a vetted
+    /// Cluster whose `Timestamp` was out of storage order, or the probe
+    /// budget ran out: the linear Cluster-`Timestamp` walk from the first
+    /// Cluster found the landing instead.
+    LinearScan,
+}
+
+/// How far into the Cluster stream [`MkvDemuxer::layouts_from_first_frames`]
+/// reads (bytes past the first Cluster) before giving up.
 const FIRST_FRAME_PEEK_BYTES: u64 = 4 << 20;
 
 /// What kind of damage a resilient demux recovered from — see
 /// [`DamageEvent`] and [`MkvDemuxer::damage_events`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DamageKind {
     /// A Top-Level master element (id given) failed to parse during the
     /// open-time Segment walk. Whatever the parser lifted before the
@@ -1562,7 +1674,10 @@ impl CrcLog {
     /// Keep `status` for the master whose body starts at `body_start`,
     /// once, charging `budget` for the room it takes first.
     fn record(&mut self, budget: &mut Budget, body_start: u64, status: CrcStatus) {
-        if self.has(body_start) || budget.room(&mut self.statuses).is_err() || budget.set_room(&mut self.kept).is_err() {
+        if self.has(body_start)
+            || budget.room(&mut self.statuses).is_err()
+            || budget.set_room(&mut self.kept).is_err()
+        {
             return;
         }
         self.kept.insert(body_start);
@@ -1579,6 +1694,7 @@ impl CrcLog {
 /// Segment, so each claim can be checked against the Segment itself.
 /// The audit distinguishes the ways a claim can fail to hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CueLieKind {
     /// The `CueTrack` (RFC 9559 §5.1.5.1.2.1) names a track number no
     /// `TrackEntry` in this Segment declares — the classic remnant of a
@@ -1737,6 +1853,7 @@ const MAX_CUE_AUDIT_FINDINGS: usize = 4096;
 /// Segment itself. The stale shape is an index left behind by an edit
 /// that moved elements; the hostile shape is a forged one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SeekLieKind {
     /// The `Seek` master omitted its `minOccurs: 1` `SeekPosition`
     /// child (§5.1.1.1.2). Parse time already surfaces this via
@@ -2014,7 +2131,10 @@ fn merge<T>(into: &mut Vec<T>, mut more: Vec<T>) {
 
 /// Add `more` to `into`, taking it whole when `into` is empty so the table
 /// is not rebuilt.
-fn merge_map(into: &mut std::collections::HashMap<u64, u32>, more: std::collections::HashMap<u64, u32>) {
+fn merge_map(
+    into: &mut std::collections::HashMap<u64, u32>,
+    more: std::collections::HashMap<u64, u32>,
+) {
     if into.is_empty() {
         *into = more;
     } else {
@@ -2050,8 +2170,10 @@ fn resync_spent() -> Error {
 fn is_damage(e: &Error) -> bool {
     match e {
         Error::InvalidData(_) => true,
-        Error::Io(io) => io.kind() == std::io::ErrorKind::UnexpectedEof
-            && !io.get_ref().is_some_and(|e| e.is::<SourceError>()),
+        Error::Io(io) => {
+            io.kind() == std::io::ErrorKind::UnexpectedEof
+                && !io.get_ref().is_some_and(|e| e.is::<SourceError>())
+        }
         _ => false,
     }
 }
@@ -2166,7 +2288,12 @@ enum Resync {
 
 /// [`scan_top_level_element`] taking what it reads, the candidates it vets
 /// included, from `budget`, and stopping when that runs out.
-fn scan_top_level_within(r: &mut dyn ReadSeek, from: u64, end: u64, budget: &mut u64) -> Result<Resync> {
+fn scan_top_level_within(
+    r: &mut dyn ReadSeek,
+    from: u64,
+    end: u64,
+    budget: &mut u64,
+) -> Result<Resync> {
     const CHUNK: usize = 64 * 1024;
     if from >= end {
         return Ok(Resync::Nothing);
@@ -2261,6 +2388,363 @@ fn vet_top_level_candidate(r: &mut dyn ReadSeek, candidate: u64, end: u64) -> Re
     Ok(Some(candidate))
 }
 
+/// Window one bisection probe reads at its start offset. Big enough to
+/// hold a whole typical Cluster header plus leading children, small
+/// enough that a probe costs one modest byte-range request.
+const PROBE_CHUNK: usize = 64 * 1024;
+/// Ceiling the probe window grows to (doubling per read) while a window
+/// held no vetted Cluster header — a Cluster at the RFC 9559 §25.1
+/// recommended ceiling (5 MB) is crossed in a handful of reads.
+const PROBE_CHUNK_MAX: usize = 1024 * 1024;
+/// How many stretches of Clusters a Cues-less seek searches, one
+/// bisection each, for a keyframe of the sought track at or before the
+/// target, before it walks the Clusters from the first: the landing
+/// Cluster, the one before it, then stretches reaching 1, 2, 4, 8, 16 and
+/// 32 seconds further back.
+const CUELESS_BACK_STEPS: u32 = 8;
+/// Hard cap on bisection probes per seek: 2^40 bytes of Cluster run halve
+/// to a window in 24 steps; the margin absorbs gaps and false candidates.
+const BISECT_MAX_PROBES: u32 = 96;
+/// Bytes carried from one probe window into the next so a candidate
+/// whose header and leading children straddle the boundary is vetted
+/// with context instead of a second read.
+const PROBE_CARRY: usize = 64;
+
+/// Child-element IDs the bisection vet accepts in a `Cluster` body: the
+/// RFC 9559 §5.1.3 children, the reclaimed `EncryptedBlock` (Appendix
+/// A.15) and legacy direct `Block` children the stream walk tolerates,
+/// `SilentTracks` (Appendix A.1), `CRC-32` and `Void`.
+const CLUSTER_CHILD_IDS: [u32; 12] = [
+    ids::TIMECODE,
+    ids::CRC32,
+    ids::POSITION,
+    ids::PREV_SIZE,
+    ids::SILENT_TRACKS,
+    ids::SIMPLE_BLOCK,
+    ids::BLOCK_GROUP,
+    ids::ENCRYPTED_BLOCK,
+    ids::VOID,
+    ids::BLOCK,
+    ids::BLOCK_DURATION,
+    ids::REFERENCE_BLOCK,
+];
+
+/// Number of leading Cluster children the in-window vet walks.
+const PROBE_VET_CHILDREN: usize = 8;
+
+/// One confirmed `Cluster` located by a bisection probe.
+#[derive(Clone, Copy, Debug)]
+struct ClusterProbe {
+    /// Absolute offset of the Cluster's Element ID byte.
+    offset: u64,
+    /// The Cluster's `Timestamp` (Segment Ticks).
+    timestamp: u64,
+    /// Absolute offset of the first byte after the Cluster (clamped to the
+    /// Segment end) when its size is known; `None` for an unknown-size
+    /// Cluster, whose end only the next Top-Level element defines.
+    next: Option<u64>,
+}
+
+enum WindowVet {
+    Accept(ClusterProbe),
+    Reject,
+    /// The window ended before the vet could reach the `Timestamp`.
+    NeedMore,
+}
+
+/// Vet a `Cluster` candidate whose Element ID starts at `buf[0]` (absolute
+/// offset `abs`) using only the bytes in `buf`. Accepted when the header
+/// parses, the body is bounded by `end` (an overrun is tolerated only
+/// when `tolerate_overrun`, the resilient reader's truncated final
+/// Cluster), every leading child seen (up to [`PROBE_VET_CHILDREN`])
+/// parses with a known Cluster-child ID and a body inside the Cluster,
+/// and a `Timestamp` precedes the first block — the RFC 9559 §5.1.3.1
+/// usage note (first child, or second after a `CRC-32`) widened to the
+/// `Position` / `PrevSize` / `SilentTracks` / `Void` prefixes the stream
+/// walk tolerates. Payload bytes that spell the Cluster ID fail one of
+/// these checks with overwhelming probability; the boundary check in
+/// [`probe_cluster_from`] catches the remainder.
+fn vet_cluster_in_window(buf: &[u8], abs: u64, end: u64, tolerate_overrun: bool) -> WindowVet {
+    // A window that reaches the end of the data cannot be extended: a
+    // header or value cut short there is a rejection, not a NeedMore.
+    let window_is_final = abs.saturating_add(buf.len() as u64) >= end;
+    let cut_short = || {
+        if window_is_final {
+            WindowVet::Reject
+        } else {
+            WindowVet::NeedMore
+        }
+    };
+    let mut cur = std::io::Cursor::new(buf);
+    let hdr = match read_element_header(&mut cur) {
+        Ok(h) if h.id == ids::CLUSTER => h,
+        Ok(_) => return WindowVet::Reject,
+        // Longest header: 4-byte ID + 8-byte size.
+        Err(_) if buf.len() < 12 => return cut_short(),
+        Err(_) => return WindowVet::Reject,
+    };
+    let body_start = abs.saturating_add(hdr.header_len as u64);
+    let (limit, next) = if hdr.size == VINT_UNKNOWN_SIZE {
+        (end, None)
+    } else {
+        let declared = body_start.saturating_add(hdr.size);
+        if declared > end {
+            if !tolerate_overrun {
+                return WindowVet::Reject;
+            }
+            (end, Some(end))
+        } else {
+            (declared, Some(declared))
+        }
+    };
+    let mut pos = body_start;
+    let mut timestamp: Option<u64> = None;
+    let mut children = 0usize;
+    while pos < limit && children < PROBE_VET_CHILDREN {
+        let rel = (pos - abs) as usize;
+        if rel >= buf.len() {
+            break;
+        }
+        let mut c = std::io::Cursor::new(&buf[rel..]);
+        let child = match read_element_header(&mut c) {
+            Ok(h) => h,
+            // A child header cut by the window's end: not a verdict
+            // unless the window is the data's end.
+            Err(_) if buf.len() - rel < 12 => return cut_short(),
+            Err(_) => return WindowVet::Reject,
+        };
+        if child.size == VINT_UNKNOWN_SIZE || !CLUSTER_CHILD_IDS.contains(&child.id) {
+            return WindowVet::Reject;
+        }
+        let child_body = pos.saturating_add(child.header_len as u64);
+        let child_end = child_body.saturating_add(child.size);
+        if child_end > limit {
+            return WindowVet::Reject;
+        }
+        match child.id {
+            ids::TIMECODE => {
+                if child.size == 0 || child.size > 8 {
+                    return WindowVet::Reject;
+                }
+                let v_rel = (child_body - abs) as usize;
+                let v_end = v_rel + child.size as usize;
+                if v_end > buf.len() {
+                    return cut_short();
+                }
+                let mut v = 0u64;
+                for &b in &buf[v_rel..v_end] {
+                    v = (v << 8) | b as u64;
+                }
+                timestamp = Some(v);
+                break;
+            }
+            ids::SIMPLE_BLOCK | ids::BLOCK_GROUP | ids::ENCRYPTED_BLOCK | ids::BLOCK => {
+                // A block before any Timestamp: not a Cluster the seek
+                // could land on (the stream walk needs the Timestamp
+                // first too).
+                return WindowVet::Reject;
+            }
+            _ => {}
+        }
+        pos = child_end;
+        children += 1;
+    }
+    match timestamp {
+        Some(ts) => WindowVet::Accept(ClusterProbe {
+            offset: abs,
+            timestamp: ts,
+            next,
+        }),
+        None if pos >= limit => WindowVet::Reject,
+        None => cut_short(),
+    }
+}
+
+/// Fill `buf` from `r` (retrying `Interrupted`), returning the number of
+/// bytes read; stops early at end of input.
+fn read_fully(r: &mut dyn ReadSeek, buf: &mut [u8]) -> usize {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    filled
+}
+
+/// Re-vet a candidate at `abs` with a full window read at the candidate
+/// itself (the window that found it ended before its `Timestamp`).
+fn vet_cluster_via_reader(
+    r: &mut dyn ReadSeek,
+    abs: u64,
+    end: u64,
+    tolerate_overrun: bool,
+) -> Result<Option<ClusterProbe>> {
+    let want = (end.saturating_sub(abs) as usize).min(PROBE_CHUNK);
+    let mut buf = vec![0u8; want];
+    r.seek(SeekFrom::Start(abs))?;
+    let n = read_fully(r, &mut buf);
+    buf.truncate(n);
+    Ok(
+        match vet_cluster_in_window(&buf, abs, end, tolerate_overrun) {
+            WindowVet::Accept(p) => Some(p),
+            _ => None,
+        },
+    )
+}
+
+/// Is the element right after `c` a Top-Level element (or `Void`), the
+/// way a real Cluster's successor must be? Payload bytes impersonating a
+/// Cluster header are followed by more payload. Checked from `window`
+/// (absolute start `window_start`) when the successor's header lies in
+/// it, otherwise with one positioned read. An unknown-size candidate has
+/// no declared end to check and is taken at face value — the
+/// conservative verdict (the stream walk after landing resynchronises on
+/// garbage the same way it does for any damaged unknown-size run).
+fn confirm_cluster_boundary(
+    r: &mut dyn ReadSeek,
+    c: ClusterProbe,
+    end: u64,
+    window: &[u8],
+    window_start: u64,
+) -> Result<bool> {
+    let Some(next) = c.next else {
+        return Ok(true);
+    };
+    if next >= end {
+        return Ok(true);
+    }
+    let successor_ok = |h: Result<crate::ebml::ElementHeader>| match h {
+        Ok(h) => TOP_LEVEL_IDS.contains(&h.id) || h.id == ids::VOID,
+        Err(_) => false,
+    };
+    if next >= window_start {
+        let rel = (next - window_start) as usize;
+        if rel + 12 <= window.len() {
+            let mut cur = std::io::Cursor::new(&window[rel..]);
+            return Ok(successor_ok(read_element_header(&mut cur)));
+        }
+    }
+    r.seek(SeekFrom::Start(next))?;
+    Ok(successor_ok(read_element_header(&mut *r)))
+}
+
+/// Bisection probe: the first confirmed `Cluster` whose Element ID starts
+/// in `[from, scan_end)`, or `None` when the range holds none. Bodies
+/// are bounded by `end` (the Segment end), not by `scan_end`: a Cluster
+/// that starts inside the range and runs past it is a hit. Reads
+/// `[from, …)` in windows ([`PROBE_CHUNK`], doubling to
+/// [`PROBE_CHUNK_MAX`] while nothing vets), scanning each for the 4-byte
+/// Cluster ID and vetting candidates in place
+/// ([`vet_cluster_in_window`]); a candidate too close to the window's
+/// end is deferred to the next window (which starts [`PROBE_CARRY`]
+/// bytes early) or, when there is no next window, re-read at itself. A
+/// vetted candidate is then confirmed by its boundary
+/// ([`confirm_cluster_boundary`]) unless it starts exactly at
+/// `trusted_at` — the byte right after a Cluster the caller already
+/// trusts, where the element found is that Cluster's successor by
+/// construction. One positioned read per window, at most one more for
+/// the boundary.
+///
+/// The reader position on return is unspecified; the caller seeks.
+fn probe_cluster_from(
+    r: &mut dyn ReadSeek,
+    from: u64,
+    scan_end: u64,
+    end: u64,
+    tolerate_overrun: bool,
+    trusted_at: Option<u64>,
+) -> Result<Option<ClusterProbe>> {
+    let scan_end = scan_end.min(end);
+    if from >= scan_end {
+        return Ok(None);
+    }
+    let cluster_id = ids::CLUSTER.to_be_bytes();
+    let mut chunk = PROBE_CHUNK;
+    let mut base = from;
+    let mut carry: Vec<u8> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    while base < scan_end {
+        let want = ((end - base) as usize).min(chunk);
+        buf.clear();
+        buf.extend_from_slice(&carry);
+        buf.resize(carry.len() + want, 0);
+        r.seek(SeekFrom::Start(base))?;
+        let carry_len = carry.len();
+        let filled = read_fully(r, &mut buf[carry_len..]);
+        if filled == 0 {
+            return Ok(None);
+        }
+        buf.truncate(carry_len + filled);
+        let window_start = base - carry_len as u64;
+        let window_end = window_start + buf.len() as u64;
+        let has_next_window = window_end < scan_end;
+        let mut i = 0usize;
+        while i + 4 <= buf.len() {
+            let abs = window_start + i as u64;
+            if abs >= scan_end {
+                return Ok(None);
+            }
+            if buf[i..i + 4] != cluster_id {
+                i += 1;
+                continue;
+            }
+            if has_next_window && buf.len() - i <= PROBE_CARRY {
+                // Vet it with context from the next window instead.
+                break;
+            }
+            let vetted = match vet_cluster_in_window(&buf[i..], abs, end, tolerate_overrun) {
+                WindowVet::Accept(p) => Some(p),
+                WindowVet::Reject => None,
+                WindowVet::NeedMore => vet_cluster_via_reader(r, abs, end, tolerate_overrun)?,
+            };
+            if let Some(p) = vetted
+                && (trusted_at == Some(abs)
+                    || confirm_cluster_boundary(r, p, end, &buf, window_start)?)
+            {
+                return Ok(Some(p));
+            }
+            i += 1;
+        }
+        let keep = buf.len().min(PROBE_CARRY);
+        carry = buf[buf.len() - keep..].to_vec();
+        base = window_end;
+        chunk = (chunk * 2).min(PROBE_CHUNK_MAX);
+    }
+    Ok(None)
+}
+
+/// Byte offset at which an interpolated Cues-less seek probe starts.
+///
+/// The estimate is the point of `[lo_off, hi_off)` whose share of the
+/// range equals the target's share of `[lo_ts, hi_ts]` (Cluster bytes
+/// taken as roughly proportional to Cluster time). The Cluster holding
+/// the target starts *before* the byte the estimate names, and a probe
+/// returns the first Cluster at or after its start, so the probe is
+/// pulled back by `back_off` (one Cluster length, as sampled from the
+/// lower bracket) to land on the wanted Cluster rather than its
+/// successor. Clamped into the range; `hi_ts` must exceed `lo_ts`.
+fn interpolation_offset(
+    lo_off: u64,
+    hi_off: u64,
+    lo_ts: u64,
+    hi_ts: u64,
+    target: u64,
+    back_off: u64,
+) -> u64 {
+    let span = (hi_off - lo_off) as u128;
+    let num = (target.clamp(lo_ts, hi_ts) - lo_ts) as u128;
+    let den = (hi_ts - lo_ts) as u128;
+    let estimate = lo_off + (span * num / den) as u64;
+    estimate
+        .saturating_sub(back_off)
+        .min(hi_off.saturating_sub(1))
+        .max(lo_off)
+}
+
 #[derive(Default)]
 struct SegmentInfo {
     timecode_scale: u64,
@@ -2281,7 +2765,8 @@ struct SegmentInfo {
 /// of the element's data. Elements with no `CRC-32` child are not
 /// represented here — absence of a status means "no CRC to check,"
 /// which the spec explicitly permits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct CrcStatus {
     /// EBML element ID of the Top-Level master that carried the `CRC-32`
     /// child (e.g. [`ids::TRACKS`], [`ids::INFO`]).
@@ -2329,6 +2814,7 @@ impl CrcStatus {
 /// reverse walker would consume to step back across the previous
 /// Cluster.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClusterRecord {
     /// Absolute file offset of the Cluster's body (the byte right after
     /// its id+size header). Stable across re-seeks; used as the dedup
@@ -2489,6 +2975,7 @@ impl SeekEntry {
 /// [`next_uuid`]: SegmentLinking::next_uuid
 /// [`families`]: SegmentLinking::families
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SegmentLinking {
     /// `SegmentUUID` (RFC 9559 §5.1.2.1, id `0x73A4`) — the 128-bit UID
     /// identifying this Segment among others: exactly 16 bytes. `None`
@@ -2553,6 +3040,7 @@ impl SegmentLinking {
 /// SegmentUUID) without rewriting the opaque chapter-codec command data —
 /// only the mapping changes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChapterTranslate {
     /// `ChapterTranslateID` (RFC 9559 §5.1.2.8.1, id `0x69A5`,
     /// `minOccurs: 1`) — the binary value representing this Segment in the
@@ -2583,6 +3071,7 @@ pub struct ChapterTranslate {
 /// The `TrackEntry`-level twin of [`ChapterTranslate`] (the Segment-level
 /// mapping), surfaced per stream via [`MkvDemuxer::track_translates`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TrackTranslate {
     /// `TrackTranslateTrackID` (RFC 9559 §5.1.4.1.27.1, id `0x66A5`,
     /// `minOccurs: 1`) — the binary value the chapter codec uses to name
@@ -2634,6 +3123,7 @@ pub struct TrackTranslate {
 /// common case for a modern file, in which case the typed accessor returns
 /// `None` rather than a hollow record.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct TrackLegacy {
     /// `CodecSettings` (RFC 9559 Appendix A.19, id `0x3A9697`, utf-8) — a
     /// string describing the encoding settings used. `None` when absent.
@@ -3134,9 +3624,15 @@ fn parse_info(
         match e.id {
             ids::TIMECODE_SCALE => out.timecode_scale = read_uint(r, e.size as usize)?,
             ids::DURATION => out.duration = read_float(r, e.size as usize)?,
-            ids::TITLE => keep_info_entry(metadata, "title", info_text(r, e.size, budget)?, budget)?,
-            ids::MUXING_APP => keep_info_entry(metadata, "muxer", info_text(r, e.size, budget)?, budget)?,
-            ids::WRITING_APP => keep_info_entry(metadata, "encoder", info_text(r, e.size, budget)?, budget)?,
+            ids::TITLE => {
+                keep_info_entry(metadata, "title", info_text(r, e.size, budget)?, budget)?
+            }
+            ids::MUXING_APP => {
+                keep_info_entry(metadata, "muxer", info_text(r, e.size, budget)?, budget)?
+            }
+            ids::WRITING_APP => {
+                keep_info_entry(metadata, "encoder", info_text(r, e.size, budget)?, budget)?
+            }
             ids::DATE_UTC => {
                 // 8-byte signed integer: nanoseconds since 2001-01-01 00:00:00 UTC.
                 if e.size == 8 {
@@ -3164,7 +3660,9 @@ fn parse_info(
                 budget.room(&mut out.linking.families)?;
                 out.linking.families.push(budget.read(r, e.size)?);
             }
-            ids::SEGMENT_FILENAME => out.linking.segment_filename = Some(info_text(r, e.size, budget)?),
+            ids::SEGMENT_FILENAME => {
+                out.linking.segment_filename = Some(info_text(r, e.size, budget)?)
+            }
             ids::PREV_FILENAME => out.linking.prev_filename = Some(info_text(r, e.size, budget)?),
             ids::NEXT_FILENAME => out.linking.next_filename = Some(info_text(r, e.size, budget)?),
             ids::CHAPTER_TRANSLATE => {
@@ -3189,7 +3687,12 @@ fn info_text(r: &mut dyn ReadSeek, size: u64, budget: &mut Budget) -> Result<Str
 /// One text field of `size` octets at the reader: at most
 /// [`MAX_TEXT_BYTES`], else invalid data with `exceeded`, and charged to
 /// `budget` before it is read.
-fn text_field(r: &mut dyn ReadSeek, size: u64, budget: &mut Budget, exceeded: &'static str) -> Result<String> {
+fn text_field(
+    r: &mut dyn ReadSeek,
+    size: u64,
+    budget: &mut Budget,
+    exceeded: &'static str,
+) -> Result<String> {
     if size > MAX_TEXT_BYTES as u64 {
         return Err(Error::invalid(exceeded));
     }
@@ -3210,7 +3713,12 @@ fn info_uid(r: &mut dyn ReadSeek, size: u64, budget: &mut Budget) -> Result<Vec<
 /// value was charged as it was read; its key and two of the shared list's
 /// slots, the most a list that doubles as it grows holds per entry, are
 /// charged here.
-fn keep_info_entry(metadata: &mut Vec<(String, String)>, key: &str, value: String, budget: &mut Budget) -> Result<()> {
+fn keep_info_entry(
+    metadata: &mut Vec<(String, String)>,
+    key: &str,
+    value: String,
+    budget: &mut Budget,
+) -> Result<()> {
     if !value.is_empty() {
         budget.charge(2 * std::mem::size_of::<(String, String)>() + key.len())?;
         metadata.push((key.into(), value));
@@ -3221,7 +3729,12 @@ fn keep_info_entry(metadata: &mut Vec<(String, String)>, key: &str, value: Strin
 /// Keep the flat metadata entry `key` = `value`, charging the key, a copy
 /// of the value and two of the shared list's slots, the most a list that
 /// doubles as it grows holds per entry, before the value is copied.
-fn keep_entry(metadata: &mut Vec<(String, String)>, key: String, value: &str, budget: &mut Budget) -> Result<()> {
+fn keep_entry(
+    metadata: &mut Vec<(String, String)>,
+    key: String,
+    value: &str,
+    budget: &mut Budget,
+) -> Result<()> {
     budget.charge(2 * std::mem::size_of::<(String, String)>() + key.capacity() + value.len())?;
     metadata.push((key, value.to_owned()));
     Ok(())
@@ -3234,7 +3747,11 @@ fn keep_entry(metadata: &mut Vec<(String, String)>, key: String, value: &str, bu
 /// mapping applies to — an empty list means "all editions using the given
 /// codec" per §5.1.2.8.3. Every child must fit the master, and what is
 /// kept is charged to the `Info` budget.
-fn parse_chapter_translate(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<ChapterTranslate> {
+fn parse_chapter_translate(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    budget: &mut Budget,
+) -> Result<ChapterTranslate> {
     let mut out = ChapterTranslate::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
@@ -3262,7 +3779,11 @@ fn parse_chapter_translate(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) 
 /// using the given codec" per §5.1.4.1.27.3. The `TrackTranslateTrackID` bytes
 /// are surfaced verbatim; their meaning is defined by the chapter codec, not
 /// the container.
-fn parse_track_translate(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<TrackTranslate> {
+fn parse_track_translate(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    budget: &mut Budget,
+) -> Result<TrackTranslate> {
     let mut out = TrackTranslate::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
@@ -3404,7 +3925,12 @@ const MAX_SIMPLE_TAG_DEPTH: u32 = 16;
 /// what resolving it will add — see [`resolved_tag_bytes`] and
 /// [`resolved_simple_tag_bytes`] — so resolution stays within the budget
 /// too.
-fn parse_tags(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<RawTag>, budget: &mut Budget) -> Result<()> {
+fn parse_tags(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    out: &mut Vec<RawTag>,
+    budget: &mut Budget,
+) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let tag_end = child_end(r, e.size, end)?;
@@ -3437,7 +3963,8 @@ fn parse_tags(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<RawTag>, budget: &mu
 /// one by one: its typed record, its resolved targets and the scope
 /// prefix of its flat keys.
 fn resolved_tag_bytes(t: &RawTag) -> usize {
-    let uids = t.track_uids.len() + t.edition_uids.len() + t.chapter_uids.len() + t.attachment_uids.len();
+    let uids =
+        t.track_uids.len() + t.edition_uids.len() + t.chapter_uids.len() + t.attachment_uids.len();
     std::mem::size_of::<Tag>() + uids * std::mem::size_of::<TargetUid>() + 2 * MAX_TAG_KEY_PREFIX
 }
 
@@ -3449,7 +3976,10 @@ fn resolved_tag_bytes(t: &RawTag) -> usize {
 fn resolved_simple_tag_bytes(s: &RawSimpleTag, flat: bool) -> usize {
     let entry = match &s.value {
         SimpleTagValue::String(v) if flat && !s.name.is_empty() && !v.is_empty() => {
-            MAX_TAG_KEY_PREFIX + s.name.len() + v.len() + 4 * std::mem::size_of::<(String, String)>()
+            MAX_TAG_KEY_PREFIX
+                + s.name.len()
+                + v.len()
+                + 4 * std::mem::size_of::<(String, String)>()
         }
         _ => 0,
     };
@@ -3484,7 +4014,12 @@ fn parse_tag(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag, budget: &mut Budget
     Ok(())
 }
 
-fn parse_targets(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag, budget: &mut Budget) -> Result<()> {
+fn parse_targets(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    t: &mut RawTag,
+    budget: &mut Budget,
+) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         child_end(r, e.size, end)?;
@@ -3670,7 +4205,10 @@ fn resolve_tags(
         // that don't resolve. A Tag with no UIDs at all is a global tag
         // (RFC 9559 §5.1.8.1.1, "If empty or omitted, then the tag value
         // describes everything in the Segment").
-        let uids = tag.track_uids.len() + tag.edition_uids.len() + tag.chapter_uids.len() + tag.attachment_uids.len();
+        let uids = tag.track_uids.len()
+            + tag.edition_uids.len()
+            + tag.chapter_uids.len()
+            + tag.attachment_uids.len();
         let mut resolved_uids: Vec<TargetUid> = Vec::with_capacity(uids);
         let mut had_any_uid = false;
         for &uid in &tag.track_uids {
@@ -3770,13 +4308,14 @@ fn resolve_tags(
             // non-empty string. Binary tag values (cover art, etc.) and
             // empty placeholders are skipped to match the pre-typed
             // behaviour where only `(name, str)` pairs surfaced.
-            if let SimpleTagValue::String(v) = &raw.value {
-                if !raw.name.is_empty() && !v.is_empty() {
-                    let mut key = String::with_capacity(prefix.len() + raw.name.len());
-                    key.push_str(&prefix);
-                    key.extend(raw.name.chars().map(|c| c.to_ascii_lowercase()));
-                    metadata.push((key, v.clone()));
-                }
+            if let SimpleTagValue::String(v) = &raw.value
+                && !raw.name.is_empty()
+                && !v.is_empty()
+            {
+                let mut key = String::with_capacity(prefix.len() + raw.name.len());
+                key.push_str(&prefix);
+                key.extend(raw.name.chars().map(|c| c.to_ascii_lowercase()));
+                metadata.push((key, v.clone()));
             }
             typed_simple.push(simple_tag_from_raw(raw));
         }
@@ -3802,7 +4341,8 @@ fn resolve_tags(
 /// surfaced in metadata corresponds to a [`SimpleTag`] inside one of these
 /// `Tag`s, but [`SimpleTag`] additionally preserves language, default
 /// flag, original case, and binary payloads that the flat view discards.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
+#[non_exhaustive]
 pub struct Tag {
     /// Scope of this tag — see [`Targets`] for the per-field semantics.
     pub targets: Targets,
@@ -3819,6 +4359,7 @@ pub struct Tag {
 /// global as far as scoping is concerned — those fields are purely
 /// informational display hints per RFC 9559 §5.1.8.1.1.1 / §5.1.8.1.1.2.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Targets {
     /// `TargetTypeValue` (RFC 9559 §5.1.8.1.1.1). Default per spec is 50
     /// ("ALBUM / OPERA / CONCERT / MOVIE / EPISODE") but we surface
@@ -3945,6 +4486,7 @@ impl Targets {
 /// level so an unrecognised value doesn't break the comparison rule for
 /// the named ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum TargetLevel {
     /// `10` — `SHOT`. The lowest hierarchy found in music or movies.
     Shot,
@@ -4058,7 +4600,8 @@ pub enum TargetUid {
 /// `TagName` case (the flat view lower-cases) plus language metadata and
 /// binary-payload tags (e.g. cover-art bytes) that the legacy
 /// `(key, value)` view can't represent.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
+#[non_exhaustive]
 pub struct SimpleTag {
     /// `TagName` (RFC 9559 §5.1.8.1.2.1).
     pub name: String,
@@ -4121,6 +4664,7 @@ pub enum SimpleTagValue {
 /// being dropped — the spec lets a virtual track reference a track that a
 /// reader chose not to surface.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TrackOperation {
     /// Resolved `TrackCombinePlanes` planes, in on-disk order. Empty when
     /// the operation has no `TrackCombinePlanes` child.
@@ -4143,6 +4687,7 @@ impl TrackOperation {
 /// [`TrackOperation::planes`] list: a referenced video track plus the role
 /// it plays in the combined 3D track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TrackPlane {
     /// The plane's source track, resolved from its `TrackPlaneUID`.
     pub track: TrackRef,
@@ -4150,8 +4695,16 @@ pub struct TrackPlane {
     pub plane_type: TrackPlaneType,
 }
 
+impl TrackPlane {
+    /// Build `TrackPlane` from every field, in declaration order.
+    pub fn new(track: TrackRef, plane_type: TrackPlaneType) -> Self {
+        Self { track, plane_type }
+    }
+}
+
 /// `TrackPlaneType` (RFC 9559 §5.1.4.1.30.4, Table 20).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TrackPlaneType {
     /// `0` — left eye.
     LeftEye,
@@ -4196,7 +4749,8 @@ impl TrackPlaneType {
 /// [`Demuxer::streams`](oxideav_core::Demuxer::streams) when the UID
 /// matches a track in the same Segment, or `None` for a dangling
 /// reference.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct TrackRef {
     /// The referenced `TrackUID` as stored in the file.
     pub track_uid: u64,
@@ -4220,6 +4774,7 @@ pub struct TrackRef {
 /// a caller feeding a stereoscopic `TrackCombinePlanes` track routes each
 /// packet to the decoder for its plane by matching `role`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VirtualPacketOrigin {
     /// Stream index of the virtual track the packet was synthesised for
     /// (always equal to the returned packet's `stream_index`).
@@ -4230,9 +4785,21 @@ pub struct VirtualPacketOrigin {
     pub role: VirtualPacketRole,
 }
 
+impl VirtualPacketOrigin {
+    /// Build `VirtualPacketOrigin` from every field, in declaration order.
+    pub fn new(virtual_stream: u32, source_stream: u32, role: VirtualPacketRole) -> Self {
+        Self {
+            virtual_stream,
+            source_stream,
+            role,
+        }
+    }
+}
+
 /// The `TrackOperation` reference kind behind a synthesised virtual-track
 /// packet — see [`VirtualPacketOrigin::role`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VirtualPacketRole {
     /// The source is a `TrackCombinePlanes > TrackPlane` reference (RFC
     /// 9559 §5.1.4.1.30.2): the packet carries one plane of the combined
@@ -4321,7 +4888,8 @@ fn build_virtual_consumers(
 ///
 /// Container-level only — the bytes inside `BlockAdditional` are not
 /// surfaced here; this just declares the *shape* of the side channel.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct BlockAdditionMapping {
     /// `BlockAddIDValue` (RFC 9559 §5.1.4.1.17.1) — the `BlockAddID`
     /// (§5.1.3.5.2.3) value this mapping describes. Range is "`>=2`"
@@ -4861,6 +5429,7 @@ pub struct TrackAudio {
 /// de-emphasis filters belongs to the cited external standards, not the
 /// container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AudioEmphasis {
     /// `0` — no emphasis (the spec default).
     NoEmphasis,
@@ -5438,6 +6007,7 @@ impl VideoInterlacing {
 /// `FlagInterlaced` (RFC 9559 §5.1.4.1.28.1, Table 3): whether the video
 /// track's frames are interlaced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum FlagInterlaced {
     /// `0` — interlacing status is unknown. Spec default; "SHOULD be
     /// avoided" per Table 3.
@@ -5484,6 +6054,7 @@ impl FlagInterlaced {
 /// [`FlagInterlaced::Interlaced`] — the spec is explicit that the element
 /// MUST be ignored otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FieldOrder {
     /// `0` — progressive. Table 4 marks this value as "SHOULD be avoided;
     /// setting FlagInterlaced to 2 is sufficient", but it's still a legal
@@ -5554,7 +6125,8 @@ impl FieldOrder {
 ///
 /// [`name`]: DocTypeExtension::name
 /// [`version`]: DocTypeExtension::version
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct DocTypeExtension {
     /// `DocTypeExtensionName` (RFC 8794 §11.2.10): the name distinguishing
     /// this extension from others of the same `DocType` + `DocTypeVersion`.
@@ -5580,7 +6152,8 @@ pub struct DocTypeExtension {
 /// for the common file that declares none).
 ///
 /// [`doc_type_extensions`]: EbmlHeader::doc_type_extensions
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct EbmlHeader {
     /// `EBMLVersion` (RFC 8794 §11.2.2): the version of EBML used to create the
     /// file. Spec default `1` materialised when absent.
@@ -5629,6 +6202,7 @@ pub struct EbmlHeader {
 /// "right eye is first" / "left eye is first" parenthetical phrasings.
 /// Per §18.10 odd values of StereoMode mean the left eye comes first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum StereoMode {
     /// `0` — mono (no stereo packing). Spec default.
     #[default]
@@ -5752,6 +6326,7 @@ impl StereoMode {
 /// modern file legitimately has no `OldStereoMode` at all. Values outside
 /// Table 7 pass through [`OldStereoMode::Other`] rather than being dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OldStereoMode {
     /// `0` — mono (no stereo packing).
     Mono,
@@ -5811,6 +6386,7 @@ impl OldStereoMode {
 /// additions, so any value outside Table 18 passes through the
 /// [`ProjectionType::Other`] variant rather than being dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ProjectionType {
     /// `0` — rectangular (flat) projection. Spec default; per §5.1.4.1.28.43
     /// `ProjectionPrivate` MUST NOT be present when this type is in effect.
@@ -5958,6 +6534,7 @@ impl Projection {
 /// additions. The §5.1.4.1.28.4 default `0` is materialised on the typed
 /// surface so an empty `Video` master decodes as `Some(AlphaMode::None)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum AlphaMode {
     /// `0` — no alpha-channel data. Spec default; either the
     /// `BlockAdditional` element with `BlockAddID=1` is absent, or it
@@ -6151,6 +6728,7 @@ impl VideoGeometry {
 /// outside the registered set surfaces via [`DisplayUnit::Other`] rather than
 /// being dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum DisplayUnit {
     /// `0` — display dimensions are in pixels. Spec default.
     #[default]
@@ -6334,6 +6912,7 @@ impl VideoColour {
 /// (with `3` reserved) — any other value surfaces via
 /// [`MatrixCoefficients::Other`] for forward compatibility.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MatrixCoefficients {
     Identity,
     BT709,
@@ -6407,6 +6986,7 @@ impl MatrixCoefficients {
 
 /// `ChromaSitingHorz` (RFC 9559 §5.1.4.1.28.23, Table 13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ChromaSitingHorz {
     /// `0` — spec default.
     #[default]
@@ -6447,6 +7027,7 @@ impl ChromaSitingHorz {
 
 /// `ChromaSitingVert` (RFC 9559 §5.1.4.1.28.24, Table 14).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ChromaSitingVert {
     /// `0` — spec default.
     #[default]
@@ -6488,6 +7069,7 @@ impl ChromaSitingVert {
 /// `Range` (RFC 9559 §5.1.4.1.28.25, Table 15): clipping of the colour
 /// ranges. Spec default `0` (*unspecified*).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ColourRange {
     /// `0` — spec default.
     #[default]
@@ -6533,6 +7115,7 @@ impl ColourRange {
 /// `TransferCharacteristics` (RFC 9559 §5.1.4.1.28.26, Table 16) — the
 /// transfer function the video uses; adopted from Table 3 of ITU-T H.273.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransferCharacteristics {
     Reserved0,
     BT709,
@@ -6617,6 +7200,7 @@ impl TransferCharacteristics {
 /// `Primaries` (RFC 9559 §5.1.4.1.28.27, Table 17) — the colour primaries
 /// the video uses; adopted from Table 2 of ITU-T H.273.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Primaries {
     Reserved0,
     BT709,
@@ -6778,6 +7362,7 @@ impl MasteringMetadata {
 /// `encodings` is returned sorted by descending `order` so iterating it
 /// front-to-back is the spec-mandated *decode* order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContentEncodings {
     /// Each [`ContentEncoding`], sorted by descending
     /// [`ContentEncoding::order`] (decode order — apply the first entry
@@ -6796,6 +7381,7 @@ impl ContentEncodings {
 /// One `ContentEncoding` (RFC 9559 §5.1.4.1.31.1): a single compression or
 /// encryption step in a track's [`ContentEncodings`] chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContentEncoding {
     /// `ContentEncodingOrder` (§5.1.4.1.31.2, default 0). Encodings are
     /// applied to the data on *write* from lowest order to highest, so a
@@ -6806,6 +7392,21 @@ pub struct ContentEncoding {
     pub scope: ContentEncodingScope,
     /// The transformation itself — compression or encryption settings.
     pub transform: ContentEncodingTransform,
+}
+
+impl ContentEncoding {
+    /// Build `ContentEncoding` from every field, in declaration order.
+    pub fn new(
+        order: u64,
+        scope: ContentEncodingScope,
+        transform: ContentEncodingTransform,
+    ) -> Self {
+        Self {
+            order,
+            scope,
+            transform,
+        }
+    }
 }
 
 /// `ContentEncodingScope` (RFC 9559 §5.1.4.1.31.3, Table 21): a bit field
@@ -6874,6 +7475,7 @@ pub enum ContentEncodingTransform {
 /// `Option<u64>` rather than a synthesised enum. The container is a pure
 /// carrier: it never computes, verifies, or interprets a signature.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContentSigning {
     /// `ContentSignature` (Appendix A.33, id `0x47E3`, binary): the
     /// cryptographic signature of the contents. `None` when absent.
@@ -6904,6 +7506,7 @@ impl ContentSigning {
 
 /// `ContentCompAlgo` (RFC 9559 §5.1.4.1.31.6, Table 23).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContentCompAlgo {
     /// `0` — zlib (RFC 1950).
     Zlib,
@@ -6949,6 +7552,7 @@ impl ContentCompAlgo {
 
 /// `ContentEncAlgo` (RFC 9559 §5.1.4.1.31.9, Table 24).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContentEncAlgo {
     /// `0` — not encrypted (signals only signing, per spec).
     None,
@@ -7001,6 +7605,7 @@ impl ContentEncAlgo {
 
 /// `AESSettingsCipherMode` (RFC 9559 §5.1.4.1.31.12, Table 26).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AesCipherMode {
     /// `1` — AES-CTR (counter mode).
     Ctr,
@@ -7044,6 +7649,7 @@ impl AesCipherMode {
 /// string; this typed view preserves the edition grouping, edition flags,
 /// nested chapters, and *all* multilingual [`ChapterDisplay`] rows.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Edition {
     /// `EditionUID` (RFC 9559 §5.1.7.1.1). `None` when the element was
     /// absent (it's optional); never zero (the spec bars 0).
@@ -7147,6 +7753,7 @@ impl Edition {
 /// `post-rfc9559-elements.md`) — a human-readable edition name in one or
 /// more languages. Part of [`Edition::displays`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EditionDisplay {
     /// `EditionString` (v5 element `0x4521`, utf-8, exactly one per
     /// `EditionDisplay`) — "the string to use as the edition name". May
@@ -7176,6 +7783,7 @@ pub struct EditionDisplay {
 /// skipped", whereas absence carries no assertion at all. Hence
 /// [`Chapter::skip_type`] is an `Option`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChapterSkipType {
     /// `0` — "Content which should not be skipped."
     NoSkipping,
@@ -7257,6 +7865,7 @@ impl ChapterSkipType {
 /// (default = 0); every other field is the zero-value equivalent of
 /// "element absent."
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Chapter {
     /// 1-based index across the whole `Chapters` element, assigned in
     /// document order (top-level then nested, depth-first). Matches the
@@ -7366,6 +7975,7 @@ impl Default for Chapter {
 /// One `ChapterDisplay` master (RFC 9559 §5.1.7.1.4.9) — a chapter title
 /// in one language. Part of [`Chapter::displays`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChapterDisplay {
     /// `ChapString` (RFC 9559 §5.1.7.1.4.10) — the title text.
     pub string: String,
@@ -7389,6 +7999,7 @@ pub struct ChapterDisplay {
 /// container surfaces the raw payloads only — it never executes a chapter
 /// command. Part of [`Chapter::chap_processes`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChapProcess {
     /// `ChapProcessCodecID` (RFC 9559 §5.1.7.1.4.15) — the chapter-codec
     /// type. Spec default is `0` (Matroska Script); materialised so
@@ -7408,6 +8019,7 @@ pub struct ChapProcess {
 /// chapter-codec command and when it should run. Part of
 /// [`ChapProcess::commands`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChapProcessCommand {
     /// `ChapProcessTime` (RFC 9559 §5.1.7.1.4.18) — when the command
     /// SHOULD be handled: `0` during the whole chapter, `1` before
@@ -7741,13 +8353,17 @@ fn parse_chapter_atom(
                 // NoSkipping. Out-of-enumeration values surface as
                 // Unknown(v) per the robust-reader rule.
                 ids::CHAPTER_SKIP_TYPE => {
-                    atom.skip_type = Some(ChapterSkipType::from_raw(read_uint(r, e.size as usize)?));
+                    atom.skip_type =
+                        Some(ChapterSkipType::from_raw(read_uint(r, e.size as usize)?));
                 }
                 ids::CHAPTER_DISPLAY => {
                     if let Some(disp) = parse_chapter_display(r, e_end, budget)? {
                         // The first display kept titles the chapter.
                         if atom.displays.is_empty() {
-                            budget.charge(entry_bytes(flat_key_len("chapter", "title"), disp.string.len()))?;
+                            budget.charge(entry_bytes(
+                                flat_key_len("chapter", "title"),
+                                disp.string.len(),
+                            ))?;
                         }
                         budget.room(&mut atom.displays)?;
                         atom.displays.push(disp);
@@ -7817,7 +8433,10 @@ fn parse_chapter_atom(
     // Flat metadata view: only top-of-atom fields, keyed by the 1-based
     // index, already charged. `title` is the first non-empty display
     // string (back-compat with the pre-typed behaviour).
-    metadata.push((flat_key("chapter", index, "start_ms"), millis(atom.time_start_ns)));
+    metadata.push((
+        flat_key("chapter", index, "start_ms"),
+        millis(atom.time_start_ns),
+    ));
     if let Some(ns) = atom.time_end_ns {
         metadata.push((flat_key("chapter", index, "end_ms"), millis(ns)));
     }
@@ -7843,7 +8462,11 @@ fn parse_chapter_atom(
 /// present-but-*empty* `EditionString` is kept: the schema does not
 /// prohibit an empty string and there is no legacy flat-view behaviour
 /// to preserve. Unknown children are skipped per the normal EBML rule.
-fn parse_edition_display(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<Option<EditionDisplay>> {
+fn parse_edition_display(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    budget: &mut Budget,
+) -> Result<Option<EditionDisplay>> {
     let mut string: Option<String> = None;
     let mut languages: Vec<String> = Vec::new();
     while r.stream_position()? < end {
@@ -7873,7 +8496,11 @@ fn parse_edition_display(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) ->
 /// Returns `None` only when the master carries no (or an empty) `ChapString`
 /// — an unusable row the flat view always dropped. `ChapLanguage` defaults
 /// to `"eng"` per RFC 9559 §5.1.7.1.4.11.
-fn parse_chapter_display(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<Option<ChapterDisplay>> {
+fn parse_chapter_display(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    budget: &mut Budget,
+) -> Result<Option<ChapterDisplay>> {
     let mut string: Option<String> = None;
     let mut language: Option<String> = None;
     let mut language_bcp47: Option<String> = None;
@@ -7888,11 +8515,15 @@ fn parse_chapter_display(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) ->
                     string = Some(v);
                 }
             }
-            ids::CHAP_LANGUAGE => language = Some(text_field(r, e.size, budget, CHAPTER_TEXT_EXCEEDED)?),
+            ids::CHAP_LANGUAGE => {
+                language = Some(text_field(r, e.size, budget, CHAPTER_TEXT_EXCEEDED)?)
+            }
             ids::CHAP_LANGUAGE_BCP47 => {
                 language_bcp47 = Some(text_field(r, e.size, budget, CHAPTER_TEXT_EXCEEDED)?);
             }
-            ids::CHAP_COUNTRY => country = Some(text_field(r, e.size, budget, CHAPTER_TEXT_EXCEEDED)?),
+            ids::CHAP_COUNTRY => {
+                country = Some(text_field(r, e.size, budget, CHAPTER_TEXT_EXCEEDED)?)
+            }
             _ => skip(r, e.size)?,
         }
     }
@@ -7944,7 +8575,11 @@ fn parse_chap_process(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Re
 /// typed [`ChapProcessCommand`]. `ChapProcessTime` defaults to `0` ("during
 /// the whole chapter") when the (mandatory) element is absent; the
 /// `ChapProcessData` payload is surfaced as raw bytes.
-fn parse_chap_process_command(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<ChapProcessCommand> {
+fn parse_chap_process_command(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    budget: &mut Budget,
+) -> Result<ChapProcessCommand> {
     let mut cmd = ChapProcessCommand::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
@@ -8004,7 +8639,15 @@ fn parse_attachments(
                 }
                 let af_end = r.stream_position()?.saturating_add(e.size).min(end);
                 idx += 1;
-                parse_attached_file(r, af_end, metadata, idx, attachment_uid_to_index, attachments, budget)
+                parse_attached_file(
+                    r,
+                    af_end,
+                    metadata,
+                    idx,
+                    attachment_uid_to_index,
+                    attachments,
+                    budget,
+                )
             }
             _ => {
                 let e_end = child_end(r, e.size, end)?;
@@ -8057,8 +8700,12 @@ fn parse_attached_file(
             child_end(r, e.size, end)?;
         }
         match e.id {
-            ids::FILE_NAME => filename = Some(text_field(r, e.size, budget, ATTACHMENT_TEXT_EXCEEDED)?),
-            ids::FILE_MIME_TYPE => mime = Some(text_field(r, e.size, budget, ATTACHMENT_TEXT_EXCEEDED)?),
+            ids::FILE_NAME => {
+                filename = Some(text_field(r, e.size, budget, ATTACHMENT_TEXT_EXCEEDED)?)
+            }
+            ids::FILE_MIME_TYPE => {
+                mime = Some(text_field(r, e.size, budget, ATTACHMENT_TEXT_EXCEEDED)?)
+            }
             ids::FILE_DESCRIPTION => {
                 description = Some(text_field(r, e.size, budget, ATTACHMENT_TEXT_EXCEEDED)?);
             }
@@ -8095,23 +8742,33 @@ fn parse_attached_file(
             _ => skip(r, e.size)?,
         }
     }
-    if let Some(n) = &filename {
-        if !n.is_empty() {
-            keep_entry(metadata, format!("attachment:{index}:filename"), n, budget)?;
-        }
+    if let Some(n) = &filename
+        && !n.is_empty()
+    {
+        keep_entry(metadata, format!("attachment:{index}:filename"), n, budget)?;
     }
-    if let Some(m) = &mime {
-        if !m.is_empty() {
-            keep_entry(metadata, format!("attachment:{index}:mime_type"), m, budget)?;
-        }
+    if let Some(m) = &mime
+        && !m.is_empty()
+    {
+        keep_entry(metadata, format!("attachment:{index}:mime_type"), m, budget)?;
     }
     if has_data {
-        keep_entry(metadata, format!("attachment:{index}:size_bytes"), &data_size.to_string(), budget)?;
+        keep_entry(
+            metadata,
+            format!("attachment:{index}:size_bytes"),
+            &data_size.to_string(),
+            budget,
+        )?;
     }
-    if let Some(d) = &description {
-        if !d.is_empty() {
-            keep_entry(metadata, format!("attachment:{index}:description"), d, budget)?;
-        }
+    if let Some(d) = &description
+        && !d.is_empty()
+    {
+        keep_entry(
+            metadata,
+            format!("attachment:{index}:description"),
+            d,
+            budget,
+        )?;
     }
     // The UID names this attachment only once it is kept: one dropped here
     // or by the caller leaves the index as it was, its room charged first.
@@ -8154,7 +8811,8 @@ fn parse_attached_file(
 /// same `N` used by the flat `attachment:N:*` metadata keys and by
 /// `tag:attachment:N:<name>` Tag scopes, so a caller can correlate the
 /// three views.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Attachment {
     /// 1-based position of this attachment within the Segment's
     /// `Attachments` element. Matches the `N` in the corresponding
@@ -8277,6 +8935,7 @@ struct CueEntry {
 /// bit-exactly. Use the demuxer's `TimestampScale` (1 ms on our own muxer)
 /// to convert.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CuePoint {
     /// `CueTime` (RFC 9559 §5.1.5.1.1, id `0xB3`) — absolute timestamp of
     /// the seek point in Segment Ticks. `minOccurs: 1`; defaults to `0`
@@ -8291,6 +8950,7 @@ pub struct CuePoint {
 /// One `Cues > CuePoint > CueTrackPositions` (RFC 9559 §5.1.5.1.2): the
 /// position of a Block on one track at the parent [`CuePoint`]'s timestamp.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CueTrackPositions {
     /// `CueTrack` (RFC 9559 §5.1.5.1.2.1, id `0xF7`, `range: not 0`) — the
     /// track number this position is for.
@@ -8331,6 +8991,7 @@ pub struct CueTrackPositions {
 /// One `Cues > CuePoint > CueTrackPositions > CueReference` (RFC 9559
 /// §5.1.5.1.2.7): a reference to a Block the cue's Block depends on.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CueReference {
     /// `CueRefTime` (RFC 9559 §5.1.5.1.2.8, id `0x96`, `minOccurs: 1`) —
     /// the timestamp of the referenced Block in Segment Ticks. Defaults to
@@ -8625,12 +9286,21 @@ fn follow_seek_target(
                 let mut tmp_meta = Vec::new();
                 let mut tmp_att_map = std::collections::HashMap::new();
                 let mut tmp_atts = Vec::new();
-                let cut = parse_attachments(r, end, &mut tmp_meta, &mut tmp_att_map, &mut tmp_atts, budgets.attachments)?;
+                let cut = parse_attachments(
+                    r,
+                    end,
+                    &mut tmp_meta,
+                    &mut tmp_att_map,
+                    &mut tmp_atts,
+                    budgets.attachments,
+                )?;
                 merge(metadata, tmp_meta);
                 merge_map(attachment_uid_to_index, tmp_att_map);
                 merge(attachments, tmp_atts);
                 if let Some(stop) = cut {
-                    budgets.damage_events.push(cut_at(ids::ATTACHMENTS, stop, end));
+                    budgets
+                        .damage_events
+                        .push(cut_at(ids::ATTACHMENTS, stop, end));
                 }
             }
             _ => return Ok(()),
@@ -8661,7 +9331,12 @@ fn follow_seek_target(
 /// copies the open makes of a CodecID, language or header-stripping
 /// setting, and the largest CodecPrivate again as working room for the
 /// codec configuration parse.
-fn parse_tracks(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TrackEntry>, budget: &mut Budget) -> Result<()> {
+fn parse_tracks(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    out: &mut Vec<TrackEntry>,
+    budget: &mut Budget,
+) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let e_end = child_end(r, e.size, end)?;
@@ -8686,7 +9361,12 @@ fn parse_tracks(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TrackEntry>, budge
     Ok(())
 }
 
-fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry, budget: &mut Budget) -> Result<()> {
+fn parse_track_entry(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    t: &mut TrackEntry,
+    budget: &mut Budget,
+) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let e_end = child_end(r, e.size, end)?;
@@ -8906,7 +9586,11 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry, budget:
 /// frame is ever decompressed or decrypted here. Each encoding is charged
 /// to `budget` with the steps the open's two decompression chains build
 /// from it.
-fn parse_content_encodings(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<ContentEncodings> {
+fn parse_content_encodings(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    budget: &mut Budget,
+) -> Result<ContentEncodings> {
     let mut encodings: Vec<ContentEncoding> = Vec::new();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
@@ -8936,7 +9620,11 @@ fn parse_content_encodings(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) 
 /// matching child be present and the other absent, but we tolerate either
 /// by keying off the type and defaulting a missing compression to zlib /
 /// missing encryption to "not encrypted" per the element defaults.
-fn parse_content_encoding(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<ContentEncoding> {
+fn parse_content_encoding(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    budget: &mut Budget,
+) -> Result<ContentEncoding> {
     let mut order: u64 = 0; // §5.1.4.1.31.2 default
     let mut scope: u64 = ids::CONTENT_ENCODING_SCOPE_BLOCK; // §5.1.4.1.31.3 default 0x1
     let mut enc_type: u64 = ids::CONTENT_ENCODING_TYPE_COMPRESSION; // §5.1.4.1.31.4 default 0
@@ -8991,7 +9679,11 @@ fn parse_content_encoding(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -
 /// `(ContentCompAlgo, ContentCompSettings)`. The settings are charged to
 /// `budget` three times: kept, and copied by each decompression chain the
 /// open builds.
-fn parse_content_compression(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<(u64, Vec<u8>)> {
+fn parse_content_compression(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    budget: &mut Budget,
+) -> Result<(u64, Vec<u8>)> {
     let mut algo: u64 = ids::CONTENT_COMP_ALGO_ZLIB; // §5.1.4.1.31.6 default 0
     let mut settings: Vec<u8> = Vec::new();
     while r.stream_position()? < end {
@@ -9063,7 +9755,12 @@ fn parse_aes_settings(r: &mut dyn ReadSeek, end: u64) -> Result<Option<u64>> {
 /// Parse `TrackOperation` (RFC 9559 §5.1.4.1.30): a virtual track built
 /// from other tracks via `TrackCombinePlanes` (3D plane combining) and/or
 /// `TrackJoinBlocks` (block timeline joining).
-fn parse_track_operation(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation, budget: &mut Budget) -> Result<()> {
+fn parse_track_operation(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    op: &mut RawTrackOperation,
+    budget: &mut Budget,
+) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let e_end = child_end(r, e.size, end)?;
@@ -9089,7 +9786,12 @@ const TRACK_OPERATION_ENTRY_BYTES: usize =
 
 /// Parse `TrackCombinePlanes` (RFC 9559 §5.1.4.1.30.1) — a list of
 /// `TrackPlane` masters, each carrying a `TrackPlaneUID` + `TrackPlaneType`.
-fn parse_combine_planes(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation, budget: &mut Budget) -> Result<()> {
+fn parse_combine_planes(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    op: &mut RawTrackOperation,
+    budget: &mut Budget,
+) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let e_end = child_end(r, e.size, end)?;
@@ -9110,12 +9812,12 @@ fn parse_combine_planes(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperati
                 }
                 // TrackPlaneUID is mandatory (minOccurs=1) and "not 0"; a
                 // plane without one is malformed and dropped.
-                if let Some(u) = uid {
-                    if u != 0 {
-                        budget.charge(TRACK_OPERATION_ENTRY_BYTES)?;
-                        budget.room(&mut op.planes)?;
-                        op.planes.push((u, plane_type));
-                    }
+                if let Some(u) = uid
+                    && u != 0
+                {
+                    budget.charge(TRACK_OPERATION_ENTRY_BYTES)?;
+                    budget.room(&mut op.planes)?;
+                    op.planes.push((u, plane_type));
                 }
             }
             _ => skip(r, e.size)?,
@@ -9126,7 +9828,12 @@ fn parse_combine_planes(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperati
 
 /// Parse `TrackJoinBlocks` (RFC 9559 §5.1.4.1.30.5) — a list of
 /// `TrackJoinUID`s naming tracks whose Blocks are joined into this one.
-fn parse_join_blocks(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation, budget: &mut Budget) -> Result<()> {
+fn parse_join_blocks(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    op: &mut RawTrackOperation,
+    budget: &mut Budget,
+) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         child_end(r, e.size, end)?;
@@ -9154,7 +9861,11 @@ fn parse_join_blocks(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation,
 /// defaults (`maxOccurs == 1`, no `default:` clause) so they stay
 /// `Option<…>` and an absent child surfaces as `None`. Unknown children
 /// are skipped — forward-compat with future schema extensions.
-fn parse_block_addition_mapping(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<BlockAdditionMapping> {
+fn parse_block_addition_mapping(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    budget: &mut Budget,
+) -> Result<BlockAdditionMapping> {
     let mut value: Option<u64> = None;
     let mut name: Option<String> = None;
     // §5.1.4.1.17.3 default is `0` (codec-defined): "If BlockAddIDType is
@@ -9199,7 +9910,12 @@ struct Budget {
 
 impl Budget {
     fn new(max: usize, exceeded: &'static str) -> Self {
-        Self { left: max, exceeded, spent: false, scratch: 0 }
+        Self {
+            left: max,
+            exceeded,
+            spent: false,
+            scratch: 0,
+        }
     }
 
     /// Reserve room for a working buffer of `bytes` that is dropped before
@@ -9243,7 +9959,10 @@ impl Budget {
 
     /// Room in `set` for one more, charging first for the table it grows
     /// into — see [`Self::table_charge`].
-    fn set_room<T: std::hash::Hash + Eq>(&mut self, set: &mut std::collections::HashSet<T>) -> Result<()> {
+    fn set_room<T: std::hash::Hash + Eq>(
+        &mut self,
+        set: &mut std::collections::HashSet<T>,
+    ) -> Result<()> {
         if set.len() == set.capacity() {
             let holds = (set.capacity() * 2).max(4);
             self.table_charge::<T>(holds)?;
@@ -9254,7 +9973,10 @@ impl Budget {
 
     /// Room in `map` for one more, charging first for the table it grows
     /// into — see [`Self::table_charge`].
-    fn map_room<K: std::hash::Hash + Eq, V>(&mut self, map: &mut std::collections::HashMap<K, V>) -> Result<()> {
+    fn map_room<K: std::hash::Hash + Eq, V>(
+        &mut self,
+        map: &mut std::collections::HashMap<K, V>,
+    ) -> Result<()> {
         if map.len() == map.capacity() {
             let holds = (map.capacity() * 2).max(4);
             self.table_charge::<(K, V)>(holds)?;
@@ -9270,7 +9992,11 @@ impl Budget {
     /// covers both tables while it rehashes.
     fn table_charge<T>(&mut self, holds: usize) -> Result<()> {
         let buckets = (holds * 8 / 7).next_power_of_two().max(8);
-        self.charge(buckets.saturating_mul(std::mem::size_of::<T>() + 1).saturating_add(32))
+        self.charge(
+            buckets
+                .saturating_mul(std::mem::size_of::<T>() + 1)
+                .saturating_add(32),
+        )
     }
 
     /// A stored element of `size` octets, charged before any of it is held
@@ -9362,7 +10088,11 @@ fn child_end(r: &mut dyn ReadSeek, size: u64, parent_end: u64) -> Result<u64> {
 /// * Unknown children are skipped (forward-compat).
 /// * Every child must fit its parent; payloads and records are charged to
 ///   the Block's budget before they are read or stored.
-fn parse_block_additions(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<Vec<BlockAddition>> {
+fn parse_block_additions(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    budget: &mut Budget,
+) -> Result<Vec<BlockAddition>> {
     let mut out: Vec<BlockAddition> = Vec::new();
     // The ids kept so far: a later BlockMore repeating one is dropped.
     let mut kept: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -9385,13 +10115,14 @@ fn parse_block_additions(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) ->
                         _ => skip(r, c.size)?,
                     }
                 }
-                if let Some(data) = data {
-                    if id != 0 && !kept.contains(&id) {
-                        budget.room(&mut out)?;
-                        budget.set_room(&mut kept)?;
-                        kept.insert(id);
-                        out.push(BlockAddition { id, data });
-                    }
+                if let Some(data) = data
+                    && id != 0
+                    && !kept.contains(&id)
+                {
+                    budget.room(&mut out)?;
+                    budget.set_room(&mut kept)?;
+                    kept.insert(id);
+                    out.push(BlockAddition { id, data });
                 }
             }
             _ => skip(r, e.size)?,
@@ -9408,7 +10139,12 @@ fn parse_block_additions(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) ->
 /// count; each record is charged to the Block's budget before it is
 /// stored. Non-`TimeSlice` children of `Slices` are skipped, and every
 /// child must fit its parent.
-fn parse_slices(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TimeSlice>, budget: &mut Budget) -> Result<()> {
+fn parse_slices(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    out: &mut Vec<TimeSlice>,
+    budget: &mut Budget,
+) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         let e_end = child_end(r, e.size, end)?;
@@ -9482,7 +10218,12 @@ fn parse_silent_tracks(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> R
     Ok(out)
 }
 
-fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry, budget: &mut Budget) -> Result<()> {
+fn parse_audio(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    t: &mut TrackEntry,
+    budget: &mut Budget,
+) -> Result<()> {
     // Materialise the typed staging record on first call. An `Audio` master
     // with no children still surfaces a record so the typed builder
     // ([`build_typed_track_audio`]) can fold the §5.1.4.1.29.1 / .3 defaults
@@ -9545,7 +10286,11 @@ fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry, budget: &mut 
 /// version selects the element set). Unknown children are skipped
 /// (forward-compat). Each child must fit the extension, and the name is
 /// charged to the header's `budget` before it is read.
-fn parse_doc_type_extension(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget) -> Result<Option<DocTypeExtension>> {
+fn parse_doc_type_extension(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    budget: &mut Budget,
+) -> Result<Option<DocTypeExtension>> {
     let mut name: Option<String> = None;
     let mut version: Option<u64> = None;
     while r.stream_position()? < end {
@@ -9567,7 +10312,12 @@ fn parse_doc_type_extension(r: &mut dyn ReadSeek, end: u64, budget: &mut Budget)
     }
 }
 
-fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry, budget: &mut Budget) -> Result<()> {
+fn parse_video(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    t: &mut TrackEntry,
+    budget: &mut Budget,
+) -> Result<()> {
     // The `Video` master was seen. Materialise the spec defaults for
     // FlagInterlaced (§5.1.4.1.28.1, default 0 = undetermined) and
     // FieldOrder (§5.1.4.1.28.2, default 2 = undetermined); explicit
@@ -9778,7 +10528,12 @@ fn parse_mastering_metadata(
 /// pre-populated by `parse_video` with the spec defaults for every child
 /// that has one — this routine overrides only the children the file actually
 /// carries. Unknown elements are skipped (forward-compat).
-fn parse_projection(r: &mut dyn ReadSeek, end: u64, p: &mut RawProjection, budget: &mut Budget) -> Result<()> {
+fn parse_projection(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    p: &mut RawProjection,
+    budget: &mut Budget,
+) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         child_end(r, e.size, end)?;
@@ -9878,31 +10633,37 @@ impl Read for ClusterReader {
 impl Seek for ClusterReader {
     fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
         let to = match to {
-            SeekFrom::Current(delta) => SeekFrom::Start(self.pos.checked_add_signed(delta)
-                .ok_or_else(|| source_error(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput, "seek outside position range",
-                )))?),
+            SeekFrom::Current(delta) => {
+                SeekFrom::Start(self.pos.checked_add_signed(delta).ok_or_else(|| {
+                    source_error(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "seek outside position range",
+                    ))
+                })?)
+            }
             other => other,
         };
         // A forward skip over Cluster bytes the CRC still needs (a Void,
         // an unknown child, the Blocks before a Cue target) is read rather
         // than seeked, so the CRC sees every byte. A read that ends early
         // (truncated input) leaves the rest to a plain seek.
-        if let (SeekFrom::Start(target), Some(c)) = (to, &self.crc) {
-            if self.pos == c.next && target > c.next && target <= c.end {
-                let mut buf = [0u8; 16 * 1024];
-                while self.pos < target {
-                    let want = ((target - self.pos) as usize).min(buf.len());
-                    match self.read(&mut buf[..want]) {
-                        Ok(0) => break,
-                        Ok(_) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(e) => return Err(e),
-                    }
+        if let (SeekFrom::Start(target), Some(c)) = (to, &self.crc)
+            && self.pos == c.next
+            && target > c.next
+            && target <= c.end
+        {
+            let mut buf = [0u8; 16 * 1024];
+            while self.pos < target {
+                let want = ((target - self.pos) as usize).min(buf.len());
+                match self.read(&mut buf[..want]) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
                 }
-                if self.pos == target {
-                    return Ok(target);
-                }
+            }
+            if self.pos == target {
+                return Ok(target);
             }
         }
         match self.inner.seek(to) {
@@ -9912,21 +10673,22 @@ impl Seek for ClusterReader {
                 Ok(pos)
             }
             Err(error) => {
-                if let SeekFrom::Start(target) = to {
-                    if error.kind() == std::io::ErrorKind::InvalidInput {
-                        // Query the physical end only on a failed seek.
-                        // A routine source failure within that end is not
-                        // truncation. File permits a position beyond EOF;
-                        // give bounded HTTP sources the same semantics.
-                        if let Ok(end) = self.inner.seek(SeekFrom::End(0)) {
-                            if target > end {
-                                self.pos = target;
-                                self.past_end = true;
-                                return Ok(target);
-                            }
-                            self.inner.seek(SeekFrom::Start(self.pos.min(end)))
-                                .map_err(source_error)?;
+                if let SeekFrom::Start(target) = to
+                    && error.kind() == std::io::ErrorKind::InvalidInput
+                {
+                    // Query the physical end only on a failed seek.
+                    // A routine source failure within that end is not
+                    // truncation. File permits a position beyond EOF;
+                    // give bounded HTTP sources the same semantics.
+                    if let Ok(end) = self.inner.seek(SeekFrom::End(0)) {
+                        if target > end {
+                            self.pos = target;
+                            self.past_end = true;
+                            return Ok(target);
                         }
+                        self.inner
+                            .seek(SeekFrom::Start(self.pos.min(end)))
+                            .map_err(source_error)?;
                     }
                 }
                 Err(source_error(error))
@@ -10036,6 +10798,11 @@ pub struct MkvDemuxer {
     out_queue: std::collections::VecDeque<QueuedPacket>,
     metadata: Vec<(String, String)>,
     duration_micros: i64,
+    /// `Segment\Info\Duration` (RFC 9559 §5.1.2.10) in Segment Ticks,
+    /// when present. Used only to place the first Cues-less seek probe
+    /// (interpolation needs a Timestamp for the Segment end); never
+    /// trusted for a landing.
+    segment_duration_ticks: Option<u64>,
     /// Cue index entries, sorted by (track, time). Empty if the file has
     /// no Cues element — `seek_to` returns `Error::Unsupported` in that
     /// case.
@@ -10301,12 +11068,15 @@ pub struct MkvDemuxer {
     /// same bytes and loop.
     resync_floor: u64,
     /// Absolute offset of the first `Cluster` element header — the anchor
-    /// for the Cues-less seek
-    /// ([`MkvDemuxer::seek_by_cluster_scan`]). `None` for a legal
-    /// zero-Cluster (metadata-only) Segment — the schema gives `Cluster`
-    /// no `minOccurs` — in which case `next_packet` reports a clean
-    /// `Error::Eof` and both seek paths return `Error::Unsupported`.
+    /// for the Cues-less seek ([`MkvDemuxer::seek_cueless`] bisection,
+    /// [`MkvDemuxer::seek_by_cluster_scan`] linear fallback). `None` for
+    /// a legal zero-Cluster (metadata-only) Segment — the schema gives
+    /// `Cluster` no `minOccurs` — in which case `next_packet` reports a
+    /// clean `Error::Eof` and every seek path returns `Error::Unsupported`.
     first_cluster_offset: Option<u64>,
+    /// Strategy the most recent successful `seek_to` used; see
+    /// [`MkvDemuxer::seek_strategy`].
+    last_seek_strategy: Option<SeekStrategy>,
     /// `TrackUID` → stream-index map, kept from the open-time walk so a
     /// mid-stream `Tags` element (RFC 9559 §23.2 live tagging) resolves
     /// its `TagTrackUID` scopes exactly like the open-time one.
@@ -10349,15 +11119,17 @@ impl Demuxer for MkvDemuxer {
                 if consumers
                     .iter()
                     .any(|c| stream_indices.contains(&c.virtual_stream))
+                    && let Some(slot) = mask.get_mut(si)
                 {
-                    if let Some(slot) = mask.get_mut(si) {
-                        *slot = true;
-                    }
+                    *slot = true;
                 }
             }
         }
-        self.out_queue
-            .retain(|q| mask.get(q.packet.stream_index as usize).copied().unwrap_or(false));
+        self.out_queue.retain(|q| {
+            mask.get(q.packet.stream_index as usize)
+                .copied()
+                .unwrap_or(false)
+        });
         self.active_stream_mask = Some(mask);
     }
 
@@ -10371,31 +11143,36 @@ impl Demuxer for MkvDemuxer {
                         let needed = self
                             .active_stream_mask
                             .as_ref()
-                            .map_or(true, |m| m.get(si).copied().unwrap_or(false));
+                            .is_none_or(|m| m.get(si).copied().unwrap_or(false));
                         !needed || o.as_ref().is_none_or(|ord| !ord.needs_probe())
                     }))
             {
                 self.finish_timestamp_probe();
             }
-            if self.timestamps_primed {
-                if let Some(q) = self.out_queue.pop_front() {
-                    // Keep the Block's `BlockAdditions` (RFC 9559 §5.1.3.5.2)
-                    // and `BlockGroup` metadata paired with the packet,
-                    // including packets buffered for DTS initialization.
-                    self.last_block_additions = q.additions;
-                    self.last_block_group_meta = q.meta;
-                    self.last_virtual_origin = q.origin;
-                    self.last_metadata.webvtt = q.webvtt;
-                    self.last_metadata.container_keyframe = q.container_keyframe;
-                    self.last_metadata.audio_trim = q.audio_trim;
-                    return Ok(q.packet);
-                }
+            if self.timestamps_primed
+                && let Some(q) = self.out_queue.pop_front()
+            {
+                // Keep the Block's `BlockAdditions` (RFC 9559 §5.1.3.5.2)
+                // and `BlockGroup` metadata paired with the packet,
+                // including packets buffered for DTS initialization.
+                self.last_block_additions = q.additions;
+                self.last_block_group_meta = q.meta;
+                self.last_virtual_origin = q.origin;
+                self.last_metadata.webvtt = q.webvtt;
+                self.last_metadata.container_keyframe = q.container_keyframe;
+                self.last_metadata.audio_trim = q.audio_trim;
+                return Ok(q.packet);
             }
             let (step, failed_at) = if let Some(block) = self.deferred_block.take() {
                 let at = block.offset;
                 let step = self.queue_block_packets_with(
-                    block.bytes, block.cluster_timecode, block.group_keyframe,
-                    block.explicit_duration, block.additions, block.meta, at,
+                    block.bytes,
+                    block.cluster_timecode,
+                    block.group_keyframe,
+                    block.explicit_duration,
+                    block.additions,
+                    block.meta,
+                    at,
                 );
                 (step, at)
             } else {
@@ -10404,7 +11181,11 @@ impl Demuxer for MkvDemuxer {
                 // first Cluster, before every track's first packet.
                 if self.walk_from_start.is_none() {
                     let idle = matches!(self.cluster_state, ClusterState::Idle);
-                    self.walk_from_start = Some(idle && self.first_cluster_offset.is_some_and(|first| before <= first));
+                    self.walk_from_start = Some(
+                        idle && self
+                            .first_cluster_offset
+                            .is_some_and(|first| before <= first),
+                    );
                 }
                 (self.advance(), before)
             };
@@ -10421,7 +11202,9 @@ impl Demuxer for MkvDemuxer {
                 Ok(()) => {}
                 Err(Error::Eof) => {
                     self.finish_timestamp_probe();
-                    if self.out_queue.is_empty() { return Err(Error::Eof); }
+                    if self.out_queue.is_empty() {
+                        return Err(Error::Eof);
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -10456,8 +11239,11 @@ impl Demuxer for MkvDemuxer {
         if self.cues.is_empty() {
             // Cues-less file (RFC 9559 §22.1 only RECOMMENDS a Cues
             // element — live recordings and files written to a pipe have
-            // none): scan the Clusters up to the target.
-            return self.seek_by_cluster_scan(stream_index, pts);
+            // none): find the landing among the Clusters. Like FFmpeg,
+            // the strict path seeks too, an unknown-size Segment with
+            // neither SeekHead nor Cues included (RFC 9559 §23.2's
+            // "SHOULD be considered non-seekable" is not taken).
+            return self.seek_cueless(stream_index, pts);
         }
         let track_number = self.track_number_by_index[stream_index as usize];
 
@@ -10478,9 +11264,9 @@ impl Demuxer for MkvDemuxer {
                 .filter(|c| c.track == track_number)
                 .map(|c| c.time)
                 .max()
-                .map_or(true, |last| target_ticks > last)
+                .is_none_or(|last| target_ticks > last)
         {
-            return self.seek_by_cluster_scan(stream_index, pts);
+            return self.seek_cueless(stream_index, pts);
         }
 
         // Find last cue entry for this track with time <= target_ticks.
@@ -10545,7 +11331,7 @@ impl Demuxer for MkvDemuxer {
         if self.resilient {
             let abs = self.segment_data_start.saturating_add(cue_cluster_offset);
             if self.cue_landing_lie(abs, cue_time)?.is_some() {
-                let landed = self.seek_by_cluster_scan(stream_index, pts);
+                let landed = self.seek_cueless(stream_index, pts);
                 let resumed_at = match landed {
                     Ok(_) => Some(self.input.stream_position()?),
                     Err(_) => None,
@@ -10570,8 +11356,8 @@ impl Demuxer for MkvDemuxer {
         // Reset cluster reader state + any previously queued packets.
         // The "most recently returned packet" the block-additions
         // surface refers to is invalidated by the jump too.
-        self.cluster_state = ClusterState::Idle;
-        self.reset_packet_queue();
+        self.reset_after_seek();
+        self.last_seek_strategy = Some(SeekStrategy::Cues);
 
         // RFC 9559 §5.1.5.1.2.3: when the Cues entry carries a
         // `CueRelativePosition`, the referenced SimpleBlock / BlockGroup
@@ -10630,8 +11416,13 @@ impl MkvDemuxer {
         self.out_queue.clear();
         self.deferred_block = None;
         self.clear_packet_metadata();
-        self.packet_clocks.iter_mut().for_each(timing::PacketClock::reset);
-        self.decode_orders.iter_mut().flatten().for_each(timing::DecodeOrder::reset);
+        self.packet_clocks
+            .iter_mut()
+            .for_each(timing::PacketClock::reset);
+        self.decode_orders
+            .iter_mut()
+            .flatten()
+            .for_each(timing::DecodeOrder::reset);
         // The decoder starts over: each audio stream's next packet says what
         // the new position needs — see `audio_trim`.
         for (pending, trims) in self.start_trims.iter_mut().zip(&self.track_trims) {
@@ -10864,19 +11655,19 @@ impl MkvDemuxer {
                     timestamp,
                 } => (body_start, declared_end, timestamp),
             };
-            if let Some(end) = declared_end {
-                if end > self.segment_data_end {
-                    push(
-                        &mut report,
-                        CueLieKind::ClusterTruncated,
-                        Some(end - self.segment_data_end),
-                    );
-                }
+            if let Some(end) = declared_end
+                && end > self.segment_data_end
+            {
+                push(
+                    &mut report,
+                    CueLieKind::ClusterTruncated,
+                    Some(end - self.segment_data_end),
+                );
             }
-            if let Some(tc) = timestamp {
-                if tc > cue.time.saturating_add(self.cue_slack_ticks(cue.track)) {
-                    push(&mut report, CueLieKind::TimestampImpossible, Some(tc));
-                }
+            if let Some(tc) = timestamp
+                && tc > cue.time.saturating_add(self.cue_slack_ticks(cue.track))
+            {
+                push(&mut report, CueLieKind::TimestampImpossible, Some(tc));
             }
             // Fine-grained claims need the Cluster's usable body bounds
             // (clamped — a truncated Cluster's missing bytes can't hold
@@ -11219,7 +12010,10 @@ impl MkvDemuxer {
     fn register_cluster_record(&mut self, body_start: u64) {
         if self.cluster_record_by_offset.contains_key(&body_start)
             || self.record_budget.room(&mut self.cluster_records).is_err()
-            || self.record_budget.map_room(&mut self.cluster_record_by_offset).is_err()
+            || self
+                .record_budget
+                .map_room(&mut self.cluster_record_by_offset)
+                .is_err()
         {
             return;
         }
@@ -11263,7 +12057,12 @@ impl MkvDemuxer {
     /// records may still keep, then charged to
     /// [`MAX_CLUSTER_RECORD_BYTES`] as kept; a master that does not fit is
     /// invalid data.
-    fn record_cluster_silent_tracks(&mut self, body_start: u64, offset: u64, end: u64) -> Result<()> {
+    fn record_cluster_silent_tracks(
+        &mut self,
+        body_start: u64,
+        offset: u64,
+        end: u64,
+    ) -> Result<()> {
         let Some(&idx) = self.cluster_record_by_offset.get(&body_start) else {
             self.input.seek(SeekFrom::Start(end))?;
             return Ok(());
@@ -11280,7 +12079,8 @@ impl MkvDemuxer {
         let kept = &mut self.cluster_records[idx].silent_track_numbers;
         let need = kept.len() + nums.len();
         if need > kept.capacity() {
-            self.record_budget.charge((need - kept.capacity()) * std::mem::size_of::<u64>())?;
+            self.record_budget
+                .charge((need - kept.capacity()) * std::mem::size_of::<u64>())?;
             kept.reserve_exact(need - kept.len());
         }
         self.record_budget.set_room(&mut self.recorded_offsets)?;
@@ -11297,14 +12097,20 @@ impl MkvDemuxer {
     /// holds it. Its body, the growth of the record's list and of the set
     /// of recorded elements are charged to [`MAX_CLUSTER_RECORD_BYTES`]
     /// before they are allocated; a block that does not fit is invalid data.
-    fn record_cluster_encrypted_block(&mut self, body_start: u64, offset: u64, size: u64) -> Result<()> {
+    fn record_cluster_encrypted_block(
+        &mut self,
+        body_start: u64,
+        offset: u64,
+        size: u64,
+    ) -> Result<()> {
         let Some(&idx) = self.cluster_record_by_offset.get(&body_start) else {
             return skip(&mut *self.input, size);
         };
         if self.recorded_offsets.contains(&offset) {
             return skip(&mut *self.input, size);
         }
-        self.record_budget.room(&mut self.cluster_records[idx].encrypted_blocks)?;
+        self.record_budget
+            .room(&mut self.cluster_records[idx].encrypted_blocks)?;
         self.record_budget.set_room(&mut self.recorded_offsets)?;
         let bytes = self.record_budget.read(&mut *self.input, size)?;
         self.recorded_offsets.insert(offset);
@@ -11382,13 +12188,18 @@ impl MkvDemuxer {
             .ok_or_else(|| Error::invalid(format!("MKV: no attachment with index {index}")))?;
         let offset = att.data_offset;
         let size = att.data_size;
-        let room = att.parent_end.min(self.segment_data_end).saturating_sub(offset);
+        let room = att
+            .parent_end
+            .min(self.segment_data_end)
+            .saturating_sub(offset);
         if size > room {
             return Err(Error::invalid(format!(
                 "MKV: attachment {index} payload of {size} bytes exceeds the {room} bytes left in its parent"
             )));
         }
-        let size = usize::try_from(size).map_err(|_| Error::invalid(format!("MKV: attachment {index} payload of {size} bytes")))?;
+        let size = usize::try_from(size).map_err(|_| {
+            Error::invalid(format!("MKV: attachment {index} payload of {size} bytes"))
+        })?;
         // Save and restore the caller's reader position so a payload fetch
         // between `next_packet` calls doesn't shift the cluster walker.
         let saved_pos = self.input.stream_position()?;
@@ -12414,7 +13225,9 @@ impl MkvDemuxer {
         // A CRC-32 element is fixed at 4 bytes; any other size is
         // malformed — "no CRC to check" rather than an error.
         let stored = match recoverable(read_element_header(&mut *self.input))? {
-            Some(e) if e.id == ids::CRC32 && e.size == 4 => recoverable(read_bytes(&mut *self.input, 4))?,
+            Some(e) if e.id == ids::CRC32 && e.size == 4 => {
+                recoverable(read_bytes(&mut *self.input, 4))?
+            }
             _ => None,
         };
         let crc_end = self.input.stream_position()?;
@@ -12440,7 +13253,7 @@ impl MkvDemuxer {
     /// Record the Cluster `CRC-32` that [`ClusterReader`] computed, once
     /// the walk has read the whole Cluster body.
     fn finish_cluster_crc(&mut self) {
-        if !self.input.crc.as_ref().is_some_and(|c| c.next == c.end) {
+        if self.input.crc.as_ref().is_none_or(|c| c.next != c.end) {
             return;
         }
         if let Some(c) = self.input.crc.take() {
@@ -12449,7 +13262,8 @@ impl MkvDemuxer {
                 stored: c.stored,
                 computed: c.crc,
             };
-            self.crc_log.record(&mut self.record_budget, c.body_start, status);
+            self.crc_log
+                .record(&mut self.record_budget, c.body_start, status);
         }
     }
 
@@ -12641,7 +13455,11 @@ impl MkvDemuxer {
                         // or second after a CRC-32 — tolerate Position /
                         // PrevSize / SilentTracks in front too, and a Void,
                         // which RFC 8794 §11.3.2 allows anywhere.
-                        ids::CRC32 | ids::POSITION | ids::PREV_SIZE | ids::SILENT_TRACKS | ids::VOID => {
+                        ids::CRC32
+                        | ids::POSITION
+                        | ids::PREV_SIZE
+                        | ids::SILENT_TRACKS
+                        | ids::VOID => {
                             if recoverable(skip(&mut *self.input, c.size))?.is_none() {
                                 break;
                             }
@@ -12694,16 +13512,352 @@ impl MkvDemuxer {
         let mut end = scan_end;
         for &start in starts.iter().rev() {
             if let Some(kf) = self.last_keyframe_between(start, end, track, target_ticks)? {
-                return self.land_on_keyframe(stream_index, kf);
+                let landed = self.land_on_keyframe(stream_index, kf)?;
+                self.last_seek_strategy = Some(SeekStrategy::LinearScan);
+                return Ok(landed);
             }
             end = start;
         }
         let (cluster_off, landed_ticks) = fallback
             .ok_or_else(|| Error::unsupported("MKV: no parseable Cluster Timestamp to seek by"))?;
         self.input.seek(SeekFrom::Start(cluster_off))?;
+        self.reset_after_seek();
+        self.last_seek_strategy = Some(SeekStrategy::LinearScan);
+        Ok(self.ticks_to_stream_pts(stream_index, landed_ticks))
+    }
+
+    /// Cues-less seek: byte-offset bisection over the Cluster run
+    /// ([`Self::bisect_last_cluster`]) for the last Cluster starting at
+    /// or before the target, then the keyframe landing of
+    /// [`Self::seek_by_cluster_scan`] from it: the last keyframe of the
+    /// sought track at or before the target, read from Block headers. When
+    /// the track's first Block in its Cluster is a keyframe the seek
+    /// lands on the Cluster's start, otherwise on the keyframe's Block, so
+    /// the first packet of the track is one it decodes from.
+    ///
+    /// A landing Cluster holding no such keyframe (a GOP spanning
+    /// Clusters) hands the search to the Clusters before it: the one just
+    /// before, then those reaching one second further back, two, four and
+    /// so on, each start found by bisecting again and each stretch
+    /// searched up to where the last one began — [`CUELESS_BACK_STEPS`]
+    /// stretches, about a minute. The linear walk
+    /// ([`Self::seek_by_cluster_scan`]) takes over, with the same landing
+    /// contract, when the bisection premise is disproved, the probe budget
+    /// runs out, or no keyframe turns up within those stretches.
+    fn seek_cueless(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        let target = self.stream_pts_to_ticks(stream_index, pts);
+        let track = self.track_number_by_index[stream_index as usize];
+        // One second in Segment Ticks.
+        let second = (1_000_000_000 / self.timecode_scale_ns.max(1)).max(1);
+        let mut want = target;
+        // Where the stretch already searched begins.
+        let mut searched_from: Option<u64> = None;
+        for step in 0..CUELESS_BACK_STEPS {
+            let Some((lo, hi_off)) = self.bisect_last_cluster(want)? else {
+                break;
+            };
+            // From the Cluster found to the stretch already searched,
+            // else to the next Cluster the bisection vetted: a Cluster it
+            // could not vet (no Timestamp, behind damage) lies in between
+            // and is searched too, as the linear walk searches it.
+            let end = searched_from.unwrap_or(hi_off);
+            if lo.offset < end
+                && let Some(kf) = self.last_keyframe_between(lo.offset, end, track, target)?
+            {
+                let landed = self.land_on_keyframe(stream_index, kf)?;
+                self.last_seek_strategy = Some(SeekStrategy::Bisection);
+                return Ok(landed);
+            }
+            // No keyframe of the track at or before the target so far:
+            // further back, if anything is.
+            if Some(lo.offset) == self.first_cluster_offset || lo.timestamp == 0 {
+                break;
+            }
+            searched_from = Some(lo.offset.min(end));
+            let back = match step {
+                0 => 1,
+                n => second.saturating_mul(1 << (n - 1)),
+            };
+            want = lo.timestamp.saturating_sub(back);
+        }
+        self.seek_by_cluster_scan(stream_index, pts)
+    }
+
+    /// The last Cluster whose `Timestamp` is at or before `target` (the
+    /// first Cluster for an earlier target), found by byte-offset
+    /// bisection over the Cluster run, and where the next Cluster it
+    /// could vet starts (else the Segment end): every Cluster from there
+    /// on starts after the target. `None` when the bisection premise is disproved or the probe
+    /// budget runs out: the caller walks the Clusters instead
+    /// ([`Self::seek_by_cluster_scan`]).
+    ///
+    /// Premise: Clusters are stored in ascending `Timestamp` order. RFC
+    /// 9559 never states it outright, but every optimum layout in §25.3
+    /// and the §22.1 recommendation that `CuePoint`s be sorted by
+    /// `CueTime` in storage order assume it, and the WebM container
+    /// guidelines make it a MUST ("all absolute (block + cluster)
+    /// timecodes MUST be monotonically increasing"). Because it is a
+    /// premise and not a guarantee, every probe is checked against the
+    /// bracket the earlier probes established: a confirmed Cluster whose
+    /// `Timestamp` falls outside `[lo, hi]` proves the run unsorted, and
+    /// the seek degrades to the linear walk, which assumes nothing about
+    /// order.
+    ///
+    /// Probe placement: interpolated on Timestamp between the brackets
+    /// (Segment `Duration` for the Segment end while no upper Cluster is
+    /// known) and pulled back one Cluster length so the probe meets the
+    /// wanted Cluster rather than its successor; an interpolated probe
+    /// that does not at least halve the unexplored range hands the next
+    /// probe to plain halving, so a skewed bitrate or a wrong `Duration`
+    /// costs at most ~2x the bisection bound. A wrong estimate only
+    /// moves probes, never the landing.
+    ///
+    /// Cost: ~log2(clusters) probes at worst (typically 3-6 on a
+    /// steady-bitrate file), each one bounded read in the unexplored
+    /// byte range (`PROBE_CHUNK`, doubling up
+    /// to `PROBE_CHUNK_MAX` only while no Cluster header is in sight)
+    /// plus, for a mid-run candidate whose end lies past the window, one
+    /// boundary read that confirms it is a real Cluster; then one or two
+    /// forward steps to close the last gap. A byte-range transport sees
+    /// one request per read.
+    fn bisect_last_cluster(&mut self, target: u64) -> Result<Option<(ClusterProbe, u64)>> {
+        let Some(first_off) = self.first_cluster_offset else {
+            return Err(Error::unsupported(
+                "MKV: no Clusters in Segment — cannot seek",
+            ));
+        };
+        let end = self.segment_data_end;
+        let tolerate_overrun = self.resilient;
+        let Some(first) = probe_cluster_from(
+            &mut *self.input,
+            first_off,
+            end,
+            end,
+            tolerate_overrun,
+            Some(first_off),
+        )?
+        else {
+            // Nothing vets as a Cluster from the first one on — let the
+            // linear walk (which also tolerates garbage) give its verdict.
+            return Ok(None);
+        };
+        // Best landing so far: the last confirmed Cluster at or before
+        // the target. The first Cluster seeds it so a target before the
+        // run lands there (parity with the Cues path's first-cue
+        // fallback).
+        let mut lo = first;
+        // Exclusive byte bound: every Cluster at or past `hi_off` has a
+        // Timestamp after the target (or `hi_off` is the Segment end).
+        let mut hi_off = end;
+        let mut hi_ts: Option<u64> = None;
+        let mut probes: u32 = 0;
+        // Interpolation guard: an interpolated probe that fails to at
+        // least halve the unexplored range hands the next step to plain
+        // halving, so the worst case stays within ~2x the bisection
+        // bound however uneven the bitrate (or however wrong a declared
+        // Duration) is.
+        let mut interpolate = true;
+        while target >= lo.timestamp {
+            // `lo` starts at the target itself: nothing is left to
+            // bisect, only its end to find — the next Cluster after it,
+            // which bounds the caller's keyframe search.
+            let closing = lo.timestamp == target;
+            // Unexplored byte range: after `lo` (its body end when the
+            // size is known, else the byte after its ID — the probe then
+            // walks through lo's own body) and before `hi_off`.
+            let lo_next = lo.next.unwrap_or_else(|| lo.offset.saturating_add(1));
+            if lo_next >= hi_off {
+                break;
+            }
+            if probes >= BISECT_MAX_PROBES {
+                // Clusters may remain unexplored between `lo` and `hi`.
+                return Ok(None);
+            }
+            probes += 1;
+            let gap = hi_off - lo_next;
+            // Narrow gaps: step forward from `lo`, so the last Cluster(s)
+            // between `lo` and `hi` are read in order (the element at a
+            // known-size lo's end is trusted — no boundary read). Wide
+            // gaps: interpolate on Timestamp when the upper bracket has
+            // one (guarded, see `interpolate`), else halve.
+            let interpolated = if closing || gap <= 2 * PROBE_CHUNK as u64 || !interpolate {
+                None
+            } else {
+                // Timestamp at `hi_off`: the bracketing Cluster's when one
+                // was probed, else the declared Segment Duration for the
+                // Segment end (an estimate only — placement, never landing).
+                let hi_t = match hi_ts {
+                    Some(h) => Some(h),
+                    None if hi_off == end => self.segment_duration_ticks,
+                    None => None,
+                };
+                hi_t.filter(|&h| h > lo.timestamp).map(|h| {
+                    let lo_len = lo.next.map_or(PROBE_CHUNK as u64, |n| n - lo.offset);
+                    interpolation_offset(lo_next, hi_off, lo.timestamp, h, target, lo_len)
+                })
+            };
+            let (from, trusted) = if closing || gap <= 2 * PROBE_CHUNK as u64 {
+                (lo_next, lo.next)
+            } else if let Some(at) = interpolated {
+                (at, if at == lo_next { lo.next } else { None })
+            } else {
+                (lo_next + gap / 2, None)
+            };
+            match probe_cluster_from(
+                &mut *self.input,
+                from,
+                hi_off,
+                end,
+                tolerate_overrun,
+                trusted,
+            )? {
+                None => {
+                    if from == lo_next {
+                        // Nothing after `lo` before `hi`: `lo` is the landing.
+                        break;
+                    }
+                    // `[from, hi_off)` holds no Cluster — the answer, if
+                    // any, is in `[lo_next, from)`.
+                    hi_off = from;
+                }
+                Some(c) => {
+                    let in_bracket =
+                        c.timestamp >= lo.timestamp && hi_ts.is_none_or(|h| c.timestamp <= h);
+                    if !in_bracket {
+                        // A genuine Cluster out of storage order: the run
+                        // is not sorted, bisection cannot be trusted —
+                        // walk it.
+                        return Ok(None);
+                    }
+                    if c.timestamp <= target {
+                        lo = c;
+                    } else {
+                        hi_off = c.offset;
+                        hi_ts = Some(c.timestamp);
+                    }
+                }
+            }
+            if interpolated.is_some() {
+                let lo_next = lo.next.unwrap_or_else(|| lo.offset.saturating_add(1));
+                interpolate = hi_off.saturating_sub(lo_next) <= gap / 2;
+            } else {
+                interpolate = true;
+            }
+        }
+        Ok(Some((lo, hi_off)))
+    }
+
+    /// Reset the Cluster reader state and every "most recently returned
+    /// packet" side channel after the reader has been repositioned by a
+    /// seek.
+    fn reset_after_seek(&mut self) {
         self.cluster_state = ClusterState::Idle;
         self.reset_packet_queue();
-        Ok(self.ticks_to_stream_pts(stream_index, landed_ticks))
+    }
+
+    /// Which strategy the most recent successful [`Demuxer::seek_to`]
+    /// landed with, or `None` before the first seek. Lets a caller on an
+    /// expensive transport (HTTP byte-range) tell a one-request `Cues`
+    /// landing from the ~log2(clusters) [`SeekStrategy::Bisection`] a
+    /// Cues-less file costs, and spot a [`SeekStrategy::LinearScan`]
+    /// (unsorted Cluster run, or a keyframe far behind the target) it may
+    /// want to avoid repeating.
+    pub fn seek_strategy(&self) -> Option<SeekStrategy> {
+        self.last_seek_strategy
+    }
+
+    /// Opt in to hunting for a `Cues` element the open did not find —
+    /// one stored after the Cluster run without a SeekHead entry
+    /// pointing at it (RFC 9559 §6.4 says it SHOULD be stored before the
+    /// first Cluster or be referenced by a SeekHead; this is the layout
+    /// that violates both).
+    ///
+    /// The hunt walks the Top-Level elements from the first Cluster to
+    /// the Segment end, one positioned read per element — cheap on a
+    /// local file, one byte-range request per Cluster over HTTP, which
+    /// is exactly why [`open`] does not do it on its own. Returns
+    /// `Ok(true)` when a `Cues` index is now loaded (already loaded, or
+    /// found and parsed), `Ok(false)` when the Segment holds none —
+    /// subsequent seeks then keep bisecting. The index is kept within the
+    /// Cues budget like one read at open, with the same damage event when
+    /// it is cut. The reader position is restored, so the call can be
+    /// made at any point between packets. Strict demuxers surface a parse
+    /// error met on the walk; resilient ones report `Ok(false)` instead.
+    /// The source's own failure is returned by both.
+    pub fn scan_for_cues(&mut self) -> Result<bool> {
+        if !self.cues.is_empty() {
+            return Ok(true);
+        }
+        let Some(first) = self.first_cluster_offset else {
+            return Ok(false);
+        };
+        let resume = self.input.stream_position()?;
+        let walked = self.hunt_late_cues(first);
+        self.input.seek(SeekFrom::Start(resume))?;
+        match walked {
+            Ok(()) => Ok(!self.cues.is_empty()),
+            Err(e) if self.resilient && is_damage(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`Self::scan_for_cues`]'s walk: step over the Top-Level elements
+    /// from `first` and parse the first `Cues` met. Stops quietly at an
+    /// element with no end inside the Segment.
+    fn hunt_late_cues(&mut self, first: u64) -> Result<()> {
+        let end = self.segment_data_end;
+        let mut pos = first;
+        while pos < end {
+            self.input.seek(SeekFrom::Start(pos))?;
+            let e = read_element_header(&mut *self.input)?;
+            let body_start = self.input.stream_position()?;
+            if e.size == VINT_UNKNOWN_SIZE {
+                // Only a Cluster may leave its size unknown here; it ends
+                // at its first child that is a Top-Level element.
+                let next = if e.id == ids::CLUSTER {
+                    self.unknown_size_cluster_end(body_start)?
+                } else {
+                    None
+                };
+                match next {
+                    Some(next) if next > pos => pos = next,
+                    _ => return Ok(()),
+                }
+                continue;
+            }
+            let body_end = body_start.saturating_add(e.size);
+            if body_end > end {
+                return Ok(());
+            }
+            if e.id == ids::CUES {
+                if let Some(status) =
+                    validate_top_level_crc(&mut *self.input, ids::CUES, body_start, body_end)?
+                {
+                    self.crc_log
+                        .record(&mut self.record_budget, body_start, status);
+                }
+                let mut cues: Vec<CueEntry> = Vec::new();
+                let mut points: Vec<CuePoint> = Vec::new();
+                let mut budget = Budget::new(MAX_CUE_BYTES, "MKV: Cues exceed their 48 MiB budget");
+                let cut = parse_cues(
+                    &mut *self.input,
+                    body_end,
+                    &mut cues,
+                    &mut points,
+                    &mut budget,
+                )?;
+                if let Some(stop) = cut {
+                    self.damage_events.push(cut_at(ids::CUES, stop, body_end));
+                    self.cues_cut = true;
+                }
+                cues.sort_by(|a, b| a.track.cmp(&b.track).then(a.time.cmp(&b.time)));
+                self.cues = cues;
+                self.cue_points = points;
+                return Ok(());
+            }
+            pos = body_end;
+        }
+        Ok(())
     }
 
     /// Where an unknown-size Cluster whose body starts at `body_start`
@@ -12798,7 +13952,8 @@ impl MkvDemuxer {
                 // `(keyframe, timestamp offset)` of a Block of the track.
                 let block = match c.id {
                     ids::TIMECODE => {
-                        if let Some(v) = recoverable(read_uint(&mut *self.input, c.size as usize))? {
+                        if let Some(v) = recoverable(read_uint(&mut *self.input, c.size as usize))?
+                        {
                             cluster_timecode = v as i64;
                         }
                         None
@@ -12837,7 +13992,7 @@ impl MkvDemuxer {
                     let time = cluster_timecode.saturating_add(offset);
                     if keyframe
                         && i128::from(time) <= i128::from(target_ticks)
-                        && best.map_or(true, |b| time > b.time)
+                        && best.is_none_or(|b| time > b.time)
                     {
                         best = Some(ScanKeyframe {
                             cluster: pos,
@@ -13028,14 +14183,22 @@ impl MkvDemuxer {
         let end = body_start.saturating_add(size);
         // Validate a leading CRC-32 child like the open-time walk does
         // for Top-Level masters (RFC 9559 §6.2); informational.
-        let crc = recoverable(validate_top_level_crc(&mut *self.input, ids::TAGS, body_start, end))?;
+        let crc = recoverable(validate_top_level_crc(
+            &mut *self.input,
+            ids::TAGS,
+            body_start,
+            end,
+        ))?;
         if let Some(Some(status)) = crc {
-            self.crc_log.record(&mut self.record_budget, body_start, status);
+            self.crc_log
+                .record(&mut self.record_budget, body_start, status);
         }
         let allowance = (MAX_TAGS_BYTES as usize).saturating_sub(self.tags_charge);
         let mut budget = Budget::new(allowance, TAGS_OVER_BUDGET);
         let mut pending: Vec<RawTag> = Vec::new();
-        if crc.is_none() || recoverable(parse_tags(&mut *self.input, end, &mut pending, &mut budget))?.is_none() {
+        if crc.is_none()
+            || recoverable(parse_tags(&mut *self.input, end, &mut pending, &mut budget))?.is_none()
+        {
             // Malformed or truncated mid-stream Tags: skip it whole, reset
             // nothing.
             self.input.seek(SeekFrom::Start(end))?;
@@ -13086,8 +14249,12 @@ impl MkvDemuxer {
                     if e.size == VINT_UNKNOWN_SIZE {
                         return Err(unknown_size_master());
                     }
-                    if self.input.stream_position()?.saturating_add(e.size) > self.segment_data_end {
-                        return Err(Error::invalid(format!("MKV: Top-Level element 0x{:X} runs past its Segment", e.id)));
+                    if self.input.stream_position()?.saturating_add(e.size) > self.segment_data_end
+                    {
+                        return Err(Error::invalid(format!(
+                            "MKV: Top-Level element 0x{:X} runs past its Segment",
+                            e.id
+                        )));
                     }
                 }
                 match e.id {
@@ -13163,8 +14330,10 @@ impl MkvDemuxer {
                 {
                     return Err(Error::invalid("MKV: child exceeds Cluster"));
                 }
-                if matches!(e.id, ids::SIMPLE_BLOCK | ids::BLOCK_GROUP | ids::ENCRYPTED_BLOCK)
-                    && e.size > MAX_BLOCK_BYTES as u64
+                if matches!(
+                    e.id,
+                    ids::SIMPLE_BLOCK | ids::BLOCK_GROUP | ids::ENCRYPTED_BLOCK
+                ) && e.size > MAX_BLOCK_BYTES as u64
                 {
                     return Err(Error::invalid("MKV: Block exceeds its budget"));
                 }
@@ -13327,7 +14496,15 @@ impl MkvDemuxer {
             } else {
                 Some(std::sync::Arc::new(meta))
             };
-            self.queue_block_packets_with(b, cluster_timecode, Some(is_keyframe), duration, additions, meta, offset)?;
+            self.queue_block_packets_with(
+                b,
+                cluster_timecode,
+                Some(is_keyframe),
+                duration,
+                additions,
+                meta,
+                offset,
+            )?;
         }
         Ok(())
     }
@@ -13382,8 +14559,12 @@ impl MkvDemuxer {
         Ok(Some(stored))
     }
 
-
-    fn queue_block_packets(&mut self, bytes: Vec<u8>, cluster_timecode: i64, offset: u64) -> Result<()> {
+    fn queue_block_packets(
+        &mut self,
+        bytes: Vec<u8>,
+        cluster_timecode: i64,
+        offset: u64,
+    ) -> Result<()> {
         // A SimpleBlock's keyframe bit is bit 7 of its flags byte. A
         // SimpleBlock can never carry BlockAdditions (the element lives
         // only on BlockGroup, RFC 9559 §5.1.3.5.2) nor the BlockGroup meta
@@ -13436,7 +14617,9 @@ impl MkvDemuxer {
         // before the Block is queued or waits; an invalid one queues
         // nothing.
         let (data_start, sizes) = lace_sizes(lacing, &bytes[body_start..])?;
-        let packets = sizes.len().checked_mul(copies)
+        let packets = sizes
+            .len()
+            .checked_mul(copies)
             .filter(|&n| n <= MAX_PROBE_PACKETS)
             .ok_or_else(|| Error::invalid("MKV: Block exceeds its 1024-packet budget"))?;
         // Everything this Block retains shares one budget: payload
@@ -13444,12 +14627,17 @@ impl MkvDemuxer {
         // packet's own size. An over-budget Block queues nothing, and does
         // not wait for room first.
         let side_data = additions.as_ref().map_or(0, |a| {
-            ARC_HEADER + std::mem::size_of::<Vec<BlockAddition>>()
+            ARC_HEADER
+                + std::mem::size_of::<Vec<BlockAddition>>()
                 + a.capacity() * std::mem::size_of::<BlockAddition>()
                 + a.iter().map(|a| a.data.capacity()).sum::<usize>()
-        }) + meta.as_ref().map_or(0, |m| ARC_HEADER + std::mem::size_of::<BlockGroupMeta>() + m.retained_bytes());
+        }) + meta.as_ref().map_or(0, |m| {
+            ARC_HEADER + std::mem::size_of::<BlockGroupMeta>() + m.retained_bytes()
+        });
         let retained = side_data + packets * std::mem::size_of::<QueuedPacket>();
-        let mut budget = MAX_BLOCK_BYTES.checked_sub(retained).ok_or_else(block_over_budget)?;
+        let mut budget = MAX_BLOCK_BYTES
+            .checked_sub(retained)
+            .ok_or_else(block_over_budget)?;
         // A Block whose packets would take the queue past the startup
         // analysis cap ends the analysis, then waits, whole, until the
         // packets held so far have been returned.
@@ -13480,8 +14668,7 @@ impl MkvDemuxer {
         let block_pts = if cluster_timecode >= 0
             && (timecode_offset >= 0 || cluster_timecode >= -timecode_offset)
         {
-            Some(((cluster_timecode as f64 / track_scale) as u64)
-                .min(i64::MAX as u64) as i64)
+            Some(((cluster_timecode as f64 / track_scale) as u64).min(i64::MAX as u64) as i64)
                 .map(|pts| pts.saturating_add(timecode_offset))
         } else {
             // A negative absolute Block timestamp is unspecified, not a
@@ -13491,7 +14678,8 @@ impl MkvDemuxer {
         // A track's CodecDelay moves its timestamps back — see `audio_trim`.
         let mut block_pts = block_pts.map(|pts| pts.saturating_sub(self.codec_delay_ticks[si]));
         let trims = self.track_trims[si];
-        let own_trim = trims.and_then(|t| t.padding(meta.as_ref().and_then(|m| m.discard_padding())));
+        let own_trim =
+            trims.and_then(|t| t.padding(meta.as_ref().and_then(|m| m.discard_padding())));
         let mut pending = self.start_trims[si];
         let n_frames = sizes.len().max(1) as i128;
         // FFmpeg 2da55bf (libavformat/matroskadec.c 4383–4386) computes the
@@ -13500,22 +14688,31 @@ impl MkvDemuxer {
         // of the stream's time base, which includes the TrackTimestampScale.
         // The laces then share it, the integer remainder distributed
         // between them (4392–4393).
-        let block_duration = explicit_duration.filter(|&d| d > 0)
+        let block_duration = explicit_duration
+            .filter(|&d| d > 0)
             .map(i128::from)
-            .or_else(|| self.track_timing[si].default_duration.and_then(|ns| {
-                let tb = time_base.as_rational();
-                timing::rescale_near(i128::from(ns) * n_frames, tb.den.into(), i128::from(tb.num) * 1_000_000_000)
-            })).unwrap_or(0);
+            .or_else(|| {
+                self.track_timing[si].default_duration.and_then(|ns| {
+                    let tb = time_base.as_rational();
+                    timing::rescale_near(
+                        i128::from(ns) * n_frames,
+                        tb.den.into(),
+                        i128::from(tb.num) * 1_000_000_000,
+                    )
+                })
+            })
+            .unwrap_or(0);
         let mut frame_at = body_start + data_start;
         for (lace, &size) in sizes.iter().enumerate() {
             let f = bytes[frame_at..frame_at + size].to_vec();
             frame_at += size;
             let i = lace as i128;
             let lace_duration = (block_duration * (i + 1) / n_frames
-                - block_duration * i / n_frames).min(i64::MAX as i128) as i64;
+                - block_duration * i / n_frames)
+                .min(i64::MAX as i128) as i64;
             let source_pts = block_pts;
-            block_pts = block_pts.and_then(|pts| (lace_duration > 0)
-                .then(|| pts.saturating_add(lace_duration)));
+            block_pts = block_pts
+                .and_then(|pts| (lace_duration > 0).then(|| pts.saturating_add(lace_duration)));
             // Block scope (RFC 9559 §5.1.4.1.31.3 bit 0x1) is "all frame
             // contents, excluding lacing data": each de-laced frame is
             // decompressed on its own.
@@ -13532,7 +14729,11 @@ impl MkvDemuxer {
                 continue;
             }
             let span = self.packet_clocks[si].frame_span(&frame_bytes, time_base);
-            let span = if lace_duration > 0 { Some(timing::Span::Ticks(lace_duration)) } else { span };
+            let span = if lace_duration > 0 {
+                Some(timing::Span::Ticks(lace_duration))
+            } else {
+                span
+            };
             let (pts, duration) = self.packet_clocks[si].timestamp(source_pts, span, time_base);
             match self.streams[si].params.codec_id.as_str() {
                 "prores" => framing::prores(&mut frame_bytes)?,
@@ -13553,7 +14754,10 @@ impl MkvDemuxer {
             let retained = frame_bytes.capacity()
                 + (copies - 1) * frame_bytes.len()
                 + webvtt.as_ref().map_or(0, |w| {
-                    ARC_HEADER + std::mem::size_of::<WebVttMetadata>() + w.identifier.capacity() + w.settings.capacity()
+                    ARC_HEADER
+                        + std::mem::size_of::<WebVttMetadata>()
+                        + w.identifier.capacity()
+                        + w.settings.capacity()
                 });
             budget = budget.checked_sub(retained).ok_or_else(block_over_budget)?;
             probe_charge += retained;
@@ -13571,7 +14775,12 @@ impl MkvDemuxer {
             let mut pkt = Packet::new(stream_idx, time_base, frame_bytes);
             pkt.pts = pts;
             pkt.dts = match &mut self.decode_orders[si] {
-                Some(order) => order.dts(pts, self.frame_parsers[si].as_ref().and_then(parser::FrameParser::reorder_delay)),
+                Some(order) => order.dts(
+                    pts,
+                    self.frame_parsers[si]
+                        .as_ref()
+                        .and_then(parser::FrameParser::reorder_delay),
+                ),
                 None => pts,
             };
             pkt.duration = duration;
@@ -13646,8 +14855,11 @@ impl MkvDemuxer {
         // Grow geometrically without taking spare queue slots past the cap.
         let needed = self.out_queue.len() + queued.len();
         if needed > self.out_queue.capacity() {
-            let capacity = needed.max(self.out_queue.capacity() * 2).min(MAX_PROBE_PACKETS);
-            self.out_queue.reserve_exact(capacity - self.out_queue.len());
+            let capacity = needed
+                .max(self.out_queue.capacity() * 2)
+                .min(MAX_PROBE_PACKETS);
+            self.out_queue
+                .reserve_exact(capacity - self.out_queue.len());
         }
         self.out_queue.extend(queued);
         Ok(())
@@ -13704,7 +14916,7 @@ fn xiph_lace_sizes(body: &[u8]) -> Result<(usize, Vec<usize>)> {
 fn fixed_lace_sizes(body: &[u8]) -> Result<(usize, Vec<usize>)> {
     let n_frames = body[0] as usize + 1;
     let payload = body.len() - 1;
-    if payload % n_frames != 0 {
+    if !payload.is_multiple_of(n_frames) {
         return Err(Error::invalid("MKV fixed lacing: non-divisible payload"));
     }
     // A zero-length payload is `n_frames` zero-byte frames.
@@ -13717,7 +14929,9 @@ fn ebml_lace_sizes(body: &[u8]) -> Result<(usize, Vec<usize>)> {
     // lace codes no size, so what follows its head could only be read as
     // some other number of frames.
     if n_frames < 2 {
-        return Err(Error::invalid("MKV ebml lacing: a lace holds at least two frames"));
+        return Err(Error::invalid(
+            "MKV ebml lacing: a lace holds at least two frames",
+        ));
     }
     let mut cur = std::io::Cursor::new(&body[1..]);
     let mut sizes: Vec<i64> = Vec::with_capacity(n_frames);
@@ -13751,7 +14965,9 @@ fn ebml_lace_sizes(body: &[u8]) -> Result<(usize, Vec<usize>)> {
     sizes.push(last);
     let sizes = sizes
         .into_iter()
-        .map(|s| usize::try_from(s).map_err(|_| Error::invalid("MKV ebml lacing: negative frame size")))
+        .map(|s| {
+            usize::try_from(s).map_err(|_| Error::invalid("MKV ebml lacing: negative frame size"))
+        })
         .collect::<Result<Vec<usize>>>()?;
     Ok((pos, sizes))
 }

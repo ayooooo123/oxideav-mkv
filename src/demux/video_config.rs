@@ -450,8 +450,8 @@ fn hevc_sps_info(nal: &[u8]) -> Option<((u32, u32), Option<usize>)> {
     r.skip(4)?; // sps_video_parameter_set_id
     let max_sub_layers_minus1 = r.bits(3)? as usize;
     r.skip(1)?; // sps_temporal_id_nesting_flag
-                // §7.3.3 profile_tier_level(1, sps_max_sub_layers_minus1): the
-                // general profile (88 bits) + general_level_idc (8 bits) …
+    // §7.3.3 profile_tier_level(1, sps_max_sub_layers_minus1): the
+    // general profile (88 bits) + general_level_idc (8 bits) …
     r.skip(96)?;
     let mut present = [(false, false); 8];
     for p in present.iter_mut().take(max_sub_layers_minus1) {
@@ -493,7 +493,8 @@ fn hevc_sps_info(nal: &[u8]) -> Option<((u32, u32), Option<usize>)> {
         return None;
     }
     let delay = (|| {
-        r.ue()?; r.ue()?; // bit_depth_luma/chroma_minus8
+        r.ue()?;
+        r.ue()?; // bit_depth_luma/chroma_minus8
         r.ue()?; // log2_max_pic_order_cnt_lsb_minus4
         let all_layers = r.bit()?;
         let start = if all_layers { 0 } else { max_sub_layers_minus1 };

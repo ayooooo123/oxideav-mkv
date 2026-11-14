@@ -280,14 +280,24 @@ fn resync_recovers_after_forged_block_size_mid_cluster() {
 
 #[test]
 fn unknown_child_cannot_skip_over_later_clusters() {
-    let damaged = elem_master(ids::CLUSTER, &[
-        elem_uint(ids::TIMECODE, 1000),
-        elem_forged_size(0xea, 1 << 20, &[0xaa; 16]),
-    ].concat());
-    let bytes = file_with_segment_body(&[
-        info_master(), tracks_master(), cluster(0, 0x11),
-        damaged, cluster(2000, 0x33),
-    ].concat());
+    let damaged = elem_master(
+        ids::CLUSTER,
+        &[
+            elem_uint(ids::TIMECODE, 1000),
+            elem_forged_size(0xea, 1 << 20, &[0xaa; 16]),
+        ]
+        .concat(),
+    );
+    let bytes = file_with_segment_body(
+        &[
+            info_master(),
+            tracks_master(),
+            cluster(0, 0x11),
+            damaged,
+            cluster(2000, 0x33),
+        ]
+        .concat(),
+    );
     let mut d = open_strict(bytes).unwrap();
     assert_eq!(drain(&mut d), vec![(0, 0x11), (2000, 0x33)]);
     assert_eq!(d.damage_events().len(), 1);
@@ -382,7 +392,10 @@ fn either_open_skips_a_damaged_tags_master() {
         let mut dmx = opened.expect("open");
         assert_eq!(dmx.streams().len(), 1, "tracks survive the damaged Tags");
         assert_eq!(
-            dmx.damage_events().iter().map(|e| e.kind()).collect::<Vec<_>>(),
+            dmx.damage_events()
+                .iter()
+                .map(|e| e.kind())
+                .collect::<Vec<_>>(),
             [DamageKind::DamagedMaster(ids::TAGS)],
         );
         let packets = drain(&mut dmx);
@@ -416,7 +429,8 @@ fn unrecoverable_tail_ends_stream_cleanly() {
 
 // =====================================================================
 // 8. Cues-less seek fallback — RFC 9559 §22.1 only RECOMMENDS Cues; both
-//    paths seek by scanning Cluster Timestamps.
+//    paths seek by Cluster Timestamp (bisection over the Cluster run,
+//    issue #9) and land on the last Cluster at or before the target.
 // =====================================================================
 
 #[test]
@@ -424,7 +438,11 @@ fn resilient_seek_without_cues_scans_cluster_timestamps() {
     let bytes = three_cluster_file(); // no Cues element at all
 
     let mut strict = open_strict(bytes.clone()).expect("open");
-    assert_eq!(strict.seek_to(0, 1500).expect("strict seek"), 1000);
+    assert_eq!(
+        strict.seek_to(0, 1500).expect("strict cue-less seek"),
+        1000,
+        "the strict path bisects the Cluster run too"
+    );
     assert_eq!(drain(&mut strict), vec![(1000, 0x22), (2000, 0x33)]);
 
     let mut dmx = open_resilient(bytes).expect("open");
@@ -469,10 +487,11 @@ fn seek_falls_back_when_the_cues_master_is_damaged() {
 
     for opened in [open_strict(bytes.clone()), open_resilient(bytes)] {
         let mut dmx = opened.expect("open");
-        assert!(dmx
-            .damage_events()
-            .iter()
-            .any(|e| e.kind() == DamageKind::DamagedMaster(ids::CUES)));
+        assert!(
+            dmx.damage_events()
+                .iter()
+                .any(|e| e.kind() == DamageKind::DamagedMaster(ids::CUES))
+        );
         let landed = dmx.seek_to(0, 1000).expect("fallback seek");
         assert_eq!(landed, 1000);
         assert_eq!(drain(&mut dmx), vec![(1000, 0x22)]);
@@ -512,7 +531,9 @@ fn resilient_seek_steps_over_unknown_size_cluster() {
 struct BoundedInput(Cursor<Vec<u8>>);
 
 impl Read for BoundedInput {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { self.0.read(buf) }
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
 }
 
 impl Seek for BoundedInput {

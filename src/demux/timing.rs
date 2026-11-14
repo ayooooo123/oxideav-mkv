@@ -21,12 +21,20 @@ struct H264Probe {
 
 impl DecodeOrder {
     pub(super) fn new(delay: usize) -> Self {
-        Self { delay, pts: [None; 17], probe: None }
+        Self {
+            delay,
+            pts: [None; 17],
+            probe: None,
+        }
     }
     pub(super) fn h264(delay: usize, explicit: bool) -> Self {
         let mut order = Self::new(delay);
         if !explicit || delay > 0 {
-            order.probe = Some(H264Probe { frames: 0, explicit, found_dts: false });
+            order.probe = Some(H264Probe {
+                frames: 0,
+                explicit,
+                found_dts: false,
+            });
         }
         order
     }
@@ -36,19 +44,30 @@ impl DecodeOrder {
     }
     pub(super) fn needs_probe(&self) -> bool {
         self.probe.as_ref().is_some_and(|p| {
-            if p.explicit { !p.found_dts } else { p.frames < 7 }
+            if p.explicit {
+                !p.found_dts
+            } else {
+                p.frames < 7
+            }
         })
     }
     /// Once delay is known, replay the queued prefix just as the reference
     /// parser does. A restricted SPS that never produced a DTS at EOF keeps
     /// N/A, rather than inventing a timestamp for an incomplete sequence.
     pub(super) fn finish_probe(&mut self) -> bool {
-        let replay = self.probe.take().is_some_and(|p| !p.explicit || p.found_dts);
-        if replay { self.pts.fill(None); }
+        let replay = self
+            .probe
+            .take()
+            .is_some_and(|p| !p.explicit || p.found_dts);
+        if replay {
+            self.pts.fill(None);
+        }
         replay
     }
     pub(super) fn dts(&mut self, pts: Option<i64>, delay: Option<usize>) -> Option<i64> {
-        if let Some(delay) = delay { self.delay = delay; }
+        if let Some(delay) = delay {
+            self.delay = delay;
+        }
         if let Some(probe) = &mut self.probe {
             probe.frames += 1;
             if probe.explicit && probe.frames == 1 {
@@ -58,11 +77,15 @@ impl DecodeOrder {
                 return None;
             }
         }
-        if self.delay >= self.pts.len() { return None; }
+        if self.delay >= self.pts.len() {
+            return None;
+        }
         if let Some(pts) = pts {
             self.pts[0] = Some(pts);
             for i in 0..self.delay {
-                if self.pts[i] <= self.pts[i + 1] { break; }
+                if self.pts[i] <= self.pts[i + 1] {
+                    break;
+                }
                 self.pts.swap(i, i + 1);
             }
             if let Some(probe) = &mut self.probe {
@@ -115,7 +138,11 @@ enum AudioTiming {
     /// FFmpeg runs no parser over Matroska AAC: a packet lasts the
     /// decoder's frame, `frame` samples at the core `rate`, which FFmpeg
     /// knows once stream probing has decoded the first packet.
-    Aac { frame: u32, rate: u32, decoded: bool },
+    Aac {
+        frame: u32,
+        rate: u32,
+        decoded: bool,
+    },
     Mp3(Mp3),
     Ac3(Ac3),
     Dts,
@@ -128,15 +155,41 @@ impl PacketClock {
             "opus" => AudioTiming::Opus,
             "flac" => AudioTiming::Flac,
             "wavpack" => AudioTiming::WavPack,
-            "vorbis" => Vorbis::new(&params.extradata).map(AudioTiming::Vorbis).unwrap_or(AudioTiming::None),
-            "aac" => crate::aac::decoder_frame(&params.extradata)
-                .map_or(AudioTiming::None, |(frame, rate)| AudioTiming::Aac { frame, rate, decoded: false }),
-            "mp3" => AudioTiming::Mp3(Mp3 { layer: 3, rate, header: 0, count: 0, samples: None }),
-            "ac3" | "eac3" => AudioTiming::Ac3(Ac3 { samples: None, rate, eac3: params.codec_id.as_str() == "eac3" }),
+            "vorbis" => Vorbis::new(&params.extradata)
+                .map(AudioTiming::Vorbis)
+                .unwrap_or(AudioTiming::None),
+            "aac" => crate::aac::decoder_frame(&params.extradata).map_or(
+                AudioTiming::None,
+                |(frame, rate)| AudioTiming::Aac {
+                    frame,
+                    rate,
+                    decoded: false,
+                },
+            ),
+            "mp3" => AudioTiming::Mp3(Mp3 {
+                layer: 3,
+                rate,
+                header: 0,
+                count: 0,
+                samples: None,
+            }),
+            "ac3" | "eac3" => AudioTiming::Ac3(Ac3 {
+                samples: None,
+                rate,
+                eac3: params.codec_id.as_str() == "eac3",
+            }),
             "dts" => AudioTiming::Dts,
             _ => AudioTiming::None,
         };
-        Self { codec, rate: if params.codec_id.as_str() == "opus" { 48000 } else { rate }, next: 0 }
+        Self {
+            codec,
+            rate: if params.codec_id.as_str() == "opus" {
+                48000
+            } else {
+                rate
+            },
+            next: 0,
+        }
     }
 
     pub(super) fn reset(&mut self) {
@@ -166,11 +219,19 @@ impl PacketClock {
             AudioTiming::Flac => ticks(flac_samples(data)?, self.rate),
             // This runs on Matroska's compact WavPack frame before rebuilding
             // its standard block headers. Its first word is block_samples.
-            AudioTiming::WavPack => ticks(u32::from_le_bytes(data.get(..4)?.try_into().ok()?), self.rate),
+            AudioTiming::WavPack => ticks(
+                u32::from_le_bytes(data.get(..4)?.try_into().ok()?),
+                self.rate,
+            ),
             AudioTiming::Vorbis(v) => ticks(v.samples(data)?, self.rate),
-            AudioTiming::Aac { frame, rate, decoded } => {
-                std::mem::replace(decoded, true).then_some(Span::Samples { samples: *frame, rate: *rate })
-            }
+            AudioTiming::Aac {
+                frame,
+                rate,
+                decoded,
+            } => std::mem::replace(decoded, true).then_some(Span::Samples {
+                samples: *frame,
+                rate: *rate,
+            }),
             AudioTiming::Mp3(m) => {
                 m.parse(data);
                 m.span(tb)
@@ -199,7 +260,12 @@ impl PacketClock {
     /// The timestamp and duration of a packet lasting `span`: `pts` for a
     /// Block's first lace, the end of the previous packet for a later lace
     /// with a nonzero duration (none without one).
-    pub(super) fn timestamp(&mut self, pts: Option<i64>, span: Option<Span>, tb: TimeBase) -> (Option<i64>, Option<i64>) {
+    pub(super) fn timestamp(
+        &mut self,
+        pts: Option<i64>,
+        span: Option<Span>,
+        tb: TimeBase,
+    ) -> (Option<i64>, Option<i64>) {
         let duration = span.map(|span| span.ticks(tb));
         let pts = pts.or_else(|| duration.filter(|&d| d > 0).map(|_| self.next));
         if let Some(pts) = pts {
@@ -278,7 +344,11 @@ impl Mp3 {
     const SAME_HEADER: u32 = 0xffe0_0000 | (3 << 19) | (3 << 17) | (3 << 10);
 
     fn parse(&mut self, data: &[u8]) {
-        let Some(head) = data.get(..4).and_then(|h| h.try_into().ok()).map(u32::from_be_bytes) else {
+        let Some(head) = data
+            .get(..4)
+            .and_then(|h| h.try_into().ok())
+            .map(u32::from_be_bytes)
+        else {
             return;
         };
         let Some((layer, rate, samples)) = mpeg_audio_header(head) else {
@@ -303,7 +373,10 @@ impl Mp3 {
     }
 
     fn span(&self, tb: TimeBase) -> Option<Span> {
-        let parsed = self.samples.and_then(|samples| floor_ticks(samples, self.rate, tb)).filter(|&t| t > 0);
+        let parsed = self
+            .samples
+            .and_then(|samples| floor_ticks(samples, self.rate, tb))
+            .filter(|&t| t > 0);
         if let Some(ticks) = parsed {
             return Some(Span::Ticks(ticks));
         }
@@ -314,7 +387,10 @@ impl Mp3 {
             _ if self.rate <= 24000 => 576,
             _ => 1152,
         };
-        (self.rate > 0).then_some(Span::Samples { samples, rate: self.rate })
+        (self.rate > 0).then_some(Span::Samples {
+            samples,
+            rate: self.rate,
+        })
     }
 }
 
@@ -327,7 +403,13 @@ fn mpeg_audio_header(h: u32) -> Option<(u32, u32, u32)> {
     let layer = 4 - ((h >> 17) & 3);
     let bitrate = (h >> 12) & 15;
     let rate = (h >> 10) & 3;
-    if h & 0xffe0_0000 != 0xffe0_0000 || version == 1 || layer == 4 || bitrate == 0 || bitrate == 15 || rate == 3 {
+    if h & 0xffe0_0000 != 0xffe0_0000
+        || version == 1
+        || layer == 4
+        || bitrate == 0
+        || bitrate == 15
+        || rate == 3
+    {
         return None;
     }
     let rate = [44100, 48000, 32000][rate as usize] >> [2, 0, 1, 0][version as usize];
@@ -353,12 +435,18 @@ struct Ac3 {
 
 impl Ac3 {
     fn span(&self, tb: TimeBase) -> Option<Span> {
-        let parsed = self.samples.and_then(|samples| floor_ticks(samples, self.rate, tb)).filter(|&t| t > 0);
+        let parsed = self
+            .samples
+            .and_then(|samples| floor_ticks(samples, self.rate, tb))
+            .filter(|&t| t > 0);
         if let Some(ticks) = parsed {
             return Some(Span::Ticks(ticks));
         }
         // libavformat's default AC-3 frame size.
-        (!self.eac3 && self.rate > 0).then_some(Span::Samples { samples: 1536, rate: self.rate })
+        (!self.eac3 && self.rate > 0).then_some(Span::Samples {
+            samples: 1536,
+            rate: self.rate,
+        })
     }
 }
 
@@ -388,7 +476,9 @@ fn ac3_frames(data: &[u8]) -> Option<(u32, u32, bool)> {
             std::cmp::Ordering::Equal => {
                 // crc2 makes the CRC of everything after the sync word zero
                 // (ATSC A/52 §5.4.1.4, §E.1.3.5).
-                let crc = frames[2..].iter().fold(0u16, |crc, &b| (crc << 8) ^ AC3_CRC[usize::from((crc >> 8) as u8 ^ b)]);
+                let crc = frames[2..].iter().fold(0u16, |crc, &b| {
+                    (crc << 8) ^ AC3_CRC[usize::from((crc >> 8) as u8 ^ b)]
+                });
                 return (crc == 0).then_some((samples, rate, eac3));
             }
         }
@@ -411,7 +501,8 @@ fn ac3_header(frame: &[u8]) -> Option<(usize, u32, u32, bool)> {
         if fscod == 3 || frmsizecod > 37 {
             return None;
         }
-        let words = AC3_FRAME_WORDS[frmsizecod / 2][fscod] + u16::from(fscod == 1 && frmsizecod % 2 == 1);
+        let words =
+            AC3_FRAME_WORDS[frmsizecod / 2][fscod] + u16::from(fscod == 1 && frmsizecod % 2 == 1);
         // Half- and quarter-rate AC-3 (bsid 9 and 10).
         let rate = RATES[fscod] >> bsid.saturating_sub(8);
         Some((usize::from(words) * 2, 1536, rate, false))
@@ -440,10 +531,25 @@ fn ac3_header(frame: &[u8]) -> Option<(usize, u32, u32, bool)> {
 /// 44.1 and 32 kHz (ATSC A/52 Table 5.18); the odd 44.1 kHz codes add a
 /// word.
 const AC3_FRAME_WORDS: [[u16; 3]; 19] = [
-    [64, 69, 96], [80, 87, 120], [96, 104, 144], [112, 121, 168], [128, 139, 192],
-    [160, 174, 240], [192, 208, 288], [224, 243, 336], [256, 278, 384], [320, 348, 480],
-    [384, 417, 576], [448, 487, 672], [512, 557, 768], [640, 696, 960], [768, 835, 1152],
-    [896, 975, 1344], [1024, 1114, 1536], [1152, 1253, 1728], [1280, 1393, 1920],
+    [64, 69, 96],
+    [80, 87, 120],
+    [96, 104, 144],
+    [112, 121, 168],
+    [128, 139, 192],
+    [160, 174, 240],
+    [192, 208, 288],
+    [224, 243, 336],
+    [256, 278, 384],
+    [320, 348, 480],
+    [384, 417, 576],
+    [448, 487, 672],
+    [512, 557, 768],
+    [640, 696, 960],
+    [768, 835, 1152],
+    [896, 975, 1344],
+    [1024, 1114, 1536],
+    [1152, 1253, 1728],
+    [1280, 1393, 1920],
 ];
 
 /// CRC-16 with generator x^16 + x^15 + x^2 + 1, most significant bit first.
@@ -454,7 +560,11 @@ const AC3_CRC: [u16; 256] = {
         let mut crc = (i as u16) << 8;
         let mut bit = 0;
         while bit < 8 {
-            crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x8005 } else { crc << 1 };
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x8005
+            } else {
+                crc << 1
+            };
             bit += 1;
         }
         table[i] = crc;
@@ -479,8 +589,14 @@ fn dts_core(data: &[u8]) -> Option<(u32, u32)> {
         }
         _ => return None,
     }
-    let bits = |at: usize, n: usize| (0..n).fold(0u32, |v, i| v << 1 | u32::from(header[(at + i) / 8] >> (7 - (at + i) % 8) & 1));
-    const RATES: [u32; 16] = [0, 8000, 16000, 32000, 0, 0, 11025, 22050, 44100, 0, 0, 12000, 24000, 48000, 96000, 192000];
+    let bits = |at: usize, n: usize| {
+        (0..n).fold(0u32, |v, i| {
+            v << 1 | u32::from(header[(at + i) / 8] >> (7 - (at + i) % 8) & 1)
+        })
+    };
+    const RATES: [u32; 16] = [
+        0, 8000, 16000, 32000, 0, 0, 11025, 22050, 44100, 0, 0, 12000, 24000, 48000, 96000, 192000,
+    ];
     let deficit = bits(33, 5) + 1;
     let crc = bits(38, 1) == 1;
     let blocks = bits(39, 7) + 1;
@@ -491,34 +607,56 @@ fn dts_core(data: &[u8]) -> Option<(u32, u32)> {
     // Full-length blocks of 8 subband samples, a real frame size, one of
     // the ten core channel arrangements, the reserved bit clear, a valid
     // LFE flag and source resolution.
-    let valid = deficit == 32 && blocks % 8 == 0 && size >= 96 && audio_mode < 10 && rate != 0
-        && bits(75, 1) == 0 && bits(85, 2) != 3 && pcm != 4 && pcm != 7;
+    let valid = deficit == 32
+        && blocks % 8 == 0
+        && size >= 96
+        && audio_mode < 10
+        && rate != 0
+        && bits(75, 1) == 0
+        && bits(85, 2) != 3
+        && pcm != 4
+        && pcm != 7;
     valid.then_some((blocks * 32, rate))
 }
 
 fn opus_samples(data: &[u8]) -> Option<u32> {
     let toc = *data.first()?;
     let config = toc >> 3;
-    let samples = if config >= 16 { 120 << (config & 3) }
-        else if config >= 12 { 480 << (config & 1) }
-        else { [480, 960, 1920, 2880][(config & 3) as usize] };
-    let count = match toc & 3 { 0 => 1, 1 | 2 => 2, _ => (data.get(1)? & 63) as u32 };
+    let samples = if config >= 16 {
+        120 << (config & 3)
+    } else if config >= 12 {
+        480 << (config & 1)
+    } else {
+        [480, 960, 1920, 2880][(config & 3) as usize]
+    };
+    let count = match toc & 3 {
+        0 => 1,
+        1 | 2 => 2,
+        _ => (data.get(1)? & 63) as u32,
+    };
     let total = samples * count;
     (count > 0 && total <= 5760).then_some(total)
 }
 
 fn flac_samples(data: &[u8]) -> Option<u32> {
-    if data.len() < 6 || data[0] != 0xff || data[1] & 0xfe != 0xf8 { return None; }
+    if data.len() < 6 || data[0] != 0xff || data[1] & 0xfe != 0xf8 {
+        return None;
+    }
     let code = data[2] >> 4;
     Some(match code {
         1 => 192,
         2..=5 => 576 << (code - 2),
         6 | 7 => {
             let lead = data[4].leading_ones() as usize;
-            if lead == 1 || lead > 7 { return None; }
+            if lead == 1 || lead > 7 {
+                return None;
+            }
             let at = 4 + lead.max(1);
-            if code == 6 { *data.get(at)? as u32 + 1 }
-            else { u16::from_be_bytes(data.get(at..at + 2)?.try_into().ok()?) as u32 + 1 }
+            if code == 6 {
+                *data.get(at)? as u32 + 1
+            } else {
+                u16::from_be_bytes(data.get(at..at + 2)?.try_into().ok()?) as u32 + 1
+            }
         }
         8..=15 => 256 << (code - 8),
         _ => return None,
@@ -538,7 +676,9 @@ struct Vorbis {
 
 impl Vorbis {
     fn new(extra: &[u8]) -> Option<Self> {
-        if extra.first() != Some(&2) { return None; }
+        if extra.first() != Some(&2) {
+            return None;
+        }
         let mut pos = 1;
         let mut sizes = [0usize; 2];
         for size in &mut sizes {
@@ -546,13 +686,19 @@ impl Vorbis {
                 let b = *extra.get(pos)?;
                 pos += 1;
                 *size = size.checked_add(b as usize)?;
-                if b < 255 { break; }
+                if b < 255 {
+                    break;
+                }
             }
         }
         let id = extra.get(pos..pos.checked_add(sizes[0])?)?;
-        if id.len() < 30 || !id.starts_with(b"\x01vorbis") || id[29] & 1 == 0 { return None; }
+        if id.len() < 30 || !id.starts_with(b"\x01vorbis") || id[29] & 1 == 0 {
+            return None;
+        }
         let setup = extra.get(pos.checked_add(sizes[0])?.checked_add(sizes[1])?..)?;
-        if setup.len() < 7 || !setup.starts_with(b"\x05vorbis") { return None; }
+        if setup.len() < 7 || !setup.starts_with(b"\x05vorbis") {
+            return None;
+        }
         // Modes are the fixed-width terminal list of the setup packet: six
         // count bits, then {blockflag:1, windowtype:16, transformtype:16,
         // mapping:8}, then a framing one and zero padding. Read the suffix
@@ -561,29 +707,58 @@ impl Vorbis {
         let framing = last * 8 + (7 - setup[last].leading_zeros() as usize);
         let mut count = 0;
         for n in 1..=64 {
-            let Some(start) = framing.checked_sub(n * 41) else { break };
-            if start < 7 * 8 + 6 { break; }
-            if bits(setup, start + 1, 16)? != 0 || bits(setup, start + 17, 16)? != 0
-                || bits(setup, start + 33, 8)? > 63 { break; }
-            if bits(setup, start - 6, 6)? as usize + 1 == n { count = n; }
+            let Some(start) = framing.checked_sub(n * 41) else {
+                break;
+            };
+            if start < 7 * 8 + 6 {
+                break;
+            }
+            if bits(setup, start + 1, 16)? != 0
+                || bits(setup, start + 17, 16)? != 0
+                || bits(setup, start + 33, 8)? > 63
+            {
+                break;
+            }
+            if bits(setup, start - 6, 6)? as usize + 1 == n {
+                count = n;
+            }
         }
-        if count == 0 { return None; }
+        if count == 0 {
+            return None;
+        }
         let mut modes = [false; 64];
         let start = framing - count * 41;
-        for (i, mode) in modes[..count].iter_mut().enumerate() { *mode = bits(setup, start + i * 41, 1)? != 0; }
+        for (i, mode) in modes[..count].iter_mut().enumerate() {
+            *mode = bits(setup, start + i * 41, 1)? != 0;
+        }
         let sizes = [1u32 << (id[28] & 15), 1u32 << (id[28] >> 4)];
         let mode_bits = usize::BITS - (count - 1).leading_zeros();
         let initial = sizes[usize::from(modes[0])];
-        Some(Self { sizes, modes, count, mode_bits, initial, previous: initial })
+        Some(Self {
+            sizes,
+            modes,
+            count,
+            mode_bits,
+            initial,
+            previous: initial,
+        })
     }
 
     fn samples(&mut self, data: &[u8]) -> Option<u32> {
         let first = *data.first()?;
-        if first & 1 != 0 { return None; }
+        if first & 1 != 0 {
+            return None;
+        }
         let mode = (first as usize >> 1) & ((1 << self.mode_bits) - 1);
-        if mode >= self.count { return None; }
+        if mode >= self.count {
+            return None;
+        }
         let long = self.modes[mode];
-        let previous = if long { self.sizes[((first >> (self.mode_bits + 1)) & 1) as usize] } else { self.previous };
+        let previous = if long {
+            self.sizes[((first >> (self.mode_bits + 1)) & 1) as usize]
+        } else {
+            self.previous
+        };
         let current = self.sizes[usize::from(long)];
         self.previous = current;
         Some((previous + current) / 4)
@@ -591,9 +766,13 @@ impl Vorbis {
 }
 
 fn bits(data: &[u8], pos: usize, count: usize) -> Option<u32> {
-    if pos.checked_add(count)? > data.len().checked_mul(8)? { return None; }
+    if pos.checked_add(count)? > data.len().checked_mul(8)? {
+        return None;
+    }
     let mut value = 0;
-    for i in 0..count { value |= (((data[(pos + i) / 8] >> ((pos + i) % 8)) & 1) as u32) << i; }
+    for i in 0..count {
+        value |= (((data[(pos + i) / 8] >> ((pos + i) % 8)) & 1) as u32) << i;
+    }
     Some(value)
 }
 
@@ -603,8 +782,10 @@ mod tests {
     #[test]
     fn reordered_pts_window_preserves_initial_na() {
         let mut clock = DecodeOrder::new(2);
-        let actual: Vec<_> = [0, 160, 80, 40, 120].into_iter()
-            .map(|pts| clock.dts(Some(pts), None)).collect();
+        let actual: Vec<_> = [0, 160, 80, 40, 120]
+            .into_iter()
+            .map(|pts| clock.dts(Some(pts), None))
+            .collect();
         assert_eq!(actual, [None, None, Some(0), Some(40), Some(80)]);
         clock.reset();
         assert_eq!(clock.dts(Some(200), None), None);
@@ -627,8 +808,22 @@ mod tests {
         }
         assert!(!order.needs_probe());
         assert!(order.finish_probe());
-        let dts: Vec<_> = pts.into_iter().map(|pts| order.dts(Some(pts), None)).collect();
-        assert_eq!(dts, [None, Some(0), Some(42), Some(83), Some(125), Some(167), Some(209)]);
+        let dts: Vec<_> = pts
+            .into_iter()
+            .map(|pts| order.dts(Some(pts), None))
+            .collect();
+        assert_eq!(
+            dts,
+            [
+                None,
+                Some(0),
+                Some(42),
+                Some(83),
+                Some(125),
+                Some(167),
+                Some(209)
+            ]
+        );
     }
     #[test]
     fn opus_toc_durations() {
@@ -642,8 +837,14 @@ mod tests {
     #[test]
     fn flac_block_size_codes() {
         assert_eq!(flac_samples(&[255, 248, 0xc0, 0, 0, 0]), Some(4096));
-        assert_eq!(flac_samples(&[255, 248, 0x60, 0, 0xc2, 0x80, 127]), Some(128));
-        assert_eq!(flac_samples(&[255, 248, 0x70, 0, 0, 0x0f, 0xff]), Some(4096));
+        assert_eq!(
+            flac_samples(&[255, 248, 0x60, 0, 0xc2, 0x80, 127]),
+            Some(128)
+        );
+        assert_eq!(
+            flac_samples(&[255, 248, 0x70, 0, 0, 0x0f, 0xff]),
+            Some(4096)
+        );
         assert_eq!(flac_samples(&[255, 248, 0x70, 0, 0]), None);
     }
     #[test]
@@ -696,7 +897,11 @@ mod tests {
         extra.extend_from_slice(&id);
         extra.extend_from_slice(&setup);
         let codec = AudioTiming::Vorbis(Vorbis::new(&extra).unwrap());
-        let mut clock = PacketClock { codec, rate: 48000, next: 0 };
+        let mut clock = PacketClock {
+            codec,
+            rate: 48000,
+            next: 0,
+        };
         // A short first packet overlaps mode 0's long window, after open and
         // after a seek alike.
         let fresh = [short(&mut clock), short(&mut clock)];

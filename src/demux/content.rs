@@ -38,7 +38,11 @@ pub(super) fn decompression_chain(
 ) -> Option<Vec<Decompression>> {
     let mut chain = Vec::new();
     for e in &enc.encodings {
-        if !(if private { e.scope.private() } else { e.scope.block() }) {
+        if !(if private {
+            e.scope.private()
+        } else {
+            e.scope.block()
+        }) {
             continue;
         }
         let ContentEncodingTransform::Compression { algo, settings } = &e.transform else {
@@ -54,11 +58,7 @@ pub(super) fn decompression_chain(
             ContentCompAlgo::Other(_) => return None,
         });
     }
-    if chain.is_empty() {
-        None
-    } else {
-        Some(chain)
-    }
+    if chain.is_empty() { None } else { Some(chain) }
 }
 
 /// Why a compression chain wasn't undone.
@@ -119,7 +119,9 @@ pub(super) fn decompress(
                     Ok(()) => out,
                     Err(compcol::Error::Corrupt) if budget < cap => return Err(Undo::OverBudget),
                     Err(e) => {
-                        return Err(Undo::Corrupt(Error::invalid(format!("MKV: lzo frame: {e:?}"))));
+                        return Err(Undo::Corrupt(Error::invalid(format!(
+                            "MKV: lzo frame: {e:?}"
+                        ))));
                     }
                 }
             }
@@ -137,7 +139,10 @@ fn inflate<A: compcol::Algorithm>(
     budget: usize,
 ) -> std::result::Result<Vec<u8>, Undo> {
     if data.is_empty() {
-        return Err(Undo::Corrupt(Error::invalid(format!("MKV: empty {} frame", A::NAME))));
+        return Err(Undo::Corrupt(Error::invalid(format!(
+            "MKV: empty {} frame",
+            A::NAME
+        ))));
     }
     compcol::vec::decompress_to_vec_capped::<A>(data, cap.min(budget) as u64).map_err(|e| match e {
         compcol::Error::OutputLimitExceeded if budget < cap => Undo::OverBudget,

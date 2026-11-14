@@ -385,9 +385,14 @@ fn cluster_records_no_encrypted_blocks_when_absent() {
 /// Cluster's one packet, 0xAA, then the end of the stream.
 fn walk_from_the_start(dmx: &mut oxideav_mkv::demux::MkvDemuxer, walks: usize) {
     for walk in 0..walks {
-        let packet = dmx.next_packet().unwrap_or_else(|e| panic!("walk {walk}: {e}"));
+        let packet = dmx
+            .next_packet()
+            .unwrap_or_else(|e| panic!("walk {walk}: {e}"));
         assert_eq!(packet.data, vec![0xAA], "walk {walk}");
-        assert!(matches!(dmx.next_packet(), Err(Error::Eof)), "walk {walk} must end after its packet");
+        assert!(
+            matches!(dmx.next_packet(), Err(Error::Eof)),
+            "walk {walk} must end after its packet"
+        );
         dmx.seek_to(0, 0).expect("seek to the start");
     }
 }
@@ -408,7 +413,10 @@ fn revisiting_a_cluster_records_its_encrypted_blocks_once() {
     assert_eq!(recs.len(), 1);
     assert_eq!(
         recs[0].encrypted_blocks,
-        vec![b"\x81\x00\x00\x80enc-one".to_vec(), b"\x81\x00\x10\x80enc-two".to_vec()],
+        vec![
+            b"\x81\x00\x00\x80enc-one".to_vec(),
+            b"\x81\x00\x10\x80enc-two".to_vec()
+        ],
         "a revisited Cluster's EncryptedBlocks must be recorded once"
     );
 }
@@ -417,9 +425,14 @@ fn revisiting_a_cluster_records_its_encrypted_blocks_once() {
 fn revisiting_a_cluster_records_its_silent_tracks_once() {
     // As with EncryptedBlocks: a SilentTracks master revisited by a seek is
     // already on the record, and its numbers are not appended again.
-    let silent = elem_master(ids::SILENT_TRACKS, &[
-        elem_uint(ids::SILENT_TRACK_NUMBER, 3), elem_uint(ids::SILENT_TRACK_NUMBER, 5),
-    ].concat());
+    let silent = elem_master(
+        ids::SILENT_TRACKS,
+        &[
+            elem_uint(ids::SILENT_TRACK_NUMBER, 3),
+            elem_uint(ids::SILENT_TRACK_NUMBER, 5),
+        ]
+        .concat(),
+    );
     let mut cluster = Vec::new();
     cluster.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
     cluster.extend_from_slice(&silent);

@@ -30,7 +30,9 @@ pub(super) enum Codec {
     /// MLP / TrueHD and for JPEG 2000, MJPEG, ProRes and raw video — or
     /// the codec isn't audio or video (subtitles), which FFmpeg treats the
     /// same way.
-    Other { intra_only: bool },
+    Other {
+        intra_only: bool,
+    },
     /// A `CodecID` FFmpeg doesn't map (`AV_CODEC_ID_NONE`).
     Unknown,
 }
@@ -173,7 +175,9 @@ enum Kind {
     Vp8,
     Vp9,
     Theora,
-    Av1 { reduced_still_picture_header: Option<bool> },
+    Av1 {
+        reduced_still_picture_header: Option<bool>,
+    },
     Mlp,
 }
 
@@ -224,7 +228,6 @@ impl FrameParser {
         }
     }
 
-
     fn parse(&mut self, frame: &[u8]) {
         match &mut self.kind {
             Kind::H264(h264) => {
@@ -234,9 +237,17 @@ impl FrameParser {
             }
             // vp3_parser.c: the frame type bit of the first byte.
             Kind::Vp3 | Kind::Theora => {
-                let bit = if matches!(self.kind, Kind::Theora) { 0x40 } else { 0x80 };
+                let bit = if matches!(self.kind, Kind::Theora) {
+                    0x40
+                } else {
+                    0x80
+                };
                 let first = frame.first().copied().unwrap_or(0);
-                self.pict_type = if first & bit != 0 { PictType::P } else { PictType::I };
+                self.pict_type = if first & bit != 0 {
+                    PictType::P
+                } else {
+                    PictType::I
+                };
             }
             // vp8_parser.c: the frame tag's key frame bit and version.
             Kind::Vp8 => {
@@ -474,7 +485,9 @@ impl H264 {
                 p += 1;
             }
             for _ in 0..count {
-                let Some(len) = data.get(p..p + 2) else { return };
+                let Some(len) = data.get(p..p + 2) else {
+                    return;
+                };
                 let len = usize::from(u16::from_be_bytes([len[0], len[1]]));
                 let Some(nal) = data.get(p + 2..p + 2 + len) else {
                     return;
@@ -597,7 +610,10 @@ fn decode_sps(rbsp: &[u8]) -> Option<(usize, H264Sps)> {
     if sps_id >= 32 {
         return None;
     }
-    if matches!(profile_idc, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 144) {
+    if matches!(
+        profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 144
+    ) {
         let chroma_format_idc = r.ue();
         if chroma_format_idc > 3 || (chroma_format_idc == 3 && r.bit() == 1) {
             return None;
@@ -657,34 +673,70 @@ fn decode_sps(rbsp: &[u8]) -> Option<(usize, H264Sps)> {
         return None;
     }
     let reorder_frames = h264_reorder_frames(&mut r);
-    Some((sps_id, H264Sps { ref_frame_count, reorder_frames }))
+    Some((
+        sps_id,
+        H264Sps {
+            ref_frame_count,
+            reorder_frames,
+        },
+    ))
 }
 
 /// H.264 SPS tail and VUI bitstream_restriction (Annex E.1.1).
 fn h264_reorder_frames(r: &mut Bits<'_>) -> Option<u32> {
     r.skip(1); // gaps_in_frame_num_value_allowed_flag
-    r.ue(); r.ue(); // picture dimensions
-    if r.bit() == 0 { r.skip(1); } // mb_adaptive_frame_field_flag
+    r.ue();
+    r.ue(); // picture dimensions
+    if r.bit() == 0 {
+        r.skip(1);
+    } // mb_adaptive_frame_field_flag
     r.skip(1); // direct_8x8_inference_flag
-    if r.bit() != 0 { for _ in 0..4 { r.ue(); } }
-    if r.bit() == 0 { return None; } // vui_parameters_present_flag
-    if r.bit() != 0 && r.bits(8) == 255 { r.skip(32); }
-    if r.bit() != 0 { r.skip(1); } // overscan
+    if r.bit() != 0 {
+        for _ in 0..4 {
+            r.ue();
+        }
+    }
+    if r.bit() == 0 {
+        return None;
+    } // vui_parameters_present_flag
+    if r.bit() != 0 && r.bits(8) == 255 {
+        r.skip(32);
+    }
+    if r.bit() != 0 {
+        r.skip(1);
+    } // overscan
     if r.bit() != 0 {
         r.skip(4); // video_format, video_full_range_flag
-        if r.bit() != 0 { r.skip(24); }
+        if r.bit() != 0 {
+            r.skip(24);
+        }
     }
-    if r.bit() != 0 { r.ue(); r.ue(); } // chroma location
-    if r.bit() != 0 { r.skip(65); } // timing information
+    if r.bit() != 0 {
+        r.ue();
+        r.ue();
+    } // chroma location
+    if r.bit() != 0 {
+        r.skip(65);
+    } // timing information
     let nal_hrd = r.bit() != 0;
-    if nal_hrd { skip_hrd(r)?; }
+    if nal_hrd {
+        skip_hrd(r)?;
+    }
     let vcl_hrd = r.bit() != 0;
-    if vcl_hrd { skip_hrd(r)?; }
-    if nal_hrd || vcl_hrd { r.skip(1); }
+    if vcl_hrd {
+        skip_hrd(r)?;
+    }
+    if nal_hrd || vcl_hrd {
+        r.skip(1);
+    }
     r.skip(1); // pic_struct_present_flag
-    if r.bit() == 0 { return None; }
+    if r.bit() == 0 {
+        return None;
+    }
     r.skip(1);
-    for _ in 0..4 { r.ue(); }
+    for _ in 0..4 {
+        r.ue();
+    }
     let reorder = r.ue();
     r.ue(); // max_dec_frame_buffering
     (!r.overread() && reorder <= 16).then_some(reorder)
@@ -692,9 +744,15 @@ fn h264_reorder_frames(r: &mut Bits<'_>) -> Option<u32> {
 
 fn skip_hrd(r: &mut Bits<'_>) -> Option<()> {
     let count = r.ue();
-    if count > 31 { return None; }
+    if count > 31 {
+        return None;
+    }
     r.skip(8);
-    for _ in 0..=count { r.ue(); r.ue(); r.skip(1); }
+    for _ in 0..=count {
+        r.ue();
+        r.ue();
+        r.skip(1);
+    }
     r.skip(20);
     (!r.overread()).then_some(())
 }
@@ -738,7 +796,9 @@ fn length_prefixed_nals(mut data: &[u8], n: usize) -> impl Iterator<Item = &[u8]
         if data.len() <= n {
             return None;
         }
-        let len = data[..n].iter().fold(0usize, |acc, &b| (acc << 8) | usize::from(b));
+        let len = data[..n]
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 8) | usize::from(b));
         if len == 0 || len > data.len() - n {
             return None;
         }

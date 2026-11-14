@@ -40,7 +40,9 @@ unsafe impl GlobalAlloc for Tracking {
 static ALLOC: Tracking = Tracking;
 
 fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn elem(id: u32, body: &[u8]) -> Vec<u8> {
@@ -57,7 +59,10 @@ fn uint(id: u32, v: u64) -> Vec<u8> {
 fn file(segment: &[Vec<u8>]) -> Vec<u8> {
     let mut out = elem(ids::EBML_HEADER, &elem(ids::EBML_DOC_TYPE, b"matroska"));
     out.extend(write_element_id(ids::SEGMENT));
-    out.extend(write_vint(segment.iter().map(Vec::len).sum::<usize>() as u64, 0));
+    out.extend(write_vint(
+        segment.iter().map(Vec::len).sum::<usize>() as u64,
+        0,
+    ));
     for element in segment {
         out.extend_from_slice(element);
     }
@@ -67,15 +72,21 @@ fn file(segment: &[Vec<u8>]) -> Vec<u8> {
 /// Subtitle track 1.
 fn tracks() -> Vec<u8> {
     let fields = [
-        uint(ids::TRACK_NUMBER, 1), uint(ids::TRACK_UID, 1),
-        uint(ids::TRACK_TYPE, 0x11), elem(ids::CODEC_ID, b"S_TEXT/UTF8"),
-    ].concat();
+        uint(ids::TRACK_NUMBER, 1),
+        uint(ids::TRACK_UID, 1),
+        uint(ids::TRACK_TYPE, 0x11),
+        elem(ids::CODEC_ID, b"S_TEXT/UTF8"),
+    ]
+    .concat();
     elem(ids::TRACKS, &elem(ids::TRACK_ENTRY, &fields))
 }
 
 /// A Cluster at `tc` holding one keyframe packet on track 1.
 fn cluster(tc: u64, payload: &[u8]) -> Vec<u8> {
-    let block = elem(ids::SIMPLE_BLOCK, &[&[0x81, 0, 0, 0x80][..], payload].concat());
+    let block = elem(
+        ids::SIMPLE_BLOCK,
+        &[&[0x81, 0, 0, 0x80][..], payload].concat(),
+    );
     elem(ids::CLUSTER, &[uint(ids::TIMECODE, tc), block].concat())
 }
 
@@ -110,8 +121,14 @@ fn cluster_records_stop_at_their_budget() {
     let held = LIVE.load(Ordering::SeqCst).saturating_sub(base);
     let recorded = d.cluster_records().len();
     let last = CLUSTERS - 1;
-    let far = d.seek_to(0, i64::from(last) * 10).ok().zip(d.next_packet().ok().map(|p| p.data));
-    let near = d.seek_to(0, 1000).ok().zip(d.next_packet().ok().map(|p| p.data));
+    let far = d
+        .seek_to(0, i64::from(last) * 10)
+        .ok()
+        .zip(d.next_packet().ok().map(|p| p.data));
+    let near = d
+        .seek_to(0, 1000)
+        .ok()
+        .zip(d.next_packet().ok().map(|p| p.data));
     assert!(
         played == CLUSTERS
             && in_order
@@ -128,8 +145,14 @@ fn cluster_records_stop_at_their_budget() {
 /// The stored CRC-32 is zero: the status records the mismatch, which does
 /// not stop playback.
 fn crc_cluster(tc: u64, payload: &[u8]) -> Vec<u8> {
-    let block = elem(ids::SIMPLE_BLOCK, &[&[0x81, 0, 0, 0x80][..], payload].concat());
-    elem(ids::CLUSTER, &[elem(ids::CRC32, &[0; 4]), uint(ids::TIMECODE, tc), block].concat())
+    let block = elem(
+        ids::SIMPLE_BLOCK,
+        &[&[0x81, 0, 0, 0x80][..], payload].concat(),
+    );
+    elem(
+        ids::CLUSTER,
+        &[elem(ids::CRC32, &[0; 4]), uint(ids::TIMECODE, tc), block].concat(),
+    )
 }
 
 /// CRC-32-led Clusters in the file below: their statuses and the set
@@ -163,7 +186,11 @@ fn cluster_crc_statuses_share_the_cluster_record_budget() {
     let held = LIVE.load(Ordering::SeqCst).saturating_sub(base);
     let statuses = d.crc_status().len();
     assert!(
-        played == CRC_CLUSTERS && in_order && held < (32 << 20) + (1 << 20) && statuses > 0 && statuses < CRC_CLUSTERS as usize,
+        played == CRC_CLUSTERS
+            && in_order
+            && held < (32 << 20) + (1 << 20)
+            && statuses > 0
+            && statuses < CRC_CLUSTERS as usize,
         "played {played} in order {in_order}, held {held} heap bytes, {statuses} CRC-32 statuses"
     );
 }
@@ -173,7 +200,13 @@ fn cluster_crc_statuses_share_the_cluster_record_budget() {
 #[test]
 fn a_tags_crc_status_is_kept_once_however_often_it_is_read() {
     let _serial = serial();
-    let tag = elem(ids::TAG, &elem(ids::SIMPLE_TAG, &[elem(ids::TAG_NAME, b"T"), elem(ids::TAG_STRING, b"v")].concat()));
+    let tag = elem(
+        ids::TAG,
+        &elem(
+            ids::SIMPLE_TAG,
+            &[elem(ids::TAG_NAME, b"T"), elem(ids::TAG_STRING, b"v")].concat(),
+        ),
+    );
     let tags = elem(ids::TAGS, &[elem(ids::CRC32, &[0; 4]), tag].concat());
     let bytes = file(&[tracks(), cluster(0, b"a"), tags, cluster(1000, b"b")]);
     let mut d = demux::open_typed(Box::new(Cursor::new(bytes)), &NullCodecResolver).unwrap();
@@ -186,6 +219,13 @@ fn a_tags_crc_status_is_kept_once_however_often_it_is_read() {
         passes += usize::from(packets == [b"a".to_vec(), b"b".to_vec()]);
         d.seek_to(0, 0).unwrap();
     }
-    let kept = d.crc_status().iter().filter(|s| s.element_id == ids::TAGS).count();
-    assert!(passes == 1000 && kept == 1, "{passes} full passes, {kept} Tags CRC-32 statuses");
+    let kept = d
+        .crc_status()
+        .iter()
+        .filter(|s| s.element_id == ids::TAGS)
+        .count();
+    assert!(
+        passes == 1000 && kept == 1,
+        "{passes} full passes, {kept} Tags CRC-32 statuses"
+    );
 }

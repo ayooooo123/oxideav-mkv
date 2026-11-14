@@ -273,15 +273,14 @@ fn all_sub_elements_round_trip() {
     assert_eq!(p.codec_state, 0x1234);
     assert_eq!(p.references.len(), 1);
     let r = &p.references[0];
-    assert_eq!(
-        r,
-        &CueReference {
-            ref_time: 200,
-            ref_cluster: Some(0x1500),
-            ref_number: Some(2),
-            ref_codec_state: Some(0x99),
-        }
-    );
+    assert_eq!(r, &{
+        let mut cue_reference = CueReference::default();
+        cue_reference.ref_time = 200;
+        cue_reference.ref_cluster = Some(0x1500);
+        cue_reference.ref_number = Some(2);
+        cue_reference.ref_codec_state = Some(0x99);
+        cue_reference
+    });
 }
 
 #[test]
@@ -361,6 +360,36 @@ fn multiple_cue_points_preserve_document_order() {
     assert_eq!(pts[1].time, 1000);
     assert_eq!(pts[2].time, 2000);
     assert_eq!(pts[2].track_positions[0].cluster_position, Some(0x300));
+}
+
+#[test]
+fn cues_after_last_cluster_without_seek_head_are_opt_in() {
+    // Index-at-end with no SeekHead pointing at it (RFC 9559 §6.4 SHOULD
+    // violated both ways): the open does not walk the Cluster run to
+    // find it (issue #9 — one positioned read per Cluster), so the typed
+    // view is empty until the caller opts in through `scan_for_cues`,
+    // which feeds the same typed collector.
+    let mut tp = Vec::new();
+    tp.extend_from_slice(&elem_uint(ids::CUE_TRACK, 1));
+    tp.extend_from_slice(&elem_uint(ids::CUE_CLUSTER_POSITION, 0x55));
+    tp.extend_from_slice(&elem_uint(ids::CUE_DURATION, 960));
+    tp.extend_from_slice(&elem_uint(ids::CUE_BLOCK_NUMBER, 1));
+    let ctp = elem_master(ids::CUE_TRACK_POSITIONS, &tp);
+    let cb = cue_point(123, &ctp);
+
+    let mut dmx = open(build_cues_last(&cb, &[cluster_body(0, 0x11)], false));
+    assert!(
+        dmx.cue_points().is_empty(),
+        "late Cues are not hunted at open"
+    );
+    assert!(dmx.scan_for_cues().expect("hunt"));
+    let pts = dmx.cue_points();
+    assert_eq!(pts.len(), 1);
+    assert_eq!(pts[0].time, 123);
+    let p = &pts[0].track_positions[0];
+    assert_eq!(p.cluster_position, Some(0x55));
+    assert_eq!(p.duration, Some(960));
+    assert_eq!(p.block_number, Some(1));
 }
 
 #[test]

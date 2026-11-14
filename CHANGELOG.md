@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Cues-less `seek_to` places its probes by interpolation (#9): the probe
+  offset is estimated from the bracketing Cluster Timestamps (the Segment
+  `Duration` standing in for the Segment end) and pulled back one Cluster
+  length, with plain halving taking over whenever an interpolated probe
+  fails to halve the unexplored range. Landings are unchanged (the last
+  Cluster at or before the target); the cost on Cues-stripped ffmpeg
+  output drops from a mean of 11–13 byte-range requests per seek to
+  4.6–4.8 (worst 6) on 54- and 540-Cluster files, and stays within ~2x
+  the bisection bound on skewed-bitrate runs or with a wrong or absent
+  `Duration`.
+
+### Added
+
+- `with_<field>` setters on every muxer-side record: `MkvTrackAudio`, `MkvTrackTiming`, `MkvTrackCodecTiming`, `MkvTrackIdentity`, `MkvTrackTranslate`, `MkvTrackLegacy`, `MkvChapter`, `MkvEditionDisplay`, `MkvChapProcess`, `MkvChapProcessCommand`, `mux::ChapterDisplay`, `MkvAttachment`, `MkvTag`, `MkvTagTargets`, `MkvSimpleTag`, `MkvVideoGeometry`, `MkvVideoColour`, `MkvMasteringMetadata`, `MkvProjection`, `MkvTrackAudienceFlags`, `MkvBlockAddition`, `BlockGroupOptions`, `MkvTrackOperation` (setters that already existed are kept as they were).
+- `new(..)` (every field, in declaration order) on `TrackPlane`, `VirtualPacketOrigin`, `ContentEncoding`, `MkvTrackPlane`, `schema::ElementDef`, `schema::SchemaFinding`, `webm::WebmFinding`.
+- `Default` on `AcmFormat`, `CrcStatus`, `Tag`, `SimpleTag`, `TrackRef`, `BlockAdditionMapping`, `DocTypeExtension`, `EbmlHeader`, `Attachment`, `ebml::ElementHeader` and `MkvBlockAddition`.
+
+### Changed
+
+- `#[non_exhaustive]` on the growable enums `AesCipherMode`, `AlphaMode`, `AudioEmphasis`, `ChapterSkipType`, `ChromaSitingHorz`, `ChromaSitingVert`, `ColourRange`, `ContentCompAlgo`, `ContentEncAlgo`, `CueLieKind`, `DamageKind`, `DisplayUnit`, `FieldOrder`, `FlagInterlaced`, `MatrixCoefficients`, `OldStereoMode`, `Primaries`, `ProjectionType`, `SchemaFindingKind`, `SeekLieKind`, `StereoMode`, `TargetLevel`, `TrackPlaneType`, `TransferCharacteristics`, `VirtualPacketRole`, `WebmSupport`. `ebml`/`schema::ElementType` (the eight EBML element types), `LacingMode`, `SimpleTagValue` / `MkvSimpleTagValue`, `TargetUid` and `ContentEncodingTransform` stay exhaustive: the format fixes their value sets.
+- `#[non_exhaustive]` on every public record: demuxer side `Attachment`, `AvccRepack`, `BlockAdditionMapping`, `ChapProcess`, `ChapProcessCommand`, `Chapter`, `ChapterDisplay`, `ChapterTranslate`, `ClusterRecord`, `ContentEncoding`, `ContentEncodings`, `ContentSigning`, `CrcStatus`, `CuePoint`, `CueReference`, `CueTrackPositions`, `DocTypeExtension`, `EbmlHeader`, `Edition`, `EditionDisplay`, `SegmentLinking`, `SimpleTag`, `Tag`, `Targets`, `TrackLegacy`, `TrackOperation`, `TrackPlane`, `TrackRef`, `TrackTranslate`, `VirtualPacketOrigin`, `ebml::ElementHeader`, `schema::ElementDef`, `schema::SchemaFinding`, `schema::SchemaReport`, `webm::WebmFinding`, `webm::WebmConformanceReport`; muxer side every record listed under Added.
+
+## [0.0.12](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.11...v0.0.12) - 2026-11-07
+
+### Other
+
+- refresh Cargo.lock to oxideav-core 0.1.43 (harness build was red on 0.1.29)
+- write only registered Matroska CodecIDs; VFW / ACM compatibility tracks; SimpleBlock KEY bit honoured
+- fill pixel_format for VP9 / AV1 / VP8, frame_rate from DefaultDuration, color_signal from Colour
+- V_MS/VFW/FOURCC + A_MS/ACM resolve through the tunnelled Win32 header
+- Cues-less seek by byte-offset bisection; open no longer hunts for late Cues ([#9](https://github.com/OxideAV/oxideav-mkv/pull/9))
+- edition 2024, MSRV 1.95
+
+### Changed
+
+- **The muxer writes only registered Matroska CodecIDs.** A codec with
+  no native mapping used to be written as `X_<codec id>` (e.g.
+  `X_mjpeg`), which no reader — this crate's demuxer included —
+  resolved. Each stream's CodecID is now planned at open
+  (`codec_id::plan_track_codec`): native id; a `CodecTag::Matroska`
+  verbatim; a demuxer placeholder back to the id it was read under
+  (`mkv:<CodecID>`, `mkv:vfw:<FOURCC>`, `mkv:acm:0xHHHH`); the
+  `V_MS/VFW/FOURCC` track (`BITMAPINFOHEADER` CodecPrivate) for Motion
+  JPEG `MJPG`, Cinepak `CVID`, HuffYUV `HFYU`, Lagarith `LAGS`, 24-bit
+  `BI_RGB` and any FourCC-tagged video; the `A_MS/ACM` track
+  (`WAVEFORMATEX` CodecPrivate) for 8/24/32-bit integer and 64-bit float
+  PCM, A-law, µ-law and any `wFormatTag`-tagged audio. Anything else is
+  `Error::Unsupported` at open, so a container-fit check sees the
+  truth. `V_THEORA` is now written too (it was read only).
+  `tests/codec_id_matrix.rs` round-trips 49 codec rows (mux → demux →
+  same codec id, parameters, extradata, packet bytes, timestamps,
+  keyframe flags → remux under the same CodecID); `ffmpeg` decodes the
+  MJPEG / 24-bit PCM / A-law files byte-identically to their sources.
+
+### Fixed
+
+- **SimpleBlock keyframe flag.** Every SimpleBlock packet was reported
+  as a keyframe; the packet flag now follows the Block's `KEY` bit
+  (RFC 9559 §10.2, §10.4), so delta frames demux as delta frames.
+- Files written by earlier releases under `X_<codec id>` read back as
+  `<codec id>`; `V_MS/VFW/FOURCC` tracks with `MJPG` / `CVID` / `HFYU`
+  / `LAGS` resolve without a codec registry.
+
 ### Added
 
 - **Video stream parameters filled from what the file states.**
@@ -40,7 +105,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VFW_CODEC_ID` / `ACM_CODEC_ID`.
 - `V_MS/VFW/FOURCC` and `A_MS/ACM` streams carry their wire identity
   in `params.tag` (`CodecTag::fourcc` / `CodecTag::wave_format`).
+- `SeekStrategy` + `MkvDemuxer::seek_strategy()`: which tier the most
+  recent `seek_to` landed with — `Cues` (one jump), `Bisection`
+  (Cues-less byte-offset bisection over the Cluster run, ~log2(clusters)
+  positioned reads, exact Cues-style landing, monotone), or `LinearScan`
+  (the bisection premise of ascending Cluster Timestamps was disproved
+  by a probe and the linear Cluster-Timestamp walk landed instead).
+- `MkvDemuxer::scan_for_cues()`: opt-in hunt for a `Cues` element that
+  is neither front-stored nor SeekHead-reachable (the walk `open` used
+  to run unconditionally); returns whether an index is now loaded.
+- `examples/seek_cost.rs`: prints the range-request / read / byte cost
+  of an open and a seek sweep the way an HTTP byte-range reader bills
+  them.
+
 ### Changed
+
+- **Unclaimed VFW / ACM tracks use a stable placeholder id:**
+  `mkv:vfw:<FOURCC>` (`mkv:vfw:0xHHHHHHHH` for a non-printable FourCC)
+  replaces `mkv:BI/<FOURCC>`, and `mkv:acm:0xHHHH` replaces the
+  pass-through `mkv:A_MS/ACM` (corpus id 233, ffmpeg's `wmv2` in
+  Matroska, now reports `mkv:vfw:WMV2` — no fleet codec claims
+  `WMV2`). A 24-bit `BI_RGB` header maps to `rgb24`, as in AVI.
+- edition 2024, MSRV 1.95
+- `open` / `open_resilient` no longer walk the Cluster run element by
+  element to find a late `Cues` element the SeekHead does not reference
+  (issue #9: one positioned read — one HTTP range request — per
+  Cluster, 534 requests to open a 48 MB / 521-Cluster `--no-cues` file;
+  now 12, flat in the Cluster count). Such a file still seeks, by
+  bisection; `scan_for_cues()` restores the old index-at-open behaviour
+  on demand. Files whose Cues are front-stored or SeekHead-reachable are
+  unaffected.
+- Strict `seek_to` on a Cues-less file no longer returns
+  `Error::Unsupported`: it bisects the Cluster run like the resilient
+  path (11–17 range requests per seek on the 48 MB fixture, against the
+  resilient linear walk's 2 per Cluster). The one strict refusal left is
+  the RFC 9559 §23.2 non-seekable signal — an unknown-size Segment with
+  neither SeekHead nor Cues (the live-stream shape) — which
+  `open_resilient` overrides. A resilient seek through a lying cue now
+  falls back to the bisection too.
+
+### Changed
+- Merged with upstream's Cues-less seek: the landing Cluster is found by
+  upstream's byte-offset bisection (`SeekStrategy::Bisection`,
+  ~log2(clusters) positioned reads) and the landing inside it is still the
+  last keyframe of the sought track at or before the target (the
+  Cluster's start when the track's first Block there is a keyframe, else
+  the keyframe's Block). A Cluster holding no such keyframe hands the
+  search to the Clusters before it (the one just before, then stretches
+  reaching 1, 2, 4 … 32 seconds further back); the linear
+  Cluster walk (`SeekStrategy::LinearScan`) takes over after that, when
+  the Clusters are out of order, or when the probe budget runs out. A
+  seek past a Cues index cut at its budget goes the same way. The strict
+  path still seeks an unknown-size Segment with neither SeekHead nor Cues
+  (upstream refuses it per RFC 9559 §23.2). `scan_for_cues()` keeps the
+  Cues budget and damage events of an index read at open.
 - A huge `Cues` index no longer strands late playback in a damn
   from-the-start Cluster scan: single-position CuePoints reserve one slot
   instead of four, and the bounded index budget is 48 MiB. The 132,884

@@ -6,7 +6,9 @@ use oxideav_core::{Error, Result, WebVttMetadata};
 
 pub(super) fn split(data: &mut Vec<u8>) -> Result<WebVttMetadata> {
     fn line(data: &[u8], start: usize) -> Result<(usize, usize)> {
-        let end = data[start..].iter().position(|&c| c == b'\r' || c == b'\n')
+        let end = data[start..]
+            .iter()
+            .position(|&c| c == b'\r' || c == b'\n')
             .map(|n| start + n)
             .ok_or_else(|| Error::invalid("MKV WebVTT: missing line ending"))?;
         let lf = end + usize::from(data[end] == b'\r');
@@ -52,7 +54,13 @@ mod tests {
 
     #[test]
     fn incomplete_lines_are_errors() {
-        for data in [b"".as_slice(), b"id", b"id\n", b"id\rsettings\ntext", b"\nsettings\r"] {
+        for data in [
+            b"".as_slice(),
+            b"id",
+            b"id\n",
+            b"id\rsettings\ntext",
+            b"\nsettings\r",
+        ] {
             assert!(split(&mut data.to_vec()).is_err());
         }
     }

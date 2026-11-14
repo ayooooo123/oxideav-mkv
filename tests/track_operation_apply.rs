@@ -287,11 +287,7 @@ fn join_blocks_synthesises_the_virtual_stream() {
         );
         assert_eq!(
             *o,
-            Some(VirtualPacketOrigin {
-                virtual_stream: 2,
-                source_stream: *src,
-                role: VirtualPacketRole::Joined,
-            }),
+            Some(VirtualPacketOrigin::new(2, *src, VirtualPacketRole::Joined)),
             "virtual packet {i} origin"
         );
     }
@@ -347,20 +343,12 @@ fn dangling_self_and_multiple_consumers() {
     assert_eq!(pkts[1].0.stream_index, 1);
     assert_eq!(
         pkts[1].1,
-        Some(VirtualPacketOrigin {
-            virtual_stream: 1,
-            source_stream: 0,
-            role: VirtualPacketRole::Joined,
-        })
+        Some(VirtualPacketOrigin::new(1, 0, VirtualPacketRole::Joined))
     );
     assert_eq!(pkts[2].0.stream_index, 2);
     assert_eq!(
         pkts[2].1,
-        Some(VirtualPacketOrigin {
-            virtual_stream: 2,
-            source_stream: 0,
-            role: VirtualPacketRole::Joined,
-        })
+        Some(VirtualPacketOrigin::new(2, 0, VirtualPacketRole::Joined))
     );
     // All three carry the same bytes.
     assert!(pkts.iter().all(|(p, _)| p.data == vec![0x77]));
@@ -445,11 +433,7 @@ fn virtual_copy_shares_block_additions() {
     assert_eq!(copy.data, vec![0x42]);
     assert_eq!(
         dmx.virtual_packet_origin(),
-        Some(VirtualPacketOrigin {
-            virtual_stream: 1,
-            source_stream: 0,
-            role: VirtualPacketRole::Joined,
-        })
+        Some(VirtualPacketOrigin::new(1, 0, VirtualPacketRole::Joined))
     );
     let copy_adds: Vec<Vec<u8>> = dmx
         .block_additions()
@@ -648,9 +632,11 @@ fn background_other_planes_and_mixed_operation_order() {
         ],
         "planes before joins, each in on-disk order"
     );
-    assert!(pkts[1..]
-        .iter()
-        .all(|(p, _)| p.stream_index == 1 && p.data == vec![0x99]));
+    assert!(
+        pkts[1..]
+            .iter()
+            .all(|(p, _)| p.stream_index == 1 && p.data == vec![0x99])
+    );
 }
 
 // --- Virtual-track seek (Cues union, §18.8) -------------------------------
@@ -742,9 +728,15 @@ fn join_file_with_cues() -> Vec<u8> {
 /// With application off, seeking the virtual stream keeps the historical
 /// behaviour: the file has no Cues rows for the virtual track's number, so
 /// the strict path reports Unsupported.
+///
+/// The fixture stores its Cues after the Clusters with no SeekHead, which
+/// `open` no longer hunts for (issue #9) — the tests load the index
+/// through the opt-in `scan_for_cues` so the Cues-union logic is what is
+/// exercised, not the Cues-less bisection.
 #[test]
 fn virtual_seek_without_application_is_unsupported() {
     let mut dmx = open(join_file_with_cues());
+    assert!(dmx.scan_for_cues().expect("late Cues"));
     match dmx.seek_to(2, 20) {
         Err(oxideav_core::Error::Unsupported { .. }) => {}
         other => panic!("expected Unsupported, got {other:?}"),
@@ -760,6 +752,7 @@ fn virtual_seek_without_application_is_unsupported() {
 #[test]
 fn virtual_seek_unions_the_source_cues() {
     let mut dmx = open(join_file_with_cues());
+    assert!(dmx.scan_for_cues().expect("late Cues"));
     dmx.set_apply_track_operations(true);
 
     // Target 25: track 1's best cue is (25, c1), track 2's is (20, c1) —
@@ -835,6 +828,7 @@ fn virtual_track_with_own_cues_uses_them() {
     out.extend_from_slice(&segment);
 
     let mut dmx = open(out);
+    assert!(dmx.scan_for_cues().expect("late Cues"));
     dmx.set_apply_track_operations(true);
     let landed = dmx.seek_to(2, 30).expect("virtual seek via own cues");
     assert_eq!(landed, 20, "landed on the virtual track's own cue");

@@ -2,8 +2,13 @@
 use oxideav_core::{Error, Result};
 
 pub(super) fn prores(data: &mut Vec<u8>) -> Result<()> {
-    if data.get(4..8) == Some(b"icpf") { return Ok(()); }
-    let len = data.len().checked_add(8).filter(|&n| n <= u32::MAX as usize)
+    if data.get(4..8) == Some(b"icpf") {
+        return Ok(());
+    }
+    let len = data
+        .len()
+        .checked_add(8)
+        .filter(|&n| n <= u32::MAX as usize)
         .ok_or_else(|| Error::invalid("MKV ProRes: frame too large"))?;
     data.resize(len, 0);
     data.copy_within(..len - 8, 8);
@@ -13,22 +18,30 @@ pub(super) fn prores(data: &mut Vec<u8>) -> Result<()> {
 }
 
 fn block(data: &[u8]) -> Result<(u32, u32, &[u8], &[u8])> {
-    if data.len() < 8 { return Err(Error::invalid("MKV WavPack: short block header")); }
+    if data.len() < 8 {
+        return Err(Error::invalid("MKV WavPack: short block header"));
+    }
     let flags = u32::from_le_bytes(data[..4].try_into().unwrap());
     let crc = u32::from_le_bytes(data[4..8].try_into().unwrap());
     let (start, size): (usize, usize) = if flags & 0x1800 == 0x1800 {
         (8, data.len() - 8)
     } else {
-        let size = data.get(8..12).ok_or_else(|| Error::invalid("MKV WavPack: missing block size"))?;
+        let size = data
+            .get(8..12)
+            .ok_or_else(|| Error::invalid("MKV WavPack: missing block size"))?;
         (12, u32::from_le_bytes(size.try_into().unwrap()) as usize)
     };
-    let end = start.checked_add(size).filter(|&n| n <= data.len())
+    let end = start
+        .checked_add(size)
+        .filter(|&n| n <= data.len())
         .ok_or_else(|| Error::invalid("MKV WavPack: block exceeds packet"))?;
     Ok((flags, crc, &data[start..end], &data[end..]))
 }
 
 pub(super) fn wavpack(data: Vec<u8>, version: u16) -> Result<Vec<u8>> {
-    if data.len() < 12 { return Err(Error::invalid("MKV WavPack: short frame")); }
+    if data.len() < 12 {
+        return Err(Error::invalid("MKV WavPack: short frame"));
+    }
     let samples = &data[..4];
     // Validate block sizes before allocating, and allocate the exact output
     // once. No size from the input can reserve memory beyond bytes present.
@@ -36,7 +49,8 @@ pub(super) fn wavpack(data: Vec<u8>, version: u16) -> Result<Vec<u8>> {
     let mut size = 0usize;
     while rest.len() >= 8 {
         let (_, _, payload, next) = block(rest)?;
-        size = size.checked_add(32 + payload.len())
+        size = size
+            .checked_add(32 + payload.len())
             .ok_or_else(|| Error::invalid("MKV WavPack: frame too large"))?;
         rest = next;
     }
@@ -72,8 +86,13 @@ mod tests {
     }
     #[test]
     fn wavpack_single_and_multiblock_headers() {
-        let compact = [4u32.to_le_bytes().to_vec(), 0x1800u32.to_le_bytes().to_vec(),
-            0x1234u32.to_le_bytes().to_vec(), vec![7, 8]].concat();
+        let compact = [
+            4u32.to_le_bytes().to_vec(),
+            0x1800u32.to_le_bytes().to_vec(),
+            0x1234u32.to_le_bytes().to_vec(),
+            vec![7, 8],
+        ]
+        .concat();
         let out = wavpack(compact, 0x410).unwrap();
         assert_eq!(&out[..10], b"wvpk\x1a\0\0\0\x10\x04");
         assert_eq!(&out[20..], b"\x04\0\0\0\0\x18\0\0\x34\x12\0\0\x07\x08");

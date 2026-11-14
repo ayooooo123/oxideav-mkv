@@ -91,10 +91,19 @@ impl TrackTrims {
 
     /// The trim of the first packet after the open or a seek (`pending`),
     /// the track's `first` or not, whose own trim is `own`.
-    pub(super) fn start(&self, pending: Pending, first: bool, own: Option<AudioTrim>) -> Option<AudioTrim> {
+    pub(super) fn start(
+        &self,
+        pending: Pending,
+        first: bool,
+        own: Option<AudioTrim>,
+    ) -> Option<AudioTrim> {
         let delay = pending == Pending::Open || (pending == Pending::Seek && first);
         if delay && self.delay > 0 {
-            Some(AudioTrim { skip_samples: self.delay, discard_padding: 0, sample_rate: self.rate })
+            Some(AudioTrim {
+                skip_samples: self.delay,
+                discard_padding: 0,
+                sample_rate: self.rate,
+            })
         } else if pending == Pending::Seek && !first && self.pre_roll > 0 {
             Some(AudioTrim {
                 skip_samples: self.pre_roll.max(own.map_or(0, |t| t.skip_samples)),
@@ -115,13 +124,16 @@ impl TrackTrims {
 pub(super) fn track_rate(sampling: Option<f64>, output: Option<f64>) -> u32 {
     let valid = |rate: f64| (0.0..=f64::from(i32::MAX)).contains(&rate);
     let sampling = sampling.filter(|&rate| valid(rate)).unwrap_or(8000.0);
-    output.filter(|&rate| rate != 0.0 && valid(rate)).unwrap_or(sampling) as u32
+    output
+        .filter(|&rate| rate != 0.0 && valid(rate))
+        .unwrap_or(sampling) as u32
 }
 
 /// `ns` nanoseconds in samples at `rate` Hz, rounded to the nearest with
 /// halves away from zero (`av_rescale_q`), saturating at the trim's range.
 fn samples(ns: i128, rate: u32) -> u32 {
-    rescale_near(ns, rate.into(), NS_PER_SECOND).map_or(u32::MAX, |n| n.clamp(0, u32::MAX.into()) as u32)
+    rescale_near(ns, rate.into(), NS_PER_SECOND)
+        .map_or(u32::MAX, |n| n.clamp(0, u32::MAX.into()) as u32)
 }
 
 /// `CodecDelay` of `ns` nanoseconds in ticks of `tb`, rounded to the

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use oxideav_core::{Demuxer, Error, NullCodecResolver, ReadSeek};
-use oxideav_mkv::demux::{self, CrcStatus, DamageKind, MkvDemuxer};
+use oxideav_mkv::demux::{self, DamageKind, MkvDemuxer};
 use oxideav_mkv::ebml::{crc32_ieee, write_element_id, write_vint};
 use oxideav_mkv::ids;
 
@@ -53,7 +53,9 @@ const BIG: usize = 48 << 20;
 const SMALL: usize = 4 << 20;
 
 fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// An element header declaring `size` octets, whatever follows it.
@@ -81,18 +83,31 @@ fn file(segment: &[Vec<u8>]) -> Vec<u8> {
 }
 
 fn track(number: u64, kind: u64, codec: &str, extra: &[u8]) -> Vec<u8> {
-    elem(ids::TRACK_ENTRY, &[
-        uint(ids::TRACK_NUMBER, number), uint(ids::TRACK_UID, number),
-        uint(ids::TRACK_TYPE, kind), elem(ids::CODEC_ID, codec.as_bytes()), extra.to_vec(),
-    ].concat())
+    elem(
+        ids::TRACK_ENTRY,
+        &[
+            uint(ids::TRACK_NUMBER, number),
+            uint(ids::TRACK_UID, number),
+            uint(ids::TRACK_TYPE, kind),
+            elem(ids::CODEC_ID, codec.as_bytes()),
+            extra.to_vec(),
+        ]
+        .concat(),
+    )
 }
 
 fn simple(track: u8, tc: i16, payload: &[u8]) -> Vec<u8> {
-    elem(ids::SIMPLE_BLOCK, &[&[0x80 | track][..], &tc.to_be_bytes(), &[0x80], payload].concat())
+    elem(
+        ids::SIMPLE_BLOCK,
+        &[&[0x80 | track][..], &tc.to_be_bytes(), &[0x80], payload].concat(),
+    )
 }
 
 fn cluster(tc: u64, children: &[Vec<u8>]) -> Vec<u8> {
-    elem(ids::CLUSTER, &[uint(ids::TIMECODE, tc), children.concat()].concat())
+    elem(
+        ids::CLUSTER,
+        &[uint(ids::TIMECODE, tc), children.concat()].concat(),
+    )
 }
 
 /// Counts the bytes the demuxer reads.
@@ -119,7 +134,10 @@ impl Seek for Counted {
 /// peak heap beyond what was live before.
 fn measure<T>(bytes: Vec<u8>, run: impl FnOnce(Box<dyn ReadSeek>) -> T) -> (T, usize, usize) {
     let read = Arc::new(AtomicUsize::new(0));
-    let input: Box<dyn ReadSeek> = Box::new(Counted { inner: Cursor::new(bytes), read: read.clone() });
+    let input: Box<dyn ReadSeek> = Box::new(Counted {
+        inner: Cursor::new(bytes),
+        read: read.clone(),
+    });
     let base = LIVE.load(Ordering::SeqCst);
     PEAK.store(base, Ordering::SeqCst);
     let out = run(input);
@@ -151,7 +169,12 @@ fn subtitle_tracks() -> Vec<u8> {
 
 /// One `AttachedFile` of `len` bytes, as a font or a cover image is stored.
 fn attached_file(len: usize) -> Vec<u8> {
-    let names = [elem(ids::FILE_NAME, b"font.ttf"), elem(ids::FILE_MIME_TYPE, b"font/ttf"), uint(ids::FILE_UID, 7)].concat();
+    let names = [
+        elem(ids::FILE_NAME, b"font.ttf"),
+        elem(ids::FILE_MIME_TYPE, b"font/ttf"),
+        uint(ids::FILE_UID, 7),
+    ]
+    .concat();
     let data = header(ids::FILE_DATA, len);
     let mut out = header(ids::ATTACHED_FILE, names.len() + data.len() + len);
     out.extend(names);
@@ -162,9 +185,17 @@ fn attached_file(len: usize) -> Vec<u8> {
 
 /// A one-entry SeekHead pointing at `id`.
 fn index(id: u32, position: u64) -> Vec<u8> {
-    elem(ids::SEEK_HEAD, &elem(ids::SEEK, &[
-        elem(ids::SEEK_ID, &write_element_id(id)), uint(ids::SEEK_POSITION, position),
-    ].concat()))
+    elem(
+        ids::SEEK_HEAD,
+        &elem(
+            ids::SEEK,
+            &[
+                elem(ids::SEEK_ID, &write_element_id(id)),
+                uint(ids::SEEK_POSITION, position),
+            ]
+            .concat(),
+        ),
+    )
 }
 
 #[test]
@@ -172,18 +203,29 @@ fn a_master_without_a_crc_is_not_read_for_one() {
     let _serial = serial();
     let first = cluster(0, &[simple(1, 0, b"a")]);
     // In line ahead of the Clusters, where mkvmerge stores attachments.
-    let inline = file(&[subtitle_tracks(), elem(ids::ATTACHMENTS, &attached_file(BIG)), first.clone()]);
+    let inline = file(&[
+        subtitle_tracks(),
+        elem(ids::ATTACHMENTS, &attached_file(BIG)),
+        first.clone(),
+    ]);
     // After the Clusters, reached through the SeekHead.
     let tracks = subtitle_tracks();
     let at = (index(ids::ATTACHMENTS, 0).len() + tracks.len() + first.len()) as u64;
-    let followed = file(&[index(ids::ATTACHMENTS, at), tracks, first, elem(ids::ATTACHMENTS, &attached_file(BIG))]);
+    let followed = file(&[
+        index(ids::ATTACHMENTS, at),
+        tracks,
+        first,
+        elem(ids::ATTACHMENTS, &attached_file(BIG)),
+    ]);
     let mut failures = Vec::new();
     for (layout, bytes) in [("in line", inline), ("followed", followed)] {
         let ((d, packet), read, peak) = measure(bytes, first_packet);
         // The attachment is still parsed, from its headers alone.
         let parsed = packet == b"a" && d.attachments()[0].data_size == BIG as u64;
         if !parsed || read >= SMALL || peak >= SMALL {
-            failures.push(format!("{layout}: parsed {parsed}, read {read} bytes, peaked at {peak} heap bytes"));
+            failures.push(format!(
+                "{layout}: parsed {parsed}, read {read} bytes, peaked at {peak} heap bytes"
+            ));
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
@@ -198,10 +240,19 @@ fn a_third_seek_head_is_skipped_unread() {
     let crc = elem(ids::CRC32, &[0; 4]);
     let third = [header(ids::SEEK_HEAD, crc.len() + void.len()), crc, void].concat();
     let empty = elem(ids::SEEK_HEAD, &[]);
-    let bytes = file(&[empty.clone(), empty, third, subtitle_tracks(), cluster(0, &[simple(1, 0, b"a")])]);
+    let bytes = file(&[
+        empty.clone(),
+        empty,
+        third,
+        subtitle_tracks(),
+        cluster(0, &[simple(1, 0, b"a")]),
+    ]);
     let ((_, packet), read, peak) = measure(bytes, first_packet);
     assert_eq!(packet, b"a");
-    assert!(read < SMALL && peak < SMALL, "read {read} bytes, peaked at {peak} heap bytes");
+    assert!(
+        read < SMALL && peak < SMALL,
+        "read {read} bytes, peaked at {peak} heap bytes"
+    );
 }
 
 #[test]
@@ -210,12 +261,27 @@ fn a_present_crc_is_checked_in_fixed_chunks() {
     let checked = attached_file(BIG);
     let crc = crc32_ieee(&checked);
     let crc_child = elem(ids::CRC32, &crc.to_le_bytes());
-    let attachments = [header(ids::ATTACHMENTS, crc_child.len() + checked.len()), crc_child, checked].concat();
-    let bytes = file(&[subtitle_tracks(), attachments, cluster(0, &[simple(1, 0, b"a")])]);
+    let attachments = [
+        header(ids::ATTACHMENTS, crc_child.len() + checked.len()),
+        crc_child,
+        checked,
+    ]
+    .concat();
+    let bytes = file(&[
+        subtitle_tracks(),
+        attachments,
+        cluster(0, &[simple(1, 0, b"a")]),
+    ]);
     let ((d, packet), _, peak) = measure(bytes, first_packet);
     assert_eq!(packet, b"a");
-    let status = d.crc_status().iter().find(|s| s.element_id == ids::ATTACHMENTS);
-    assert_eq!(status, Some(&CrcStatus { element_id: ids::ATTACHMENTS, stored: crc, computed: crc }));
+    let status = d
+        .crc_status()
+        .iter()
+        .find(|s| s.element_id == ids::ATTACHMENTS);
+    assert_eq!(
+        status.map(|s| (s.element_id, s.stored, s.computed)),
+        Some((ids::ATTACHMENTS, crc, crc))
+    );
     assert!(peak < SMALL, "peaked at {peak} heap bytes");
 }
 
@@ -224,12 +290,30 @@ fn a_present_crc_is_checked_in_fixed_chunks() {
 fn held_tracks() -> Vec<u8> {
     let sps = [0x67, 0x42, 0x00, 0x1e, 0xf4, 0xf2];
     let pps = [0x68, 0xce, 0x38, 0x80];
-    let avcc = [&[1, 0x42, 0x00, 0x1e, 0xff, 0xe1, 0, sps.len() as u8][..], &sps, &[1, 0, pps.len() as u8], &pps].concat();
-    let video = elem(ids::VIDEO, &[uint(ids::PIXEL_WIDTH, 16), uint(ids::PIXEL_HEIGHT, 16)].concat());
-    elem(ids::TRACKS, &[
-        track(1, 1, "V_MPEG4/ISO/AVC", &[elem(ids::CODEC_PRIVATE, &avcc), video].concat()),
-        track(2, 0x11, "S_TEXT/UTF8", &[]),
-    ].concat())
+    let avcc = [
+        &[1, 0x42, 0x00, 0x1e, 0xff, 0xe1, 0, sps.len() as u8][..],
+        &sps,
+        &[1, 0, pps.len() as u8],
+        &pps,
+    ]
+    .concat();
+    let video = elem(
+        ids::VIDEO,
+        &[uint(ids::PIXEL_WIDTH, 16), uint(ids::PIXEL_HEIGHT, 16)].concat(),
+    );
+    elem(
+        ids::TRACKS,
+        &[
+            track(
+                1,
+                1,
+                "V_MPEG4/ISO/AVC",
+                &[elem(ids::CODEC_PRIVATE, &avcc), video].concat(),
+            ),
+            track(2, 0x11, "S_TEXT/UTF8", &[]),
+        ]
+        .concat(),
+    )
 }
 
 /// Two Xiph-laced frames on track 2, "y" and "z": behind 1023 held packets
@@ -242,9 +326,15 @@ fn laced() -> Vec<u8> {
 /// packet must still play, then a `Void` of `tail` bytes that an overrunning
 /// child can reach into.
 fn group_file(held: u16, group: Vec<u8>, tail: usize) -> Vec<u8> {
-    let mut first: Vec<Vec<u8>> = (0..held).map(|i| simple(2, i as i16, &i.to_be_bytes())).collect();
+    let mut first: Vec<Vec<u8>> = (0..held)
+        .map(|i| simple(2, i as i16, &i.to_be_bytes()))
+        .collect();
     first.push(group);
-    let mut segment = vec![held_tracks(), cluster(0, &first), cluster(2000, &[simple(2, 0, b"next")])];
+    let mut segment = vec![
+        held_tracks(),
+        cluster(0, &first),
+        cluster(2000, &[simple(2, 0, b"next")]),
+    ];
     if tail > 0 {
         segment.push([header(ids::VOID, tail), vec![0; tail]].concat());
     }
@@ -265,11 +355,34 @@ fn block_group_children_must_fit_their_parents() {
     // Each child declares BIG bytes that the file physically holds, while
     // its parent ends right after the child's header.
     let overruns = [
-        ("Block", elem(ids::BLOCK_GROUP, &[header(ids::BLOCK, BIG), laced()[..6].to_vec()].concat())),
-        ("CodecState", elem(ids::BLOCK_GROUP, &[block.clone(), header(ids::CODEC_STATE, BIG)].concat())),
-        ("BlockAdditional", elem(ids::BLOCK_GROUP, &[
-            block, elem(ids::BLOCK_ADDITIONS, &elem(ids::BLOCK_MORE, &header(ids::BLOCK_ADDITIONAL, BIG))),
-        ].concat())),
+        (
+            "Block",
+            elem(
+                ids::BLOCK_GROUP,
+                &[header(ids::BLOCK, BIG), laced()[..6].to_vec()].concat(),
+            ),
+        ),
+        (
+            "CodecState",
+            elem(
+                ids::BLOCK_GROUP,
+                &[block.clone(), header(ids::CODEC_STATE, BIG)].concat(),
+            ),
+        ),
+        (
+            "BlockAdditional",
+            elem(
+                ids::BLOCK_GROUP,
+                &[
+                    block,
+                    elem(
+                        ids::BLOCK_ADDITIONS,
+                        &elem(ids::BLOCK_MORE, &header(ids::BLOCK_ADDITIONAL, BIG)),
+                    ),
+                ]
+                .concat(),
+            ),
+        ),
     ];
     let mut failures = Vec::new();
     for (child, group) in overruns {
@@ -291,8 +404,15 @@ fn block_group_records_share_the_block_budget() {
     let _serial = serial();
     // Two million empty TimeSlices: 4 MiB on disk, 80 bytes each once read.
     let count = 1 << 21;
-    let slices = [header(ids::SLICES, 2 * count), [ids::TIME_SLICE as u8, 0x80].repeat(count)].concat();
-    let group = elem(ids::BLOCK_GROUP, &[elem(ids::BLOCK, &laced()), slices].concat());
+    let slices = [
+        header(ids::SLICES, 2 * count),
+        [ids::TIME_SLICE as u8, 0x80].repeat(count),
+    ]
+    .concat();
+    let group = elem(
+        ids::BLOCK_GROUP,
+        &[elem(ids::BLOCK, &laced()), slices].concat(),
+    );
     let mut failures = Vec::new();
     for held in [0, 1023] {
         let (packets, _, peak) = measure(group_file(held, group.clone(), 0), drain);
@@ -300,7 +420,9 @@ fn block_group_records_share_the_block_budget() {
         // At most the 32 MiB a Block may retain, plus a growing buffer's
         // previous half while it moves.
         if !played || peak >= 48 << 20 {
-            failures.push(format!("{held} held: played {played}, peaked at {peak} heap bytes"));
+            failures.push(format!(
+                "{held} held: played {played}, peaked at {peak} heap bytes"
+            ));
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
@@ -314,9 +436,14 @@ fn a_waiting_block_holds_no_more_than_its_budget() {
     let _serial = serial();
     let mut stored = [&[0x82, 0, 0, 0x82, 1, 1][..], b"y"].concat();
     stored.resize(17 << 20, 0x5a);
-    let group = elem(ids::BLOCK_GROUP, &[
-        elem(ids::BLOCK, &stored), elem(ids::CODEC_STATE, &vec![0x33; 9 << 20]),
-    ].concat());
+    let group = elem(
+        ids::BLOCK_GROUP,
+        &[
+            elem(ids::BLOCK, &stored),
+            elem(ids::CODEC_STATE, &vec![0x33; 9 << 20]),
+        ]
+        .concat(),
+    );
     let input: Box<dyn ReadSeek> = Box::new(Cursor::new(group_file(1023, group, 0)));
     let base = LIVE.load(Ordering::SeqCst);
     let mut d = demux::open_typed(input, &NullCodecResolver).unwrap();
@@ -349,23 +476,42 @@ fn duplicate_block_addition_ids_are_dropped_in_linear_time() {
     let _serial = serial();
     let count = 100_000u64;
     let more = |id: u64, data: &[u8]| {
-        elem(ids::BLOCK_MORE, &[uint(ids::BLOCK_ADD_ID, id), elem(ids::BLOCK_ADDITIONAL, data)].concat())
+        elem(
+            ids::BLOCK_MORE,
+            &[
+                uint(ids::BLOCK_ADD_ID, id),
+                elem(ids::BLOCK_ADDITIONAL, data),
+            ]
+            .concat(),
+        )
     };
-    let additions: Vec<u8> = (1..=count).map(|id| more(id, b"a"))
+    let additions: Vec<u8> = (1..=count)
+        .map(|id| more(id, b"a"))
         .chain((1..=count).map(|id| more(id, b"b")))
         .flatten()
         .collect();
-    let group = elem(ids::BLOCK_GROUP, &[
-        elem(ids::BLOCK, &[0x81, 0, 0, 0, b'x']), elem(ids::BLOCK_ADDITIONS, &additions),
-    ].concat());
-    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(file(&[subtitle_tracks(), cluster(0, &[group])])));
+    let group = elem(
+        ids::BLOCK_GROUP,
+        &[
+            elem(ids::BLOCK, &[0x81, 0, 0, 0, b'x']),
+            elem(ids::BLOCK_ADDITIONS, &additions),
+        ]
+        .concat(),
+    );
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(file(&[
+        subtitle_tracks(),
+        cluster(0, &[group]),
+    ])));
     let started = Instant::now();
     let mut d = demux::open_typed(input, &NullCodecResolver).unwrap();
     assert_eq!(d.next_packet().unwrap().data, b"x");
     let took = started.elapsed();
     let kept = d.block_additions();
     let first_of_each = kept.len() == count as usize
-        && kept.iter().zip(1..).all(|(a, id)| a.block_add_id() == id && a.data() == b"a");
+        && kept
+            .iter()
+            .zip(1..)
+            .all(|(a, id)| a.block_add_id() == id && a.data() == b"a");
     assert!(
         first_of_each && took < Duration::from_secs(10),
         "kept {} additions, the first of each id: {first_of_each}; took {took:?}",
@@ -417,7 +563,10 @@ fn masters_over_their_budget_are_refused_unread() {
     // Packet "a" after one damage event for the master `id`.
     let a = |id: u32| Some((vec![DamageKind::DamagedMaster(id)], b"a".to_vec()));
     let mut failures = Vec::new();
-    let mut check = |case: &str, bytes: Vec<u8>, resilient: bool, expected: Option<(Vec<DamageKind>, Vec<u8>)>| {
+    let mut check = |case: &str,
+                     bytes: Vec<u8>,
+                     resilient: bool,
+                     expected: Option<(Vec<DamageKind>, Vec<u8>)>| {
         let (outcome, read, _) = measure(bytes, |input| opened(input, resilient));
         if outcome != expected || read >= SMALL {
             failures.push(format!("{case}, resilient {resilient}: damage and first packet {outcome:?} after reading {read} bytes"));
@@ -426,27 +575,60 @@ fn masters_over_their_budget_are_refused_unread() {
     let tracks = subtitle_tracks();
     let at = (index(ids::TAGS, 0).len() + tracks.len() + first.len()) as u64;
     for resilient in [false, true] {
-        check("SeekHead", file(&[padded(ids::SEEK_HEAD, &[]), subtitle_tracks(), first.clone()]), resilient, a(ids::SEEK_HEAD));
+        check(
+            "SeekHead",
+            file(&[
+                padded(ids::SEEK_HEAD, &[]),
+                subtitle_tracks(),
+                first.clone(),
+            ]),
+            resilient,
+            a(ids::SEEK_HEAD),
+        );
         let tags = file(&[subtitle_tracks(), padded(ids::TAGS, &[]), first.clone()]);
         check("Tags", tags, resilient, a(ids::TAGS));
         let tracks_over = file(&[padded(ids::TRACKS, &entry), first.clone()]);
         check("Tracks", tracks_over, resilient, None);
-        let followed = file(&[index(ids::TAGS, at), tracks.clone(), first.clone(), padded(ids::TAGS, &[])]);
+        let followed = file(&[
+            index(ids::TAGS, at),
+            tracks.clone(),
+            first.clone(),
+            padded(ids::TAGS, &[]),
+        ]);
         check("Tags followed", followed, resilient, a(ids::TAGS));
     }
     let trailing = file(&[subtitle_tracks(), first.clone(), padded(ids::TAGS, &[])]);
     let (packets, read, _) = measure(trailing, drain);
     if packets != [b"a".to_vec()] || read >= SMALL {
-        failures.push(format!("Tags trailing: {} packets after reading {read} bytes", packets.len()));
+        failures.push(format!(
+            "Tags trailing: {} packets after reading {read} bytes",
+            packets.len()
+        ));
     }
     // Within its budget, a 3 MiB CodecPrivate's Tracks is still checked.
-    let entry = track(1, 0x11, "S_TEXT/UTF8", &elem(ids::CODEC_PRIVATE, &vec![1; 3 << 20]));
+    let entry = track(
+        1,
+        0x11,
+        "S_TEXT/UTF8",
+        &elem(ids::CODEC_PRIVATE, &vec![1; 3 << 20]),
+    );
     let crc = crc32_ieee(&entry);
     let crc_child = elem(ids::CRC32, &crc.to_le_bytes());
-    let tracks = [header(ids::TRACKS, crc_child.len() + entry.len()), crc_child, entry].concat();
+    let tracks = [
+        header(ids::TRACKS, crc_child.len() + entry.len()),
+        crc_child,
+        entry,
+    ]
+    .concat();
     let ((d, packet), _, _) = measure(file(&[tracks, first]), first_packet);
-    let status = d.crc_status().iter().find(|s| s.element_id == ids::TRACKS).copied();
-    if packet != b"a" || status != Some(CrcStatus { element_id: ids::TRACKS, stored: crc, computed: crc }) {
+    let status = d
+        .crc_status()
+        .iter()
+        .find(|s| s.element_id == ids::TRACKS)
+        .copied();
+    if packet != b"a"
+        || status.map(|s| (s.element_id, s.stored, s.computed)) != Some((ids::TRACKS, crc, crc))
+    {
         failures.push(format!("Tracks within budget: CRC-32 status {status:?}"));
     }
     assert!(failures.is_empty(), "{failures:#?}");
@@ -465,7 +647,10 @@ fn encrypted_blocks_share_one_retention_budget() {
     for i in 0..10u8 {
         let mut body = vec![i; BLOCK];
         body[..4].copy_from_slice(&[0x81, 0, 0, 0x80]);
-        segment.push(cluster(u64::from(i) * 1000, &[simple(1, 0, &[b'p', i]), elem(ids::ENCRYPTED_BLOCK, &body)]));
+        segment.push(cluster(
+            u64::from(i) * 1000,
+            &[simple(1, 0, &[b'p', i]), elem(ids::ENCRYPTED_BLOCK, &body)],
+        ));
     }
     let input: Box<dyn ReadSeek> = Box::new(Cursor::new(file(&segment)));
     let base = LIVE.load(Ordering::SeqCst);
@@ -479,7 +664,12 @@ fn encrypted_blocks_share_one_retention_budget() {
         }
     }
     let retained = LIVE.load(Ordering::SeqCst).saturating_sub(base);
-    let kept: Vec<u8> = d.cluster_records().iter().flat_map(|r| &r.encrypted_blocks).map(|b| b[BLOCK - 1]).collect();
+    let kept: Vec<u8> = d
+        .cluster_records()
+        .iter()
+        .flat_map(|r| &r.encrypted_blocks)
+        .map(|b| b[BLOCK - 1])
+        .collect();
     let damaged = d.damage_events().len();
     let played = packets == (0..10u8).map(|i| vec![b'p', i]).collect::<Vec<_>>();
     // Six 5 MiB blocks fit the 32 MiB budget; the other four are damage.
@@ -515,15 +705,25 @@ fn encrypted_block_lists_count_against_the_budget() {
     let _serial = serial();
     let mut big = vec![0x5a; 31 << 20];
     big[..4].copy_from_slice(&[0x81, 0, 0, 0x80]);
-    let mut segment = vec![subtitle_tracks(), cluster(0, &[simple(1, 0, b"a"), elem(ids::ENCRYPTED_BLOCK, &big)])];
+    let mut segment = vec![
+        subtitle_tracks(),
+        cluster(0, &[simple(1, 0, b"a"), elem(ids::ENCRYPTED_BLOCK, &big)]),
+    ];
     for i in 1..=16_000 {
         segment.push(cluster(i, &[elem(ids::ENCRYPTED_BLOCK, &[])]));
     }
     segment.push(cluster(20_000, &[simple(1, 0, b"z")]));
     let (d, packets, _) = drained(&segment);
     let records = d.cluster_records();
-    let lists: usize = records.iter().map(|r| r.encrypted_blocks.capacity() * std::mem::size_of::<Vec<u8>>()).sum();
-    let blocks: usize = records.iter().flat_map(|r| &r.encrypted_blocks).map(Vec::capacity).sum();
+    let lists: usize = records
+        .iter()
+        .map(|r| r.encrypted_blocks.capacity() * std::mem::size_of::<Vec<u8>>())
+        .sum();
+    let blocks: usize = records
+        .iter()
+        .flat_map(|r| &r.encrypted_blocks)
+        .map(Vec::capacity)
+        .sum();
     let big_kept = records[0].encrypted_blocks.first().map(Vec::len) == Some(31 << 20);
     let played = packets == [b"a".to_vec(), b"z".to_vec()];
     assert!(
@@ -543,16 +743,30 @@ fn silent_tracks_share_the_cluster_record_budget() {
     let numbers = elem(ids::SILENT_TRACK_NUMBER, &[1]).repeat(1_500_000);
     let mut segment = vec![subtitle_tracks()];
     for i in 0..4u8 {
-        segment.push(cluster(u64::from(i) * 1000, &[simple(1, 0, &[b'p', i]), elem(ids::SILENT_TRACKS, &numbers)]));
+        segment.push(cluster(
+            u64::from(i) * 1000,
+            &[simple(1, 0, &[b'p', i]), elem(ids::SILENT_TRACKS, &numbers)],
+        ));
     }
     let (d, packets, held) = drained(&segment);
-    let kept: Vec<usize> = d.cluster_records().iter().map(|r| r.silent_track_numbers.len()).collect();
-    let lists: usize = d.cluster_records().iter().map(|r| r.silent_track_numbers.capacity() * 8).sum();
+    let kept: Vec<usize> = d
+        .cluster_records()
+        .iter()
+        .map(|r| r.silent_track_numbers.len())
+        .collect();
+    let lists: usize = d
+        .cluster_records()
+        .iter()
+        .map(|r| r.silent_track_numbers.capacity() * 8)
+        .sum();
     let played = packets == (0..4u8).map(|i| vec![b'p', i]).collect::<Vec<_>>();
     // Two masters fit the budget; the other two are damage.
     assert!(
-        played && kept == [1_500_000, 1_500_000, 0, 0] && d.damage_events().len() == 2
-            && lists <= 32 << 20 && held < (32 << 20) + (1 << 20),
+        played
+            && kept == [1_500_000, 1_500_000, 0, 0]
+            && d.damage_events().len() == 2
+            && lists <= 32 << 20
+            && held < (32 << 20) + (1 << 20),
         "played {played}, kept {kept:?}, {} damage events, lists {lists} bytes, held {held} heap bytes",
         d.damage_events().len()
     );
@@ -574,7 +788,10 @@ fn an_av1_frame_of_empty_obus_is_read_within_its_block_budget() {
         let mut d = demux::open_typed(Box::new(Cursor::new(bytes)), &NullCodecResolver).unwrap();
         let base = LIVE.load(Ordering::SeqCst);
         PEAK.store(base, Ordering::SeqCst);
-        let packet = d.next_packet().map(|p| p.data.len()).map_err(|e| format!("{e}"));
+        let packet = d
+            .next_packet()
+            .map(|p| p.data.len())
+            .map_err(|e| format!("{e}"));
         let peak = PEAK.load(Ordering::SeqCst) - base;
         if packet != Ok(frame.len()) || peak >= 32 << 20 {
             failures.push(format!("{case}: packet {packet:?}, peak {peak} heap bytes"));

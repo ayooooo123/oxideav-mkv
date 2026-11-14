@@ -13,8 +13,8 @@
 //!   inside a Cluster that doesn't start with one.
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use oxideav_core::{Demuxer, ReadSeek};
 use oxideav_mkv::demux::MkvDemuxer;

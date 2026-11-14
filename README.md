@@ -229,6 +229,49 @@ them after decoding.
   parse time. The common file declares none and surfaces an empty list.
 - Segment walk: `Info`, `Tracks`, `Tags`, `Cues`, `Cluster`. Known- and
   unknown-size Segment/Cluster both supported.
+- **Seeking, tiered** (`seek_to`, strict and resilient alike; which tier
+  landed is readable through `MkvDemuxer::seek_strategy() ->
+  Option<SeekStrategy>`):
+  1. `SeekStrategy::Cues` — a `Cues` index stored before the first Cluster
+     or reached through a `SeekHead` entry (RFC 9559 §6.4): one jump to the
+     `CueClusterPosition` of the last `CuePoint` at or before the target.
+  2. `SeekStrategy::Bisection` — no usable `Cues` (`mkvmerge --no-cues`-style
+     output, a damaged `Cues` master the resilient open skipped, a lying
+     cue): a byte-offset search over the Cluster run. Each probe reads one
+     bounded window inside the unexplored byte range, resynchronises on
+     the next vetted `Cluster` header in it (header + leading children
+     parse, `Timestamp` before the first block, successor is a Top-Level
+     element) and reads that Cluster's `Timestamp`. The probe point is
+     interpolated from the bracketing Timestamps (the Segment `Duration`
+     stands in for the Segment end until a later Cluster is seen), pulled
+     back one Cluster length, and handed to plain halving whenever an
+     interpolated probe fails to halve the range — so a skewed bitrate or
+     a wrong `Duration` costs at most ~2x the bisection bound and never
+     moves the landing. Measured on Cues-stripped ffmpeg output: a mean of
+     4.6–4.8 byte-range requests per seek (worst 6) on 54- and 540-Cluster
+     files, against 11–13 for plain halving and ~500 for a linear walk.
+     Finds the Cluster a Cues lookup would name: the last one at or
+     before the target, monotone in the target. The landing inside it is
+     the last keyframe of the sought track at or before the target (see
+     *Cues-less seek* below); a Cluster without one hands the search to
+     the Clusters before it.
+  3. `SeekStrategy::LinearScan` — the bisection premise (ascending Cluster
+     `Timestamp`s, a MUST in the WebM guidelines and the assumption behind
+     every §25.3 layout) is checked on every probe; a Cluster found out of
+     order degrades the seek to the linear Cluster-`Timestamp` walk, which
+     assumes nothing about order. The walk also takes over when no
+     keyframe of the sought track turns up within about a minute before
+     the target.
+  `open` no longer walks the Cluster run hunting for a `Cues` element that
+  is neither front-stored nor SeekHead-reachable (one positioned read per
+  Cluster, i.e. one HTTP range request per Cluster over a byte-range
+  reader — issue #9); `MkvDemuxer::scan_for_cues()` is the opt-in for
+  callers with cheap local I/O who want the index anyway. The RFC 9559
+  §23.2 non-seekable signal (unknown-size Segment with neither SeekHead nor
+  Cues — the live-stream shape) is not taken: like FFmpeg, strict and
+  resilient demuxers seek such a file too. `cargo run --example seek_cost
+  <file.mkv>` prints the request / read / byte cost of an open and a seek
+  sweep as a byte-range transport would bill them.
 - Clusters: `SimpleBlock` and `BlockGroup -> Block`, all three lacing
   modes (Xiph, fixed, EBML-signed-delta).
 - **Typed `BlockGroup` meta** (`demux::open_typed`):
@@ -702,20 +745,24 @@ them after decoding.
   RFC 9559 §22.1 only RECOMMENDS the element; live recordings and files
   written to a pipe have none — or damaged and skipped), or past the last
   `CueTime` kept for its track from an index cut at its budget or by
-  damage,
-  scans the Clusters up to the target, the way FFmpeg indexes such
-  a file: it walks Cluster `Timestamp`s (§5.1.3.1) to the first Cluster
-  past the target, then reads Block headers in those Clusters, newest
-  first, for the last keyframe of the sought track at or before the
-  target. When the track's first Block in that Cluster is a keyframe the
-  seek lands on the Cluster's start; otherwise (a Cluster starting
-  mid-GOP) it lands on the keyframe's Block, so the first packet of the
-  track is always one it decodes from. Unknown-size Clusters are stepped
-  over child by child; targets before the first keyframe / past the last
-  Cluster snap to the first / last Cluster. Like FFmpeg, both the strict
-  and the resilient path seek this way rather than taking RFC 9559
-  §23.2's "neither SeekHead nor Cues at the start SHOULD be considered
-  non-seekable".
+  damage, bisects the Cluster run on byte offset (see *Seeking, tiered*
+  above) for the last Cluster starting at or before the target, then reads
+  Block headers in it for the last keyframe of the sought track at or
+  before the target. When the track's first Block in that Cluster is a
+  keyframe the seek lands on the Cluster's start; otherwise (a Cluster
+  starting mid-GOP) it lands on the keyframe's Block, so the first packet
+  of the track is always one it decodes from. A Cluster holding no such
+  keyframe hands the search to the Clusters before it: the one just
+  before, then stretches reaching 1, 2, 4 … 32 seconds further back, each
+  start found by bisecting again. The linear Cluster-`Timestamp` walk (§5.1.3.1), the
+  way FFmpeg indexes such a file, is the fallback with the same landing
+  when a probe finds the run out of ascending order, the probe budget runs
+  out, or no keyframe turns up within those stretches. Unknown-size Clusters
+  are stepped over child by child; targets before the first keyframe /
+  past the last Cluster snap to the first / last Cluster. Like FFmpeg,
+  both the strict and the resilient path seek this way rather than taking
+  RFC 9559 §23.2's "neither SeekHead nor Cues at the start SHOULD be
+  considered non-seekable".
 - **Cues that LIE — trust-but-verify seek + whole-index audit**: the
   index is pure metadata (every `CueClusterPosition` / `CueTime` /
   `CueRelativePosition` / `CueBlockNumber` claim restates information
@@ -877,9 +924,9 @@ them after decoding.
   body-offset dedup keeps a back-then-forward seek revisiting the same
   Cluster from producing two statuses for it. Trailing `Cues` reached
   through the SeekHead (the common single-pass-mux layout, and the one
-  our own muxer emits) are validated the same way, so a Cues CRC mismatch
-  surfaces regardless of whether the `Cues` was placed before or after
-  Clusters.
+  our own muxer emits) or found by the opt-in `scan_for_cues()` hunt are
+  validated the same way, so a Cues CRC mismatch surfaces regardless of
+  whether the `Cues` was placed before or after Clusters.
   A Cluster declared with the unknown-size VINT can't be CRC-checked
   (the spec requires a bounded body) and produces no status. Validation
   is informational — a mismatch does **not** abort the open (RFC 8794
@@ -2119,6 +2166,45 @@ implemented for roundtrip:
 Unknown MKV codec IDs fall back to a pass-through `mkv:<raw-id>` form
 so the demuxer never hides an unrecognised track.
 
+**What the muxer writes** (`codec_id::plan_track_codec`, decided when
+the muxer is opened):
+
+1. the native CodecID above (the list is symmetric: every id the
+   demuxer maps, the muxer writes, `V_THEORA` included);
+2. a `CodecTag::Matroska` the stream carries, verbatim;
+3. a demuxer placeholder back to the id it was read under —
+   `mkv:<CodecID>` verbatim, `mkv:vfw:<FOURCC>` / `mkv:acm:0xHHHH`
+   through the compatibility track with that FourCC / tag — so a remux
+   of a track no codec claimed is lossless;
+4. `V_MS/VFW/FOURCC` (CodecPrivate = 40-byte `BITMAPINFOHEADER` +
+   extradata) for Motion JPEG (`MJPG`), Cinepak (`CVID`), HuffYUV
+   (`HFYU`), Lagarith (`LAGS`), 24-bit `BI_RGB` (`rgb24`), and any video
+   stream tagged with a FourCC; `A_MS/ACM` (CodecPrivate =
+   `WAVEFORMATEX` + `cbSize` extradata) for `pcm_u8` / `pcm_s24le` /
+   `pcm_s32le` / `pcm_f64le` / A-law / µ-law and any audio stream tagged
+   with a `wFormatTag`.
+
+Anything else is refused with `Error::Unsupported` at open — earlier
+releases wrote an unregistered `X_<codec id>` that no reader resolved
+(files carrying one still read back as `<codec id>`). Pinned by the
+49-row mux → demux → remux matrix in `tests/codec_id_matrix.rs`; the
+MJPEG / 24-bit PCM / A-law files it writes decode identically to their
+sources in `ffmpeg`.
+
+### Mid-stream shape changes
+
+A Matroska track header (`CodecID`, `CodecPrivate`, `PixelWidth` /
+`PixelHeight`, `SamplingFrequency`, `Channels`, `BitDepth`) states one
+shape for the whole Segment; RFC 9559 §23.2 places a change of codec or
+resolution at a Segment boundary. The core `Muxer` contract has no
+in-band parameters event — a `Frame::StreamParams` stops at the encoder
+(which re-configures or returns `Error::Unsupported`), and `Packet`
+carries no shape — so this muxer writes every track header from the
+`StreamInfo` it was opened with and cannot detect a later change. A
+caller that follows a shape change must finish this file
+(`write_trailer`) and open a new muxer for the new shape; the muxer
+never rewrites a header to match.
+
 ### Probes + registration
 
 - Registers both `"matroska"` and `"webm"` with the container registry.
@@ -2131,10 +2217,11 @@ so the demuxer never hides an unrecognised track.
 ## What's NOT implemented
 
 - CRC-32 validation covers Top-Level master elements parsed up front,
-  trailing ones reached through the SeekHead, and every `Cluster` the
-  demuxer walks to its end through `next_packet` / `seek_to`. A `Cluster`
-  declared with the unknown-size VINT still produces no status (RFC 8794
-  §11.3.1 needs a bounded body).
+  trailing ones reached through the SeekHead (or, for `Cues`, the opt-in
+  `scan_for_cues()` hunt), and every `Cluster` the demuxer walks to its
+  end through `next_packet` / `seek_to`. A `Cluster` declared with the
+  unknown-size VINT still produces no status (RFC 8794 §11.3.1 needs a
+  bounded body).
   The muxer writes a leading `CRC-32` child on every Top-Level master it
   buffers end-to-end before flushing — `Info`, `Tracks`, `Cues`, plus
   `Chapters` and `Attachments` when those are queued. `SeekHead` and
@@ -2322,7 +2409,7 @@ resilient `next_packet` may only fail with the clean `Error::Eof` (any
 other error class panics the harness), damage-event bookkeeping must
 never move backwards, and both seek shapes (Cues index — now
 trust-but-verified, so a lying cue exercises the `CueLie` fallback —
-plus the Cues-less cluster-scan fallback) run post-drain, followed by a
+plus the Cues-less bisection fallback) run post-drain, followed by a
 whole-index `audit_cues` pass asserting its capped findings list stays
 consistent with the exact counter and `is_truthful()` agrees — so the
 recovery loop's forward-progress guarantee is fuzz-checked. The seed corpus in

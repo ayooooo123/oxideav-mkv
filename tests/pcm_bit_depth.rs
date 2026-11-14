@@ -130,10 +130,10 @@ struct StaticPcmResolver;
 
 impl CodecResolver for StaticPcmResolver {
     fn resolve_tag(&self, ctx: &ProbeContext) -> Option<CodecId> {
-        if let CodecTag::Matroska(tag) = &ctx.tag {
-            if tag == "A_PCM/INT/LIT" {
-                return Some(CodecId::new("pcm_s16le"));
-            }
+        if let CodecTag::Matroska(tag) = &ctx.tag
+            && tag == "A_PCM/INT/LIT"
+        {
+            return Some(CodecId::new("pcm_s16le"));
         }
         None
     }

@@ -34,14 +34,20 @@ fn file(segment: &[Vec<u8>]) -> Vec<u8> {
 /// Subtitle track 1.
 fn tracks() -> Vec<u8> {
     let fields = [
-        uint(ids::TRACK_NUMBER, 1), uint(ids::TRACK_UID, 1),
-        uint(ids::TRACK_TYPE, 0x11), elem(ids::CODEC_ID, b"S_TEXT/UTF8"),
-    ].concat();
+        uint(ids::TRACK_NUMBER, 1),
+        uint(ids::TRACK_UID, 1),
+        uint(ids::TRACK_TYPE, 0x11),
+        elem(ids::CODEC_ID, b"S_TEXT/UTF8"),
+    ]
+    .concat();
     elem(ids::TRACKS, &elem(ids::TRACK_ENTRY, &fields))
 }
 
 fn simple(payload: &[u8]) -> Vec<u8> {
-    elem(ids::SIMPLE_BLOCK, &[&[0x81, 0, 0, 0x80][..], payload].concat())
+    elem(
+        ids::SIMPLE_BLOCK,
+        &[&[0x81, 0, 0, 0x80][..], payload].concat(),
+    )
 }
 
 /// Clusters in the file below that each need a recovery.
@@ -56,10 +62,26 @@ fn damage_events_stop_at_4096_and_count_the_rest() {
     let mut segment = vec![tracks()];
     for i in 0..DAMAGED {
         let overrun = header(ids::SIMPLE_BLOCK, 64);
-        segment.push(elem(ids::CLUSTER, &[uint(ids::TIMECODE, u64::from(i) * 10), simple(&i.to_be_bytes()), overrun].concat()));
+        segment.push(elem(
+            ids::CLUSTER,
+            &[
+                uint(ids::TIMECODE, u64::from(i) * 10),
+                simple(&i.to_be_bytes()),
+                overrun,
+            ]
+            .concat(),
+        ));
     }
-    segment.push(elem(ids::CLUSTER, &[uint(ids::TIMECODE, u64::from(DAMAGED) * 10), simple(&DAMAGED.to_be_bytes())].concat()));
-    let mut d = demux::open_typed(Box::new(Cursor::new(file(&segment))), &NullCodecResolver).unwrap();
+    segment.push(elem(
+        ids::CLUSTER,
+        &[
+            uint(ids::TIMECODE, u64::from(DAMAGED) * 10),
+            simple(&DAMAGED.to_be_bytes()),
+        ]
+        .concat(),
+    ));
+    let mut d =
+        demux::open_typed(Box::new(Cursor::new(file(&segment))), &NullCodecResolver).unwrap();
     let mut played = 0u32;
     let mut in_order = true;
     loop {

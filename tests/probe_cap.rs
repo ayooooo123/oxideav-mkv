@@ -43,7 +43,12 @@ static ALLOC: Tracking = Tracking;
 const CAP: usize = 1024;
 
 fn elem(id: u32, body: &[u8]) -> Vec<u8> {
-    [write_element_id(id), write_vint(body.len() as u64, 0), body.to_vec()].concat()
+    [
+        write_element_id(id),
+        write_vint(body.len() as u64, 0),
+        body.to_vec(),
+    ]
+    .concat()
 }
 
 fn uint(id: u32, v: u64) -> Vec<u8> {
@@ -55,28 +60,57 @@ fn uint(id: u32, v: u64) -> Vec<u8> {
 fn tracks(copies: u64) -> Vec<u8> {
     let sps = [0x67, 0x42, 0x00, 0x1e, 0xf4, 0xf2];
     let pps = [0x68, 0xce, 0x38, 0x80];
-    let avcc = [&[1, 0x42, 0x00, 0x1e, 0xff, 0xe1, 0, sps.len() as u8][..], &sps, &[1, 0, pps.len() as u8], &pps].concat();
+    let avcc = [
+        &[1, 0x42, 0x00, 0x1e, 0xff, 0xe1, 0, sps.len() as u8][..],
+        &sps,
+        &[1, 0, pps.len() as u8],
+        &pps,
+    ]
+    .concat();
     let entry = |number: u64, kind: u64, codec: &str, extra: Vec<u8>| {
-        elem(ids::TRACK_ENTRY, &[
-            uint(ids::TRACK_NUMBER, number), uint(ids::TRACK_UID, number),
-            uint(ids::TRACK_TYPE, kind), elem(ids::CODEC_ID, codec.as_bytes()), extra,
-        ].concat())
+        elem(
+            ids::TRACK_ENTRY,
+            &[
+                uint(ids::TRACK_NUMBER, number),
+                uint(ids::TRACK_UID, number),
+                uint(ids::TRACK_TYPE, kind),
+                elem(ids::CODEC_ID, codec.as_bytes()),
+                extra,
+            ]
+            .concat(),
+        )
     };
-    let video = elem(ids::VIDEO, &[uint(ids::PIXEL_WIDTH, 16), uint(ids::PIXEL_HEIGHT, 16)].concat());
+    let video = elem(
+        ids::VIDEO,
+        &[uint(ids::PIXEL_WIDTH, 16), uint(ids::PIXEL_HEIGHT, 16)].concat(),
+    );
     let mut entries = vec![
-        entry(1, 1, "V_MPEG4/ISO/AVC", [elem(ids::CODEC_PRIVATE, &avcc), video].concat()),
+        entry(
+            1,
+            1,
+            "V_MPEG4/ISO/AVC",
+            [elem(ids::CODEC_PRIVATE, &avcc), video].concat(),
+        ),
         entry(2, 0x11, "S_TEXT/UTF8", Vec::new()),
     ];
     for number in 3..copies + 2 {
         let join = elem(ids::TRACK_JOIN_BLOCKS, &uint(ids::TRACK_JOIN_UID, 2));
-        entries.push(entry(number, 0x11, "S_TEXT/UTF8", elem(ids::TRACK_OPERATION, &join)));
+        entries.push(entry(
+            number,
+            0x11,
+            "S_TEXT/UTF8",
+            elem(ids::TRACK_OPERATION, &join),
+        ));
     }
     elem(ids::TRACKS, &entries.concat())
 }
 
 /// A keyframe SimpleBlock on the subtitle track.
 fn simple(tc: i16, body: &[u8]) -> Vec<u8> {
-    elem(ids::SIMPLE_BLOCK, &[&[0x82][..], &tc.to_be_bytes(), &[0x80], body].concat())
+    elem(
+        ids::SIMPLE_BLOCK,
+        &[&[0x82][..], &tc.to_be_bytes(), &[0x80], body].concat(),
+    )
 }
 
 fn single(i: u16) -> Vec<u8> {
@@ -84,11 +118,15 @@ fn single(i: u16) -> Vec<u8> {
 }
 
 fn file(blocks: &[Vec<u8>]) -> Vec<u8> {
-    let cluster = elem(ids::CLUSTER, &[uint(ids::TIMECODE, 0), blocks.concat()].concat());
+    let cluster = elem(
+        ids::CLUSTER,
+        &[uint(ids::TIMECODE, 0), blocks.concat()].concat(),
+    );
     [
         elem(ids::EBML_HEADER, &elem(ids::EBML_DOC_TYPE, b"matroska")),
         elem(ids::SEGMENT, &[tracks(1), cluster].concat()),
-    ].concat()
+    ]
+    .concat()
 }
 
 /// Peak heap from opening `bytes` to its first packet, the point where
@@ -104,13 +142,23 @@ fn peak_to_first_packet(bytes: &[u8]) -> (usize, Vec<u8>, MkvDemuxer) {
 
 fn virtual_blocks(copies: u64) -> MkvDemuxer {
     let laces: Vec<u8> = (0..=255).collect();
-    let laced = elem(ids::SIMPLE_BLOCK, &[&[0x82, 0, 1, 0x84, 255][..], &laces].concat());
-    let first = elem(ids::CLUSTER, &[uint(ids::TIMECODE, 0), single(0), laced].concat());
-    let later = elem(ids::CLUSTER, &[uint(ids::TIMECODE, 2000), simple(0, b"later")].concat());
+    let laced = elem(
+        ids::SIMPLE_BLOCK,
+        &[&[0x82, 0, 1, 0x84, 255][..], &laces].concat(),
+    );
+    let first = elem(
+        ids::CLUSTER,
+        &[uint(ids::TIMECODE, 0), single(0), laced].concat(),
+    );
+    let later = elem(
+        ids::CLUSTER,
+        &[uint(ids::TIMECODE, 2000), simple(0, b"later")].concat(),
+    );
     let bytes = [
         elem(ids::EBML_HEADER, &elem(ids::EBML_DOC_TYPE, b"matroska")),
         elem(ids::SEGMENT, &[tracks(copies), first, later].concat()),
-    ].concat();
+    ]
+    .concat();
     let mut d = demux::open_typed(Box::new(Cursor::new(bytes)), &NullCodecResolver).unwrap();
     d.set_apply_track_operations(true);
     d
@@ -157,7 +205,10 @@ fn a_laced_block_at_the_cap_waits_until_the_held_packets_are_returned() {
     // One short of it, then a Block of 256 fixed-size laces.
     let mut laced = (0..CAP as u16 - 1).map(single).collect::<Vec<_>>();
     let laces: Vec<u8> = (0..=255).collect();
-    laced.push(elem(ids::SIMPLE_BLOCK, &[&[0x82, 0x03, 0xff, 0x84, 255][..], &laces].concat()));
+    laced.push(elem(
+        ids::SIMPLE_BLOCK,
+        &[&[0x82, 0x03, 0xff, 0x84, 255][..], &laces].concat(),
+    ));
     laced.extend((CAP as u16..CAP as u16 + 4).map(single));
 
     let (at_cap_peak, first, d) = peak_to_first_packet(&file(&at_cap));
@@ -178,7 +229,9 @@ fn a_laced_block_at_the_cap_waits_until_the_held_packets_are_returned() {
             Err(e) => panic!("{e}"),
         }
     }
-    let mut expected: Vec<Vec<u8>> = (1..CAP as u16 - 1).map(|i| i.to_be_bytes().to_vec()).collect();
+    let mut expected: Vec<Vec<u8>> = (1..CAP as u16 - 1)
+        .map(|i| i.to_be_bytes().to_vec())
+        .collect();
     expected.extend(laces.iter().map(|&b| vec![b]));
     expected.extend((CAP as u16..CAP as u16 + 4).map(|i| i.to_be_bytes().to_vec()));
     assert_eq!(rest, expected);
